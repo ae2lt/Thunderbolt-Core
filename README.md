@@ -6,7 +6,7 @@ AE2 Lightning Tech.
 - Mod name: `Thunderbolt Core`
 - Mod id: `thunderbolt`
 - Java namespace: `com.moakiee.thunderbolt`
-- Maven coordinate: `com.moakiee.thunderbolt:thunderbolt:2.0.0-alpha.1`
+- Maven coordinate: `com.moakiee.thunderbolt:thunderbolt:1.0.0`
 - Minecraft / loader: Minecraft `1.21.1`, NeoForge `21.1.x`
 
 ## What It Provides
