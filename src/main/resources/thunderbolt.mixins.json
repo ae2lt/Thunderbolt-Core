@@ -1,0 +1,25 @@
+{
+  "required": true,
+  "minVersion": "0.8.5",
+  "package": "com.moakiee.thunderbolt.ae2.mixin",
+  "compatibilityLevel": "JAVA_21",
+  "mixins": [
+    "CraftingCalculationMixin",
+    "GridConnectionMaxChannelsMixin",
+    "GridGetMachineNodesMixin",
+    "GridNodeMaxChannelsMixin",
+    "PathingCalculationCapMixin",
+    "CraftingCpuLogicBatchMixin",
+    "AdvCraftingCpuLogicBatchMixin",
+    "ExecutingCraftingJobAccessor",
+    "ElapsedTimeTrackerAccessor",
+    "TaskProgressAccessor",
+    "AaeExecutingCraftingJobAccessor",
+    "AaeElapsedTimeTrackerAccessor",
+    "AaeTaskProgressAccessor"
+  ],
+  "client": [],
+  "injectors": {
+    "defaultRequire": 1
+  }
+}
