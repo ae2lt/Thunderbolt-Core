@@ -748,4 +748,49 @@ class CraftPlannerV2Test {
 
         return new RandomGraph(b.build(), all, stock, "w0", amount);
     }
+
+    /**
+     * A recipe chain far deeper than {@link CraftPlannerV2#MAX_OBTAIN_DEPTH} (and any thread stack) that
+     * is feasible and non-contended must be resolved by the iterative linear backbone — never recursing,
+     * never exhausting the budget, never overflowing.
+     */
+    @Test
+    void deepFeasibleChainResolvedIterativelyWithoutOverflow() {
+        int n = 5_000;
+        CraftGraph.Builder<String> b = CraftGraph.<String>builder();
+        for (int i = 0; i < n; i++) {
+            b.pattern("A" + i, 1, List.of(CraftInput.of("A" + (i + 1), 1)));
+        }
+        b.stock("A" + n, 10);
+
+        CraftPlan<String> plan = CraftPlannerV2.plan(b.build(), "A0", 3);
+
+        assertTrue(plan.feasible(), "deep non-contended chain solved by the iterative linear pass");
+        assertEquals(3L, plan.usedStock().get("A" + n));
+        assertTrue(plan.missing().isEmpty());
+        assertFalse(plan.budgetExhausted(), "no recursion, so no depth/visit degradation");
+    }
+
+    /**
+     * The same chain with no stock anywhere forces the recursive bounded search (the linear pass reports
+     * infeasible). Without {@link CraftPlannerV2#MAX_OBTAIN_DEPTH} the descent would recurse {@code n}
+     * deep and {@code StackOverflowError}; with it, the descent degrades to a best-effort "missing" plan
+     * (Policy A) and flags {@link CraftPlan#budgetExhausted()} instead of crashing.
+     */
+    @Test
+    void deepRecursiveChainDegradesInsteadOfOverflowing() {
+        int n = 5_000;
+        CraftGraph.Builder<String> b = CraftGraph.<String>builder();
+        for (int i = 0; i < n; i++) {
+            b.pattern("A" + i, 1, List.of(CraftInput.of("A" + (i + 1), 1)));
+        }
+        // No stock: linearPass is infeasible -> escalates to obtain()'s recursive descent.
+
+        CraftPlan<String> plan = CraftPlannerV2.plan(b.build(), "A0", 1);
+
+        assertTrue(plan.supported());
+        assertFalse(plan.feasible());
+        assertFalse(plan.missing().isEmpty(), "shortfall reported, not crashed");
+        assertTrue(plan.budgetExhausted(), "depth guard degraded the over-deep descent to best-effort");
+    }
 }

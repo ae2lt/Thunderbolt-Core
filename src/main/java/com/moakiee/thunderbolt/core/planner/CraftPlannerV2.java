@@ -52,8 +52,27 @@ public final class CraftPlannerV2<K> {
      */
     public static final int DEFAULT_VISIT_CAP = 64;
 
+    /**
+     * Stack-overflow safety net for the bounded fallback search. {@link #obtain} recurses once per
+     * crafting edge along a single root-to-leaf path ({@code obtain → fire → obtain}), so its stack depth
+     * equals the depth of the (acyclic) recipe DAG. The clean linear backbone ({@link #linearPass}) is
+     * fully iterative and resolves every feasible, non-contended request without recursing — the
+     * recursion is entered only when that backbone reports infeasible or hits contention. To keep a
+     * pathologically deep recipe chain from overflowing the calculating thread's stack, descent past this
+     * many levels degrades to "missing" (Policy A) and sets {@link CraftPlan#budgetExhausted()}, exactly
+     * like a visit-budget freeze. 256 levels (~512 stack frames with the paired {@code fire}) is far
+     * deeper than any real Minecraft recipe chain yet safe on a default thread stack; overridable via
+     * {@code -Dthunderbolt.maxCraftDepth} for unusual {@code -Xss} setups.
+     */
+    public static final int MAX_OBTAIN_DEPTH =
+            Math.max(16, Integer.getInteger("thunderbolt.maxCraftDepth", 256));
+
     private final CraftGraph<K> graph;
     private final int visitCap;
+
+    // Current recursion depth of the bounded fallback search (obtain/fire). Guards against stack overflow
+    // on degenerate deep chains; see MAX_OBTAIN_DEPTH. Not part of the rolled-back planning state.
+    private int depth;
 
     private final Map<K, List<CraftPattern<K>>> patternsByOutput = new HashMap<>();
     private Map<K, Long> capacity;
@@ -366,6 +385,15 @@ public final class CraftPlannerV2<K> {
             return 0;
         }
 
+        // Depth guard: refuse to recurse past MAX_OBTAIN_DEPTH. We already drew stock/byproducts above,
+        // so only the un-stocked remainder is reported missing — turning a would-be StackOverflowError
+        // into the same best-effort "missing" degradation a visit-budget freeze produces.
+        if (depth >= MAX_OBTAIN_DEPTH) {
+            addMissing(x, d);
+            budgetExhausted = true;
+            return d;
+        }
+
         List<CraftPattern<K>> ps = patternsByOutput.getOrDefault(x, List.of());
         if (ps.isEmpty()) {
             addMissing(x, d);
@@ -420,7 +448,13 @@ public final class CraftPlannerV2<K> {
         long inputUnmet = 0;
         for (CraftInput<K> in : r.inputs()) {
             long amt = in.unitsFor(times); // closed form per flavour
-            long unmet = obtain(in.key(), amt);
+            depth++;
+            long unmet;
+            try {
+                unmet = obtain(in.key(), amt);
+            } finally {
+                depth--;
+            }
             inputUnmet = Sat.add(inputUnmet, unmet);
             if (in.returned() && in.uses() == CraftInput.INFINITE_USES) {
                 // true catalyst/container: the seed is handed back, net consumption zero —

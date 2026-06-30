@@ -67,6 +67,17 @@ import com.moakiee.thunderbolt.core.planner.Sat;
  *       engine replaces; the per-node cap keeps work bounded and our result is mass-balanced/safe.</li>
  * </ul>
  *
+ * <p><b>Execution-time contract (fuzzy substitution).</b> For a hard-fuzzy slot the planner commits to a
+ * <em>concrete</em> substitute (the most-available option in the chosen combination) and charges that exact
+ * key as used. AE2 still fires the single real {@link IPatternDetails}, and at extraction time its fuzzy
+ * matcher may pull a <em>different</em> acceptable stack than the one the plan charged (e.g. a different
+ * NBT/damage variant, or a different tag member that happened to be in the same slot). The plan stays
+ * mass-balanced for the key it charged, but the network can end up consuming a sibling substitute instead.
+ * This is an <b>execution-time</b> concern, not a planning one: reconciling "what the plan charged" with
+ * "what the fuzzy slot actually resolved" is the responsibility of the executing CPU (the batch crafting
+ * CPU logic), which sees the real extraction. The planner intentionally does not try to predict AE2's
+ * runtime fuzzy resolution here — see the batch CPU logic for the execution-side fix.
+ *
  * <p>Byte accounting reproduces AE2's formulas (see {@code CraftingTreeNode#request},
  * {@code CraftingTreeProcess#request} and {@code ICraftingSimulationState#addStackBytes}) over the
  * memoized DAG: byte-identical to AE2 for jobs without shared sub-graphs, smaller otherwise.
@@ -208,13 +219,25 @@ public final class FastCraftingPlanner {
             }
 
             Collection<IPatternDetails> patterns = craftingService.getCraftingFor(key);
-            if (patterns.size() > 1) {
-                multiplePaths[0] = true;
-            }
+            // Count only the primary-output views we actually register (see restriction below); the raw
+            // getCraftingFor count would over-report "multiple paths" for secondary-output aliases.
+            int registeredForKey = 0;
 
             for (IPatternDetails details : patterns) {
-                // This pattern is indexed under `key`, so `key` is one of its outputs: that one is the
-                // primary for this node; every other output is a byproduct routed through the pool.
+                // Primary-output restriction: a pattern becomes a craft node ONLY under its declared
+                // primary output. getCraftingFor(key) also returns patterns where `key` is merely a
+                // SECONDARY output; if we registered those as a second node producing `key`, the same
+                // real IPatternDetails would be fireable through two nodes and toAe2Plan (which merges
+                // firings by source) could schedule it twice -> double-craft (over-draws stock, piles up
+                // byproducts). So we skip non-primary views here: `key` is instead supplied from the
+                // byproduct pool when its real primary is crafted, never by a second firing of this
+                // source. Trade-off (accepted): an item that is ONLY ever a secondary output, with no
+                // pattern of its own, surfaces as missing rather than being made by over-producing the
+                // primary — the rare byproduct-only request is left to AE2's own path, not faked here.
+                GenericStack primaryStack = details.getPrimaryOutput();
+                if (primaryStack == null || !key.equals(primaryStack.what())) {
+                    continue;
+                }
                 List<GenericStack> outputs = details.getOutputs();
                 GenericStack primary = null;
                 List<CraftOutput<AEKey>> byproducts = new ArrayList<>(Math.max(0, outputs.size() - 1));
@@ -226,7 +249,7 @@ public final class FastCraftingPlanner {
                     }
                 }
                 if (primary == null) {
-                    return false; // defensive: key not actually produced here
+                    continue; // defensive: primary not enumerated in getOutputs(); skip this pattern
                 }
 
                 // Per-slot acceptable concrete options for the hard-fuzzy (OR) expansion.
@@ -297,6 +320,10 @@ public final class FastCraftingPlanner {
                 // Keep the best (lowest rank-sum) up to FUZZY_NONCYCLE_STEPS combinations; when the
                 // product is within budget this emits all of them, otherwise it greedily keeps the front.
                 emitBestCombinations(builder, seen, queue, key, outAmount, byproducts, slotOptions, details);
+                registeredForKey++;
+            }
+            if (registeredForKey > 1) {
+                multiplePaths[0] = true; // genuinely distinct recipes whose primary output is `key`
             }
         }
         return true;
