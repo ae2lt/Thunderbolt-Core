@@ -2,11 +2,13 @@ package com.moakiee.thunderbolt.ae2.crafting;
 
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collection;
 import java.util.Comparator;
 import java.util.Deque;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -25,6 +27,9 @@ import appeng.crafting.CraftingPlan;
 import appeng.crafting.inv.ChildCraftingSimulationState;
 import appeng.crafting.inv.CraftingSimulationState;
 
+import com.moakiee.thunderbolt.ae2.overload.model.MatchMode;
+import com.moakiee.thunderbolt.ae2.overload.pattern.OverloadPatternDetails;
+import com.moakiee.thunderbolt.ae2.overload.pattern.OverloadedProviderOnlyPatternDetails;
 import com.moakiee.thunderbolt.core.planner.BoundedCombinations;
 import com.moakiee.thunderbolt.core.planner.CraftGraph;
 import com.moakiee.thunderbolt.core.planner.CraftInput;
@@ -77,6 +82,13 @@ import com.moakiee.thunderbolt.core.planner.Sat;
  * "what the fuzzy slot actually resolved" is the responsibility of the executing CPU (the batch crafting
  * CPU logic), which sees the real extraction. The planner intentionally does not try to predict AE2's
  * runtime fuzzy resolution here — see the batch CPU logic for the execution-side fix.
+ *
+ * <p><b>Planning-side ID_ONLY (ignore-NBT) aggregation.</b> Overload patterns may mark an input slot
+ * {@code ID_ONLY}: at execution any stack sharing the item id is accepted regardless of NBT. For such a
+ * slot the planner expands the candidate set with every same-item stack already in the network (via
+ * {@code findFuzzyTemplates}/{@code IGNORE_ALL}) so the slot's available stock is counted as the
+ * cross-NBT sum. Without this the planner would only see the exact declared template and report a false
+ * shortfall whenever the item is held under a different NBT variant.
  *
  * <p>Byte accounting reproduces AE2's formulas (see {@code CraftingTreeNode#request},
  * {@code CraftingTreeProcess#request} and {@code ICraftingSimulationState#addStackBytes}) over the
@@ -254,19 +266,27 @@ public final class FastCraftingPlanner {
 
                 // Per-slot acceptable concrete options for the hard-fuzzy (OR) expansion.
                 IPatternDetails.IInput[] inputs = details.getInputs();
+                // Overload patterns expose per-slot match modes; an ID_ONLY (ignore-NBT) slot accepts any
+                // stack sharing the item id, so its available stock is the SUM across NBT variants. The
+                // slot index here lines up with how Ae2OverloadPatternDetails wrapped getInputs().
+                OverloadPatternDetails overloadView = details instanceof OverloadedProviderOnlyPatternDetails op
+                        ? op.overloadPatternDetailsView()
+                        : null;
                 List<List<CraftInput<AEKey>>> slotOptions = new ArrayList<>(inputs.length);
                 long combos = 1;
                 boolean patternUnsatisfiable = false;
-                for (IPatternDetails.IInput in : inputs) {
+                for (int slot = 0; slot < inputs.length; slot++) {
+                    IPatternDetails.IInput in = inputs[slot];
                     // Durability tool slot: collapse the degradation chain to one finite-use token.
                     DurabilityChain<AEKey> chain = durabilityChain(in, snapshot, builder, durability);
                     if (chain != null) {
                         slotOptions.add(List.of(CraftInput.of(chain.carrier(), Math.max(1, in.getMultiplier()))));
                         continue; // single deterministic option, never enqueued for crafting
                     }
-                    GenericStack[] possible = in.getPossibleInputs();
-                    List<CraftInput<AEKey>> opts = new ArrayList<>(possible.length);
-                    for (GenericStack template : possible) {
+                    boolean idOnly = overloadView != null && overloadView.inputMode(slot) == MatchMode.ID_ONLY;
+                    List<GenericStack> templates = idOnlyTemplates(in, idOnly, snapshot);
+                    List<CraftInput<AEKey>> opts = new ArrayList<>(templates.size());
+                    for (GenericStack template : templates) {
                         AEKey inputKey = template.what();
                         long amt = Sat.mul(template.amount(), in.getMultiplier());
                         AEKey remaining = in.getRemainingKey(inputKey) instanceof AEKey r ? r : null;
@@ -327,6 +347,32 @@ public final class FastCraftingPlanner {
             }
         }
         return true;
+    }
+
+    /**
+     * Concrete templates to consider for one input slot. A normal slot uses the pattern's declared
+     * possible inputs verbatim. An ID_ONLY (ignore-NBT) overload slot additionally pulls every same-item
+     * stack already in the network ({@code findFuzzyTemplates} uses {@code FuzzyMode.IGNORE_ALL} = same
+     * item id regardless of NBT/damage), each carrying the slot's per-craft amount. The v2 planner then
+     * treats them as competing inputs and splits firings across them, so the slot's effective stock is the
+     * cross-NBT sum — eliminating false "missing" when the item is only held under an NBT variant the
+     * pattern never enumerated. Crafting still works because the original declared template is kept first
+     * (so its pattern is discovered) and AE2's executing CPU reconciles the actually-extracted variant.
+     */
+    private static List<GenericStack> idOnlyTemplates(IPatternDetails.IInput in, boolean idOnly,
+                                                      ChildCraftingSimulationState snapshot) {
+        GenericStack[] possible = in.getPossibleInputs();
+        if (!idOnly) {
+            return Arrays.asList(possible);
+        }
+        LinkedHashMap<AEKey, GenericStack> byKey = new LinkedHashMap<>();
+        for (GenericStack template : possible) {
+            byKey.putIfAbsent(template.what(), template);
+            for (AEKey fuzzy : snapshot.findFuzzyTemplates(template.what())) {
+                byKey.putIfAbsent(fuzzy, new GenericStack(fuzzy, template.amount()));
+            }
+        }
+        return new ArrayList<>(byKey.values());
     }
 
     /**

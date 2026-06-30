@@ -157,7 +157,7 @@ public final class BatchExecutor {
 
                 ParallelBatchCpuHelper.markDispatched(result, dispatched);
                 es.extractAEPower(powerOne * dispatched, Actionable.MODULATE, PowerMultiplier.CONFIG);
-                ParallelBatchCpuHelper.registerExpectedOutputs(job, details, dispatched);
+                ParallelBatchCpuHelper.registerExpectedOutputs(job, details, result.keys, dispatched);
                 dirty = true;
 
                 int opsCost = BatchCpuAccounting.cpuOpsForCopies(dispatched);

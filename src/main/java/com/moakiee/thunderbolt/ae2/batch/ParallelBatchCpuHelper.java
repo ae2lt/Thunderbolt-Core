@@ -171,17 +171,28 @@ public final class ParallelBatchCpuHelper {
         }
     }
 
-    public static void registerExpectedOutputs(BatchJobView job, IPatternDetails details, int dispatched) {
+    public static void registerExpectedOutputs(BatchJobView job, IPatternDetails details,
+                                               AEKey[] chosenKeys, int dispatched) {
         if (dispatched <= 0) return;
 
         for (var output : details.getOutputs()) {
             job.insertWaitingFor(output.what(), output.amount() * (long) dispatched);
         }
 
-        for (var input : details.getInputs()) {
+        var inputs = details.getInputs();
+        for (int i = 0; i < inputs.length; i++) {
+            var input = inputs[i];
             var possibles = input.getPossibleInputs();
             if (possibles.length == 0) continue;
-            AEKey containerKey = input.getRemainingKey(possibles[0].what());
+            // Use the substitute actually extracted for this slot (bulkExtract's choice), not
+            // possibles[0]: a fuzzy slot's variants can hand back different leftover containers
+            // (e.g. different filled containers -> different empties), so keying the expected
+            // container off the first candidate would make the job wait for / credit the wrong
+            // leftover. chosenKeys is aligned 1:1 with details.getInputs() by bulkExtract.
+            AEKey consumedKey = (chosenKeys != null && i < chosenKeys.length && chosenKeys[i] != null)
+                    ? chosenKeys[i]
+                    : possibles[0].what();
+            AEKey containerKey = input.getRemainingKey(consumedKey);
             if (containerKey != null) {
                 long count = input.getMultiplier() * (long) dispatched;
                 job.insertWaitingFor(containerKey, count);
