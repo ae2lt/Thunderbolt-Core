@@ -91,8 +91,12 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
     private final Map<IPatternDetails, IdentityHashMap<ICraftingProvider, Boolean>> batchedByTask = new HashMap<>();
     private final ArrayDeque<IPatternDetails>[] taskWheel = createWheel();
     private final Set<IPatternDetails> queuedTasks = Collections.newSetFromMap(new IdentityHashMap<>());
-    private final Map<AEKey, Set<IPatternDetails>> parkedByMissingKey = new HashMap<>();
-    private final Map<IPatternDetails, Set<AEKey>> parkedMissingKeysByTask = new IdentityHashMap<>();
+    // Parked tasks are indexed by AEKey#getPrimaryKey() (item id, ignoring components/damage), not the
+    // exact declared input key: providers like the matter warping matrix return container items as a
+    // DIFFERENT exact key (e.g. a durability tool at damage+1), and an exact-key index would never see
+    // the return and leave the task to the 32-tick safety poll alone.
+    private final Map<Object, Set<IPatternDetails>> parkedByMissingKey = new HashMap<>();
+    private final Map<IPatternDetails, Set<Object>> parkedMissingKeysByTask = new IdentityHashMap<>();
     private final Set<AEKey> batchedStatusChanges = new HashSet<>();
     private final List<AEKey> statusChangeScratch = new ArrayList<>();
     private final Set<IPatternDetails> nonBatchTasksThisTick = Collections.newSetFromMap(new IdentityHashMap<>());
@@ -1079,16 +1083,20 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
         }
 
         int newCursor = (wheelCursor + delta) & WHEEL_MASK;
-        if (delta > 1) {
-            // A tick gap (server stall, chunk reload) would otherwise jump the cursor straight over
-            // intermediate buckets, stranding their tasks for a whole wheel revolution (up to 63
-            // ticks). Everything in a skipped bucket is due by now, so drain it into the new bucket.
-            var dest = taskWheel[newCursor];
-            for (int i = 1; i < delta; i++) {
-                var skipped = taskWheel[(wheelCursor + i) & WHEEL_MASK];
-                while (!skipped.isEmpty()) {
-                    dest.addLast(skipped.pollFirst());
-                }
+        // Everything in a bucket the cursor moves off of is due by now, INCLUDING the old cursor
+        // bucket itself: wakes and job (re)builds that run outside executeCrafting (e.g. a provider
+        // returning outputs during the post-tick sweep) schedule with delay 0 into the bucket that
+        // was already polled this tick. Without draining it, such a task would silently sleep a
+        // whole wheel revolution (~64 ticks) — and a tick gap (server stall, chunk reload) would
+        // likewise strand every skipped bucket's tasks.
+        var dest = taskWheel[newCursor];
+        for (int i = 0; i < delta; i++) {
+            var skipped = taskWheel[(wheelCursor + i) & WHEEL_MASK];
+            if (skipped == dest) {
+                continue;
+            }
+            while (!skipped.isEmpty()) {
+                dest.addLast(skipped.pollFirst());
             }
         }
         wheelCursor = newCursor;
@@ -1156,14 +1164,18 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
         }
 
         unparkTask(details);
-        var taskKeys = new HashSet<AEKey>();
+        var taskKeys = new HashSet<Object>();
         for (var key : missingKeys) {
-            if (key == null || !taskKeys.add(key)) {
+            if (key == null) {
+                continue;
+            }
+            var primaryKey = key.getPrimaryKey();
+            if (primaryKey == null || !taskKeys.add(primaryKey)) {
                 continue;
             }
             parkedByMissingKey
                     .computeIfAbsent(
-                            key,
+                            primaryKey,
                             ignored -> Collections.newSetFromMap(new IdentityHashMap<IPatternDetails, Boolean>()))
                     .add(details);
         }
@@ -1310,7 +1322,7 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
             return;
         }
 
-        var waitingTasks = parkedByMissingKey.remove(what);
+        var waitingTasks = parkedByMissingKey.remove(what.getPrimaryKey());
         if (waitingTasks == null || waitingTasks.isEmpty()) {
             return;
         }
