@@ -28,10 +28,19 @@ public final class BatchExecutor {
      * its overload-only pattern type). Defaults to "skip nothing" so the lib works standalone.
      */
     private static volatile Predicate<IPatternDetails> skipRule = details -> false;
+    private static volatile Predicate<IPatternDetails> batchEligibleRule = details -> true;
 
     /** Installs the pattern skip rule. Call once from the host mod's setup. */
     public static void setSkipRule(Predicate<IPatternDetails> rule) {
         skipRule = rule != null ? rule : details -> false;
+    }
+
+    /**
+     * Installs the pattern eligibility rule for batch providers. Defaults to "try every pattern"
+     * so standalone library users keep the original behavior.
+     */
+    public static void setBatchEligibleRule(Predicate<IPatternDetails> rule) {
+        batchEligibleRule = rule != null ? rule : details -> true;
     }
 
     public static BatchRunResult runBatchOnly(int remainingOps,
@@ -66,17 +75,22 @@ public final class BatchExecutor {
             if (skipRule.test(details)) {
                 continue;
             }
+            if (!batchEligibleRule.test(details)) {
+                continue;
+            }
 
-            var perTaskBatched = batchedByTask.computeIfAbsent(details, key -> new IdentityHashMap<>());
-
-            var eligible = new java.util.ArrayList<EligibleProvider>();
+            var perTaskBatched = batchedByTask.get(details);
+            java.util.ArrayList<EligibleProvider> eligible = null;
             long availableBatchCapacity = 0;
             for (var provider : cs.getProviders(details)) {
                 if (!(provider instanceof IBatchCraftingProvider batch)) continue;
                 sawBatchProvider = true;
-                if (perTaskBatched.containsKey(provider)) continue;
+                if (perTaskBatched != null && perTaskBatched.containsKey(provider)) continue;
                 int capacity = batch.getBatchCapacity(details);
                 if (capacity <= 0) continue;
+                if (eligible == null) {
+                    eligible = new java.util.ArrayList<>();
+                }
                 eligible.add(new EligibleProvider(batch, capacity));
                 availableBatchCapacity += capacity;
                 if (availableBatchCapacity >= Integer.MAX_VALUE) {
@@ -84,7 +98,7 @@ public final class BatchExecutor {
                     break;
                 }
             }
-            if (eligible.isEmpty() || availableBatchCapacity <= 0) continue;
+            if (eligible == null || availableBatchCapacity <= 0) continue;
 
             // Dispatch smaller-capacity providers first: the even split (leftover/remaining) grows
             // as remaining shrinks, so leaving the largest provider last lets it absorb the
@@ -170,6 +184,9 @@ public final class BatchExecutor {
                 leftover -= dispatched;
 
                 if (initialRealCraft > 1) {
+                    if (perTaskBatched == null) {
+                        perTaskBatched = batchedByTask.computeIfAbsent(details, key -> new IdentityHashMap<>());
+                    }
                     perTaskBatched.put((ICraftingProvider) batch, Boolean.TRUE);
                 }
 

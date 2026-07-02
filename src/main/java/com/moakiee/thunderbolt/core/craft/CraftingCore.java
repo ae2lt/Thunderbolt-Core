@@ -1,5 +1,12 @@
 package com.moakiee.thunderbolt.core.craft;
 
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.IdentityHashMap;
+import java.util.List;
+import java.util.Map;
+
 import net.minecraft.core.HolderLookup;
 import net.minecraft.nbt.CompoundTag;
 import net.minecraft.nbt.ListTag;
@@ -35,6 +42,7 @@ public final class CraftingCore implements Sweepable {
     private final CopyAssembler assembler;
     private final CraftingCoreRegistry registry;
     private final WheelCell[] wheel = new WheelCell[WHEEL_SIZE];
+    private final Map<IPatternDetails, Map<InputSignature, CachedAssembly>> assemblyCache = new IdentityHashMap<>();
     private int threadsInFlight;
     private long lastSweptTick;
 
@@ -75,7 +83,7 @@ public final class CraftingCore implements Sweepable {
 
         CopyAssembler.AssembledCopy assembled;
         try {
-            assembled = assembler.assembleOneCopy(details, oneCopyTemplate);
+            assembled = assembleOneCopyCached(details, oneCopyTemplate);
         } catch (Throwable t) {
             appeng.core.AELog.warn("[ae2lt] batch crafting core assemble failed for %s; dropping %d copies. %s",
                     details, copies, t);
@@ -99,6 +107,35 @@ public final class CraftingCore implements Sweepable {
         threadsInFlight += accepted;
         registry.markActive(this);
         return accepted;
+    }
+
+    private CopyAssembler.AssembledCopy assembleOneCopyCached(IPatternDetails details,
+                                                              KeyCounter[] oneCopyTemplate) {
+        var signature = InputSignature.capture(oneCopyTemplate);
+        var byInput = assemblyCache.computeIfAbsent(details, ignored -> new HashMap<>());
+        var cached = byInput.get(signature);
+        if (cached != null) {
+            return cached.cacheable() ? cached.assembled() : assembler.assembleOneCopy(details, oneCopyTemplate);
+        }
+
+        var assembled = assembler.assembleOneCopy(details, oneCopyTemplate);
+        byInput.put(signature, isExpectedAssembly(details, assembled)
+                ? CachedAssembly.cacheable(assembled)
+                : CachedAssembly.uncacheable());
+        return assembled;
+    }
+
+    private static boolean isExpectedAssembly(IPatternDetails details, CopyAssembler.AssembledCopy assembled) {
+        if (assembled == null || assembled.output() == null || assembled.outputCount() <= 0) {
+            return false;
+        }
+
+        for (var output : details.getOutputs()) {
+            if (assembled.output().equals(output.what()) && assembled.outputCount() == output.amount()) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /** In-flight copies currently scheduled in the wheel cell at {@code slot} (mod wheel size). */
@@ -294,5 +331,42 @@ public final class CraftingCore implements Sweepable {
         if (key != null && amount > 0) {
             cell.outputs.put(key, saturatedAdd(cell.outputs.getLong(key), amount));
         }
+    }
+
+    private record CachedAssembly(boolean cacheable, CopyAssembler.AssembledCopy assembled) {
+        private static CachedAssembly cacheable(CopyAssembler.AssembledCopy assembled) {
+            var remainders = assembled.remainders() != null ? List.copyOf(assembled.remainders()) : List.<CopyAssembler.Stack>of();
+            return new CachedAssembly(
+                    true,
+                    new CopyAssembler.AssembledCopy(assembled.output(), assembled.outputCount(), remainders));
+        }
+
+        private static CachedAssembly uncacheable() {
+            return new CachedAssembly(false, null);
+        }
+    }
+
+    private record InputSignature(List<List<InputEntry>> slots) {
+        private static InputSignature capture(KeyCounter[] inputs) {
+            var slots = new ArrayList<List<InputEntry>>(inputs.length);
+            for (var input : inputs) {
+                var entries = new ArrayList<InputEntry>();
+                if (input != null) {
+                    for (var entry : input) {
+                        if (entry.getKey() != null && entry.getLongValue() > 0) {
+                            entries.add(new InputEntry(entry.getKey(), entry.getLongValue()));
+                        }
+                    }
+                }
+                entries.sort(Comparator
+                        .comparingInt((InputEntry entry) -> entry.key().hashCode())
+                        .thenComparing(entry -> entry.key().toString()));
+                slots.add(List.copyOf(entries));
+            }
+            return new InputSignature(List.copyOf(slots));
+        }
+    }
+
+    private record InputEntry(AEKey key, long amount) {
     }
 }

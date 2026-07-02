@@ -1,6 +1,7 @@
 package com.moakiee.thunderbolt.ae2.timewheel;
 
 import java.util.ArrayDeque;
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -69,6 +70,7 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
     private static final int WHEEL_MASK = WHEEL_SIZE - 1;
     private static final int MAX_TASK_PROBES_PER_TICK = 262_144;
     private static final int RETRY_DELAY_TICKS = 4;
+    private static final int PARKED_TASK_SAFETY_DELAY_TICKS = 32;
     private static final String TAG_INVENTORY = "inventory";
     private static final String TAG_JOB = "job";
     private static final String TAG_OVERLOAD_STATE = "ae2ltOverloadState";
@@ -89,10 +91,14 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
     private final Map<IPatternDetails, IdentityHashMap<ICraftingProvider, Boolean>> batchedByTask = new HashMap<>();
     private final ArrayDeque<IPatternDetails>[] taskWheel = createWheel();
     private final Set<IPatternDetails> queuedTasks = Collections.newSetFromMap(new IdentityHashMap<>());
+    private final Map<AEKey, Set<IPatternDetails>> parkedByMissingKey = new HashMap<>();
+    private final Map<IPatternDetails, Set<AEKey>> parkedMissingKeysByTask = new IdentityHashMap<>();
     private final Set<AEKey> batchedStatusChanges = new HashSet<>();
+    private final List<AEKey> statusChangeScratch = new ArrayList<>();
     private final Set<IPatternDetails> nonBatchTasksThisTick = Collections.newSetFromMap(new IdentityHashMap<>());
     private final KeyCounter scratchExpectedOutputs = new KeyCounter();
     private final KeyCounter scratchExpectedContainerItems = new KeyCounter();
+    private final SingleTaskBatchJobView scratchBatchJobView = new SingleTaskBatchJobView();
     // Pattern power depends only on the (fixed) input amounts of a pattern, so it is constant across
     // every copy pushed for a given task. Caching it removes calculatePatternPower from the hot
     // per-copy dispatch loop (it was ~7% of the CPU tick in profiling). Keyed by pattern identity;
@@ -256,12 +262,10 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
                 var outcome = pushOnePattern(activeJob, task, details, craftingService, energyService, level);
                 if (outcome == DispatchOutcome.PUSHED) {
                     usedOps++;
+                    unparkTask(details);
                     rescheduleIfStillPending(activeJob, details, 0);
                 } else {
-                    rescheduleIfStillPending(
-                            activeJob,
-                            details,
-                            outcome == DispatchOutcome.RETRY_LATER ? RETRY_DELAY_TICKS : 1);
+                    rescheduleFailedTask(activeJob, details, outcome);
                 }
             }
         } finally {
@@ -290,7 +294,7 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
                 craftingService,
                 energyService,
                 level,
-                new SingleTaskBatchJobView(activeJob, details),
+                scratchBatchJobView.bind(activeJob, details),
                 inventory,
                 batchedByTask,
                 () -> {
@@ -323,7 +327,7 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
         if (craftingContainer == null) {
             clearScratchCounter(expectedOutputs);
             clearScratchCounter(expectedContainerItems);
-            return DispatchOutcome.RETRY_LATER;
+            return DispatchOutcome.RETRY_MISSING_INPUT;
         }
 
         boolean pushed = false;
@@ -336,7 +340,7 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
 
                 if (energyService.extractAEPower(patternPower, Actionable.SIMULATE,
                         PowerMultiplier.CONFIG) < patternPower - 0.01D) {
-                    return DispatchOutcome.RETRY_LATER;
+                    return DispatchOutcome.RETRY_NO_POWER;
                 }
 
                 if (!provider.pushPattern(details, craftingContainer)) {
@@ -388,7 +392,9 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
         // Skip the (SIMULATE + MODULATE) extraction entirely if nothing can accept a push right
         // now. Busy providers typically free up within a tick, so retry on the next one (same
         // cadence as the vanilla path's RETRY_SOON, NOT the 4-tick energy/missing-input backoff).
-        if (!hasFreeProvider(craftingService, details)) {
+        var providers = providersForSinglePush(craftingService, details).iterator();
+        var firstProvider = nextFreeProvider(providers);
+        if (firstProvider == null) {
             return new BulkPush(0, 1);
         }
 
@@ -422,10 +428,8 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
         int dispatched = 0;
         boolean freeProviderRejected = false;
         try {
-            for (var provider : providersForSinglePush(craftingService, details)) {
-                if (dispatched >= affordable) {
-                    break;
-                }
+            var provider = firstProvider;
+            while (provider != null && dispatched < affordable) {
                 while (dispatched < affordable && !provider.isBusy()) {
                     if (pending == null) {
                         pending = ParallelBatchCpuHelper.cloneSingleCopy(result);
@@ -441,6 +445,7 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
                     ParallelBatchCpuHelper.markDispatched(result, 1);
                     dispatched++;
                 }
+                provider = nextFreeProvider(providers);
             }
         } finally {
             int leftover = actual - dispatched;
@@ -450,7 +455,7 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
         }
 
         if (dispatched > 0) {
-            var jobView = new SingleTaskBatchJobView(activeJob, details);
+            var jobView = scratchBatchJobView.bind(activeJob, details);
             ParallelBatchCpuHelper.registerExpectedOutputs(jobView, details, result, dispatched);
             consumeTaskCopies(activeJob, details, dispatched);
             cpu.markDirty();
@@ -468,13 +473,15 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
         return new BulkPush(0, 1);
     }
 
-    private boolean hasFreeProvider(CraftingService craftingService, IPatternDetails details) {
-        for (var provider : providersForSinglePush(craftingService, details)) {
+    @Nullable
+    private ICraftingProvider nextFreeProvider(Iterator<ICraftingProvider> providers) {
+        while (providers.hasNext()) {
+            var provider = providers.next();
             if (!provider.isBusy()) {
-                return true;
+                return provider;
             }
         }
-        return false;
+        return null;
     }
 
     public long insert(AEKey what, long amount, Actionable type) {
@@ -534,7 +541,7 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
             }
         } else if (type == Actionable.MODULATE) {
             inventory.insert(what, amount, Actionable.MODULATE);
-            wakeSchedulerForReturnedInput();
+            wakeSchedulerForReturnedInput(what);
         }
 
         return inserted;
@@ -932,7 +939,7 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
 
         decrementItems(activeJob.timeTracker, claimed, incoming.getType());
         inventory.insert(incoming, claimed, Actionable.MODULATE);
-        wakeSchedulerForReturnedInput();
+        wakeSchedulerForReturnedInput(incoming);
         return claimed;
     }
 
@@ -998,6 +1005,7 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
     }
 
     private void removeTask(TimeWheelJob activeJob, IPatternDetails details) {
+        unparkTask(details);
         var removed = activeJob.tasks.remove(details);
         if (removed != null && removed.value > 0) {
             activeJob.removePendingOutputs(details, removed.value);
@@ -1042,7 +1050,10 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
     }
 
     private boolean needsSchedulerRebuild(TimeWheelJob activeJob) {
-        return !activeJob.tasks.isEmpty() && (queuedTasks.isEmpty() || !hasScheduledWheelEntries());
+        return !activeJob.tasks.isEmpty()
+                && queuedTasks.isEmpty()
+                && parkedMissingKeysByTask.isEmpty()
+                && !hasScheduledWheelEntries();
     }
 
     private boolean hasScheduledWheelEntries() {
@@ -1103,6 +1114,7 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
             bucket.clear();
         }
         queuedTasks.clear();
+        clearParkedTasks();
         queueRebuildNeeded = true;
     }
 
@@ -1118,6 +1130,129 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
         taskWheel[slot].addLast(details);
     }
 
+    private void unscheduleTask(IPatternDetails details) {
+        boolean removed = false;
+        for (var bucket : taskWheel) {
+            for (var iterator = bucket.iterator(); iterator.hasNext(); ) {
+                if (iterator.next() == details) {
+                    iterator.remove();
+                    removed = true;
+                }
+            }
+        }
+        if (removed) {
+            queuedTasks.remove(details);
+        }
+    }
+
+    private boolean parkTaskForMissingInputs(TimeWheelJob activeJob, IPatternDetails details) {
+        if (!activeJob.tasks.containsKey(details)) {
+            return false;
+        }
+
+        var missingKeys = findMissingInputKeys(details);
+        if (missingKeys.isEmpty()) {
+            return false;
+        }
+
+        unparkTask(details);
+        var taskKeys = new HashSet<AEKey>();
+        for (var key : missingKeys) {
+            if (key == null || !taskKeys.add(key)) {
+                continue;
+            }
+            parkedByMissingKey
+                    .computeIfAbsent(
+                            key,
+                            ignored -> Collections.newSetFromMap(new IdentityHashMap<IPatternDetails, Boolean>()))
+                    .add(details);
+        }
+        if (taskKeys.isEmpty()) {
+            return false;
+        }
+        parkedMissingKeysByTask.put(details, taskKeys);
+        return true;
+    }
+
+    private void unparkTask(IPatternDetails details) {
+        var keys = parkedMissingKeysByTask.remove(details);
+        if (keys == null || keys.isEmpty()) {
+            return;
+        }
+
+        for (var key : keys) {
+            var tasks = parkedByMissingKey.get(key);
+            if (tasks == null) {
+                continue;
+            }
+            tasks.remove(details);
+            if (tasks.isEmpty()) {
+                parkedByMissingKey.remove(key);
+            }
+        }
+    }
+
+    private void clearParkedTasks() {
+        parkedByMissingKey.clear();
+        parkedMissingKeysByTask.clear();
+    }
+
+    private Set<AEKey> findMissingInputKeys(IPatternDetails details) {
+        var exactRequired = new HashMap<AEKey, Long>();
+        var ambiguousKeys = new HashSet<AEKey>();
+        var missing = new HashSet<AEKey>();
+
+        for (var input : details.getInputs()) {
+            long multiplier = input.getMultiplier();
+            var possibles = input.getPossibleInputs();
+            if (possibles.length == 0) {
+                continue;
+            }
+
+            if (possibles.length == 1) {
+                var possible = possibles[0];
+                var key = possible.what();
+                long perCopy = multiplySaturated(possible.amount(), multiplier);
+                if (key == null || perCopy <= 0) {
+                    continue;
+                }
+                exactRequired.merge(key, perCopy, Ae2LtTimeWheelCraftingCpuLogic::addSaturated);
+                continue;
+            }
+
+            boolean slotSatisfied = false;
+            var slotKeys = new HashSet<AEKey>();
+            for (var possible : possibles) {
+                var key = possible.what();
+                long perCopy = multiplySaturated(possible.amount(), multiplier);
+                if (key == null || perCopy <= 0) {
+                    continue;
+                }
+                slotKeys.add(key);
+                if (inventory.extract(key, perCopy, Actionable.SIMULATE) >= perCopy) {
+                    slotSatisfied = true;
+                }
+            }
+
+            ambiguousKeys.addAll(slotKeys);
+            if (!slotSatisfied) {
+                missing.addAll(slotKeys);
+            }
+        }
+
+        for (var entry : exactRequired.entrySet()) {
+            long required = entry.getValue();
+            if (required > 0 && inventory.extract(entry.getKey(), required, Actionable.SIMULATE) < required) {
+                missing.add(entry.getKey());
+            }
+        }
+
+        if (missing.isEmpty()) {
+            missing.addAll(ambiguousKeys);
+        }
+        return missing;
+    }
+
     @Nullable
     private IPatternDetails pollDueTask(TimeWheelJob activeJob) {
         var bucket = taskWheel[wheelCursor];
@@ -1126,6 +1261,7 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
             queuedTasks.remove(details);
             var task = activeJob.tasks.get(details);
             if (task != null && task.value > 0) {
+                unparkTask(details);
                 return details;
             }
         }
@@ -1137,6 +1273,24 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
         if (task != null && task.value > 0) {
             scheduleTask(details, delayTicks);
         }
+    }
+
+    private void rescheduleFailedTask(TimeWheelJob activeJob, IPatternDetails details, DispatchOutcome outcome) {
+        if (outcome == DispatchOutcome.RETRY_MISSING_INPUT && parkTaskForMissingInputs(activeJob, details)) {
+            rescheduleIfStillPending(activeJob, details, PARKED_TASK_SAFETY_DELAY_TICKS);
+            return;
+        }
+
+        unparkTask(details);
+        rescheduleIfStillPending(activeJob, details, retryDelayTicks(outcome));
+    }
+
+    private int retryDelayTicks(DispatchOutcome outcome) {
+        return switch (outcome) {
+            case RETRY_SOON -> 1;
+            case RETRY_MISSING_INPUT, RETRY_NO_POWER, RETRY_LATER -> RETRY_DELAY_TICKS;
+            case PUSHED -> 0;
+        };
     }
 
     private void carryOverDueTasks() {
@@ -1151,9 +1305,21 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
         }
     }
 
-    private void wakeSchedulerForReturnedInput() {
-        if (this.job != null) {
-            this.queueRebuildNeeded = true;
+    private void wakeSchedulerForReturnedInput(AEKey what) {
+        if (this.job == null || what == null) {
+            return;
+        }
+
+        var waitingTasks = parkedByMissingKey.remove(what);
+        if (waitingTasks == null || waitingTasks.isEmpty()) {
+            return;
+        }
+
+        var tasksToWake = new ArrayList<>(waitingTasks);
+        for (var details : tasksToWake) {
+            unparkTask(details);
+            unscheduleTask(details);
+            scheduleTask(details, 0);
         }
     }
 
@@ -1185,13 +1351,15 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
         }
 
         lastModifiedOnTick = TickHandler.instance().getCurrentTick();
-        var changed = Set.copyOf(batchedStatusChanges);
+        statusChangeScratch.clear();
+        statusChangeScratch.addAll(batchedStatusChanges);
         batchedStatusChanges.clear();
-        for (var key : changed) {
+        for (var key : statusChangeScratch) {
             for (var listener : listeners) {
                 listener.accept(key);
             }
         }
+        statusChangeScratch.clear();
     }
 
     private void postPatternOutputsChange(IPatternDetails details) {
@@ -1262,9 +1430,21 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
         return left * right;
     }
 
+    private static long addSaturated(long left, long right) {
+        if (right <= 0) {
+            return left;
+        }
+        if (left > Long.MAX_VALUE - right) {
+            return Long.MAX_VALUE;
+        }
+        return left + right;
+    }
+
     private enum DispatchOutcome {
         PUSHED,
         RETRY_SOON,
+        RETRY_MISSING_INPUT,
+        RETRY_NO_POWER,
         RETRY_LATER
     }
 
@@ -1520,13 +1700,15 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
     }
 
     private final class SingleTaskBatchJobView implements BatchJobView, BatchTaskHandle, Iterator<BatchTaskHandle> {
-        private final TimeWheelJob activeJob;
-        private final IPatternDetails details;
+        private TimeWheelJob activeJob;
+        private IPatternDetails details;
         private boolean consumed;
 
-        private SingleTaskBatchJobView(TimeWheelJob activeJob, IPatternDetails details) {
+        private SingleTaskBatchJobView bind(TimeWheelJob activeJob, IPatternDetails details) {
             this.activeJob = activeJob;
             this.details = details;
+            this.consumed = false;
+            return this;
         }
 
         @Override
