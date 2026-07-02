@@ -50,6 +50,9 @@ public abstract class CraftingCalculationMixin implements FastCraftingControl {
     @Shadow
     private boolean simulate;
 
+    @Shadow
+    abstract net.minecraft.world.level.Level getLevel();
+
     @Unique
     private boolean ae2lt$fastPlanningEnabled = CoreConfig.FAST_PATH_ENABLED;
 
@@ -78,7 +81,8 @@ public abstract class CraftingCalculationMixin implements FastCraftingControl {
         FastPlanningWatchdog.start(
                 "output=" + this.output + " requested=" + amount + " simulate=" + simulate + " engine=thunderbolt");
         try {
-            var attempt = FastCraftingPlanner.tryAttempt(craftingService, networkInv, output, amount, simulate);
+            var attempt = FastCraftingPlanner.tryAttempt(
+                    craftingService, networkInv, getLevel(), output, amount, simulate);
             if (attempt.handled()) {
                 // Reproduce the side effect of the real method body we are skipping, so that
                 // CraftingCalculation#isSimulation() reflects the attempt that produced this plan.

@@ -57,7 +57,10 @@ public final class CraftGraph<K> {
         }
 
         public Builder<K> stock(K key, long amount) {
-            stock.merge(key, amount, Long::sum);
+            // Saturating: a durability carrier's aggregate uses can already sit at the saturation
+            // cap; a plain Long::sum could overflow negative and stock() would clamp it to zero,
+            // turning a huge supply into a false shortfall.
+            stock.merge(key, amount, Sat::add);
             return this;
         }
 

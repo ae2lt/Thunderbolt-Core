@@ -23,6 +23,7 @@ import appeng.api.stacks.AEKey;
 import appeng.api.stacks.GenericStack;
 import appeng.api.stacks.KeyCounter;
 import net.minecraft.world.item.Item;
+import net.minecraft.world.level.Level;
 import appeng.crafting.CraftingPlan;
 import appeng.crafting.inv.ChildCraftingSimulationState;
 import appeng.crafting.inv.CraftingSimulationState;
@@ -135,6 +136,7 @@ public final class FastCraftingPlanner {
      */
     public static FastAttempt tryAttempt(ICraftingService craftingService,
                                          CraftingSimulationState networkInv,
+                                         Level level,
                                          AEKey output,
                                          long amount,
                                          boolean simulate) {
@@ -151,8 +153,11 @@ public final class FastCraftingPlanner {
         boolean[] multiplePaths = {false};
         Map<AEKey, DurabilityChain<AEKey>> durability = new HashMap<>();
         Set<AEKey> emittable = new HashSet<>();
-        if (!buildGraph(craftingService, snapshot, output, builder, multiplePaths, durability, emittable)) {
-            return FastAttempt.decline(); // defensive: buildGraph rarely declines now
+        if (!buildGraph(craftingService, snapshot, level, output, builder, multiplePaths, durability, emittable)) {
+            // Rare hard declines only: e.g. a key used both as a durability carrier (priced in uses)
+            // and as a plain whole-item input — two unit systems on one pool. AE2's exact simulator
+            // handles those correctly, and correctness beats speed for the odd setup that hits this.
+            return FastAttempt.decline();
         }
 
         CraftPlan<AEKey> plan = CraftPlannerV2.plan(builder.build(), output, amount);
@@ -191,6 +196,7 @@ public final class FastCraftingPlanner {
     /** BFS the reachable recipe graph; returns false to decline the fast path. */
     private static boolean buildGraph(ICraftingService craftingService,
                                       ChildCraftingSimulationState snapshot,
+                                      Level level,
                                       AEKey root,
                                       CraftGraph.Builder<AEKey> builder,
                                       boolean[] multiplePaths,
@@ -201,6 +207,18 @@ public final class FastCraftingPlanner {
         // Memoized "how much is already in the network" per key (SIMULATE probe), used to rank fuzzy
         // substitutes most-available-first so the bounded keep-best-32 picks the cheapest routes.
         Map<AEKey, Long> availability = new HashMap<>();
+        // Unit-system bookkeeping. A durability chain prices its links in USES (carrier pool); every
+        // other node is priced in whole ITEMS. The same physical stock must never be counted under
+        // both systems (or under two incompatible chains), so we track:
+        //   itemUnitKeys — keys stocked/consumed as whole items (BFS-polled nodes + plain inputs);
+        //   linkOwner    — every link of every registered chain -> that chain (uses-priced keys).
+        // linkOwner doubles as the merge index: a slot whose declared start key is a mid-chain link of
+        // an already-built chain reuses that chain when their step granularities line up ("相接"),
+        // instead of building a second, overlapping chain. Any overlap that ISN'T such a clean merge
+        // (a link priced as a whole item, or two chains stepping the same tool at different
+        // durability-per-craft granularities) is a genuine conflict -> decline to AE2's simulator.
+        Set<AEKey> itemUnitKeys = new HashSet<>();
+        Map<AEKey, DurabilityChain<AEKey>> linkOwner = new HashMap<>();
         seen.add(root);
         queue.add(root);
 
@@ -220,6 +238,7 @@ public final class FastCraftingPlanner {
                 if (available > 0) {
                     builder.stock(key, available);
                 }
+                itemUnitKeys.add(key); // this node is priced in whole items from here on
             }
 
             // Emitable items (e.g. via level/energy emitters) are an infinite on-demand source: keep
@@ -244,8 +263,8 @@ public final class FastCraftingPlanner {
                 // byproducts). So we skip non-primary views here: `key` is instead supplied from the
                 // byproduct pool when its real primary is crafted, never by a second firing of this
                 // source. Trade-off (accepted): an item that is ONLY ever a secondary output, with no
-                // pattern of its own, surfaces as missing rather than being made by over-producing the
-                // primary — the rare byproduct-only request is left to AE2's own path, not faked here.
+                // pattern of its own, surfaces as missing (Policy A best-effort) rather than being
+                // made by deliberately over-producing the primary.
                 GenericStack primaryStack = details.getPrimaryOutput();
                 if (primaryStack == null || !key.equals(primaryStack.what())) {
                     continue;
@@ -278,9 +297,21 @@ public final class FastCraftingPlanner {
                 for (int slot = 0; slot < inputs.length; slot++) {
                     IPatternDetails.IInput in = inputs[slot];
                     // Durability tool slot: collapse the degradation chain to one finite-use token.
-                    DurabilityChain<AEKey> chain = durabilityChain(in, snapshot, builder, durability);
+                    ChainLookup lookup = durabilityChain(in, craftingService, snapshot, level, builder,
+                            durability, linkOwner, itemUnitKeys);
+                    if (lookup.conflict()) {
+                        return false; // incompatible durability semantics -> AE2's exact simulator
+                    }
+                    DurabilityChain<AEKey> chain = lookup.chain();
                     if (chain != null) {
-                        slotOptions.add(List.of(CraftInput.of(chain.carrier(), Math.max(1, in.getMultiplier()))));
+                        // Chain "uses" per firing = tools in the slot x multiplier. One chain step
+                        // already encodes this slot's per-craft durability cost (the chain was built
+                        // from this slot's own getRemainingKey), so a 2-durability-per-craft recipe
+                        // simply produces a chain whose length is the firings a full tool survives.
+                        long usesPerFiring = Sat.mul(
+                                Math.max(1, in.getPossibleInputs()[0].amount()),
+                                Math.max(1, in.getMultiplier()));
+                        slotOptions.add(List.of(CraftInput.of(chain.carrier(), usesPerFiring)));
                         continue; // single deterministic option, never enqueued for crafting
                     }
                     boolean idOnly = overloadView != null && overloadView.inputMode(slot) == MatchMode.ID_ONLY;
@@ -288,6 +319,12 @@ public final class FastCraftingPlanner {
                     List<CraftInput<AEKey>> opts = new ArrayList<>(templates.size());
                     for (GenericStack template : templates) {
                         AEKey inputKey = template.what();
+                        if (linkOwner.containsKey(inputKey)) {
+                            // Whole-item consumption of a key some chain prices in uses (its carrier
+                            // OR any mid-chain damaged variant) would mix the two unit systems.
+                            return false;
+                        }
+                        itemUnitKeys.add(inputKey);
                         long amt = Sat.mul(template.amount(), in.getMultiplier());
                         AEKey remaining = in.getRemainingKey(inputKey) instanceof AEKey r ? r : null;
                         if (remaining == null) {
@@ -375,6 +412,12 @@ public final class FastCraftingPlanner {
         return new ArrayList<>(byKey.values());
     }
 
+    /** Result of a durability-slot probe: a usable chain, nothing, or a unit conflict (decline). */
+    private record ChainLookup(@Nullable DurabilityChain<AEKey> chain, boolean conflict) {
+        static final ChainLookup NONE = new ChainLookup(null, false);
+        static final ChainLookup CONFLICT = new ChainLookup(null, true);
+    }
+
     /**
      * Detect a durability-tool input and capture its degradation chain once, delegating the chain
      * building / reduction to the engine ({@link DurabilityChain}).
@@ -383,34 +426,157 @@ public final class FastCraftingPlanner {
      * {@code getRemainingKey} but returns {@code null} when the step leaves the tool's own {@link Item}
      * (a container like a bucket degrades into a <em>different</em> item → not durability), and
      * {@code stock} probes each exact variant's count (so partial tools are counted). The aggregate uses
-     * become the carrier's stock in the graph. Returns {@code null} when this slot is not a reducible
-     * durability tool (plain item, container, or a chain longer than {@link #FUZZY_CYCLE_STEPS}).
+     * become the carrier's stock in the graph.
+     *
+     * <p><b>Chains are matched to SLOT semantics, not just to the item.</b> {@code getRemainingKey} is
+     * per-input: one recipe may cost 1 durability per craft, another 2. The chain is built by stepping
+     * <em>this slot's</em> rule, so a 2-per-craft slot yields a chain whose length is the firings a full
+     * tool survives — self-consistent on its own.
+     *
+     * <p><b>Anchoring at the fullest tool.</b> A slot's declared template need not be the full tool: an
+     * overload pattern is captured from real items the player inserts, so its template is frequently a
+     * <em>partially used</em> tool, while the tool that will actually refill the pool is crafted brand
+     * new (full). Building the chain straight from a damaged template would miss the fuller variants
+     * above it and, worse, never discover the tool's own craft recipe (that recipe's output is the full
+     * key, which nothing else would poll). {@link #fullestAnchor} therefore relocates the anchor to the
+     * fullest same-item variant the slot accepts (craftable variant first, à la AE2's
+     * {@code CraftingTreeNode.findCraftedStack}, otherwise the longest-downward-walk stock variant). That
+     * makes the fullest tool the single carrier for every slot on the orbit, so discovery order stops
+     * mattering and we never need to re-anchor a chain backward.
+     *
+     * <p><b>Merge by connectivity ("相接"), not by item identity.</b> {@code linkOwner} indexes every
+     * link of every already-built chain back to that chain. When a slot's (anchored) start key is
+     * already a link of an existing chain we <em>reuse</em> that chain — but only when this slot's own
+     * step from that link lands on the chain's <em>next</em> link, i.e. the two share the same
+     * durability-per-craft granularity and lie on one orbit. That is precisely the case where two slots
+     * start at different damage levels of the same tool yet connect into one chain, so pooling their
+     * stock once is sound. If the step lands elsewhere (e.g. a 2-per-craft slot meeting a 1-per-craft
+     * chain), the same physical tools would be priced in two incompatible "uses" units on one pool with
+     * no sound linear split, so it reports a {@linkplain ChainLookup#CONFLICT conflict} and declines to
+     * AE2. The same conflict is reported when a fresh chain's links overlap keys already priced as whole
+     * items ({@code itemUnitKeys}) or links owned by another chain: with the fullest-anchor above, any
+     * remaining overlap is a genuine unit-system clash, and declining is always safe.
+     *
+     * <p>Returns {@link ChainLookup#NONE} when this slot is not a reducible durability tool (plain
+     * item, container, or a chain longer than {@link #FUZZY_CYCLE_STEPS}).
      */
-    private static DurabilityChain<AEKey> durabilityChain(IPatternDetails.IInput in,
-                                                          ChildCraftingSimulationState snapshot,
-                                                          CraftGraph.Builder<AEKey> builder,
-                                                          Map<AEKey, DurabilityChain<AEKey>> registry) {
+    private static ChainLookup durabilityChain(IPatternDetails.IInput in,
+                                               ICraftingService craftingService,
+                                               ChildCraftingSimulationState snapshot,
+                                               Level level,
+                                               CraftGraph.Builder<AEKey> builder,
+                                               Map<AEKey, DurabilityChain<AEKey>> registry,
+                                               Map<AEKey, DurabilityChain<AEKey>> linkOwner,
+                                               Set<AEKey> itemUnitKeys) {
         GenericStack[] possible = in.getPossibleInputs();
-        if (possible.length == 0 || !(possible[0].what() instanceof AEItemKey full)) {
-            return null;
+        if (possible.length == 0 || !(possible[0].what() instanceof AEItemKey template)) {
+            return ChainLookup.NONE;
         }
-        DurabilityChain<AEKey> cached = registry.get(full);
-        if (cached != null) {
-            return cached;
+        // Unbreakable / non-degrading tool: getRemainingKey hands the very same key back. It's a pure
+        // catalyst, so let the plain-input path model it as a `returned` input (one seed serves the
+        // whole batch). Detecting it here also skips fullestAnchor's fuzzy stock scan — pure waste for
+        // a tool that never forms a chain.
+        if (template.equals(in.getRemainingKey(template))) {
+            return ChainLookup.NONE;
+        }
+        Item item = template.getItem();
+        AEItemKey full = fullestAnchor(in, craftingService, snapshot, level, template, item);
+        // One degradation step under THIS slot's rule (null = consumed outright / leaves the item).
+        AEKey step = in.getRemainingKey(full) instanceof AEItemKey next && next.getItem() == item
+                ? next
+                : null;
+
+        // Merge index: is this slot's start key already a link of some built chain?
+        DurabilityChain<AEKey> owner = linkOwner.get(full);
+        if (owner != null) {
+            if (step == null) {
+                return ChainLookup.NONE; // plain consumption; the caller's linkOwner check declines
+            }
+            // "相接": stepping this slot's rule from `full` must land on the chain's next link, i.e.
+            // both step at the same durability-per-craft granularity along the same orbit.
+            List<AEKey> links = owner.links();
+            int idx = links.indexOf(full);
+            AEKey chainNext = idx >= 0 && idx + 1 < links.size() ? links.get(idx + 1) : null;
+            return step.equals(chainNext)
+                    ? new ChainLookup(owner, false)
+                    : ChainLookup.CONFLICT; // same tool link, different per-craft granularity
+        }
+        if (step == null) {
+            return ChainLookup.NONE;
         }
 
-        Item item = full.getItem();
         DurabilityChain<AEKey> chain = DurabilityChain.build(
                 full,
                 k -> in.getRemainingKey(k) instanceof AEItemKey next && next.getItem() == item ? next : null,
                 k -> snapshot.extract(k, Long.MAX_VALUE, Actionable.SIMULATE),
                 FUZZY_CYCLE_STEPS);
         if (chain == null) {
-            return null;
+            return ChainLookup.NONE;
         }
-        registry.put(full, chain);
+        for (AEKey link : chain.links()) {
+            if (itemUnitKeys.contains(link) || linkOwner.containsKey(link)) {
+                return ChainLookup.CONFLICT; // stock already counted under another unit system / chain
+            }
+        }
+        registry.put(chain.carrier(), chain); // carrier == full == links[0]
+        for (AEKey link : chain.links()) {
+            linkOwner.put(link, chain);
+        }
         builder.stock(full, chain.totalUses()); // carrier stock = aggregate uses (set once)
-        return chain;
+        return new ChainLookup(chain, false);
+    }
+
+    /**
+     * Pick the fullest (most-uses-remaining) same-item variant this slot accepts, to anchor its chain.
+     *
+     * <p>The relative durability of two variants is decided <em>structurally</em> — the one whose
+     * downward {@code getRemainingKey} walk is longer takes more crafts to break, so it has more uses
+     * left — never by reading a damage value (modded tools may not use vanilla durability at all).
+     *
+     * <p>A craftable variant, when present, is the absolute fullest: a freshly crafted tool is at max
+     * durability, so no stock variant can beat it. So we take AE2's {@code getFuzzyCraftable} answer
+     * directly when it exists (and skip the potentially expensive stock scan). Only when nothing
+     * craftable is valid for the slot do we widen the search to same-item stock variants (fuzzy,
+     * ignore-NBT) and the declared template, keeping the one with the longest downward walk. Any variant
+     * that turns out to sit off this slot's step lattice simply isn't reached by the anchor's walk and
+     * is left uncounted — an undercount, which is safe (it can only over-report missing, never
+     * over-promise).
+     */
+    private static AEItemKey fullestAnchor(IPatternDetails.IInput in, ICraftingService craftingService,
+                                           ChildCraftingSimulationState snapshot, Level level,
+                                           AEItemKey template, Item item) {
+        if (craftingService.getFuzzyCraftable(template, k -> in.isValid(k, level)) instanceof AEItemKey craftable
+                && craftable.getItem() == item) {
+            return craftable; // craftable == full durability == absolute fullest; no scan needed
+        }
+        AEItemKey anchor = template;
+        long best = downwardLength(in, template, item);
+        for (AEKey variant : snapshot.findFuzzyTemplates(template)) {
+            if (!(variant instanceof AEItemKey ik) || ik.getItem() != item || ik.equals(anchor)) {
+                continue;
+            }
+            long len = downwardLength(in, ik, item);
+            if (len > best) {
+                best = len;
+                anchor = ik;
+            }
+        }
+        return anchor;
+    }
+
+    /** Number of links on {@code from}'s downward chain (uses left + 1), capped at the cyclic budget. */
+    private static long downwardLength(IPatternDetails.IInput in, AEItemKey from, Item item) {
+        long len = 1;
+        Set<AEKey> guard = new HashSet<>();
+        AEKey cur = from;
+        guard.add(cur);
+        while (in.getRemainingKey(cur) instanceof AEItemKey next && next.getItem() == item && guard.add(next)) {
+            cur = next;
+            if (++len > FUZZY_CYCLE_STEPS) {
+                break;
+            }
+        }
+        return len;
     }
 
     /**
