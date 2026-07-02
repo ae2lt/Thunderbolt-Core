@@ -69,8 +69,6 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
     private static final int WHEEL_MASK = WHEEL_SIZE - 1;
     private static final int MAX_TASK_PROBES_PER_TICK = 262_144;
     private static final int RETRY_DELAY_TICKS = 4;
-    /** {@link #pushBulkForTask} sentinel: the pattern must use AE2's one-copy substitution path. */
-    private static final int BULK_FALLBACK = -1;
     private static final String TAG_INVENTORY = "inventory";
     private static final String TAG_JOB = "job";
     private static final String TAG_OVERLOAD_STATE = "ae2ltOverloadState";
@@ -247,15 +245,11 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
                     continue;
                 }
 
-                int bulkDispatched = pushBulkForTask(
+                var bulk = pushBulkForTask(
                         activeJob, task, details, remainingOps, craftingService, energyService);
-                if (bulkDispatched != BULK_FALLBACK) {
-                    if (bulkDispatched > 0) {
-                        usedOps += bulkDispatched;
-                        rescheduleIfStillPending(activeJob, details, 0);
-                    } else {
-                        rescheduleIfStillPending(activeJob, details, RETRY_DELAY_TICKS);
-                    }
+                if (bulk != null) {
+                    usedOps += bulk.dispatched();
+                    rescheduleIfStillPending(activeJob, details, bulk.retryDelayTicks());
                     continue;
                 }
 
@@ -374,54 +368,75 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
      * visit in a single {@link ParallelBatchCpuHelper#bulkExtract} call and then hands the
      * pre-resolved copies to the (non-batch) providers one {@code pushPattern} at a time.
      *
-     * @return number of copies dispatched (>= 0), or {@link #BULK_FALLBACK} when the pattern needs
-     *         AE2's one-copy substitution path (overload patterns, non-homogeneous/fuzzy inputs, or
-     *         a variant a free provider rejected).
+     * @return the visit result, or {@code null} when the pattern needs AE2's one-copy substitution
+     *         path (overload patterns, non-homogeneous/fuzzy inputs, or a variant a free provider
+     *         rejected before anything was dispatched).
      */
-    private int pushBulkForTask(TimeWheelJob activeJob,
-                                TaskProgress task,
-                                IPatternDetails details,
-                                int maxCopies,
-                                CraftingService craftingService,
-                                IEnergyService energyService) {
+    @Nullable
+    private BulkPush pushBulkForTask(TimeWheelJob activeJob,
+                                     TaskProgress task,
+                                     IPatternDetails details,
+                                     int maxCopies,
+                                     CraftingService craftingService,
+                                     IEnergyService energyService) {
         if (details instanceof OverloadedProviderOnlyPatternDetails) {
-            return BULK_FALLBACK;
+            return null;
         }
         if (task.value <= 0 || maxCopies <= 0) {
-            return 0;
+            return new BulkPush(0, 1);
         }
-        // Skip the (SIMULATE + MODULATE) extraction entirely if nothing can accept a push right now.
+        // Skip the (SIMULATE + MODULATE) extraction entirely if nothing can accept a push right
+        // now. Busy providers typically free up within a tick, so retry on the next one (same
+        // cadence as the vanilla path's RETRY_SOON, NOT the 4-tick energy/missing-input backoff).
         if (!hasFreeProvider(craftingService, details)) {
-            return 0;
+            return new BulkPush(0, 1);
         }
 
         int budget = (int) Math.min(task.value, (long) maxCopies);
         var result = ParallelBatchCpuHelper.bulkExtract(details, inventory, budget);
         if (result == null) {
-            return BULK_FALLBACK;
+            return null;
         }
 
         int actual = result.actualCopies;
-        double powerOne = patternPowerFor(details, ParallelBatchCpuHelper.cloneSingleCopy(result));
+        // The first clone doubles as the power probe and the first container handed to a provider.
+        KeyCounter[] pending = ParallelBatchCpuHelper.cloneSingleCopy(result);
+        double powerOne = patternPowerFor(details, pending);
+
+        // One SIMULATE for the whole visit (instead of one per copy) caps how many copies we can
+        // afford; each dispatched copy still MODULATEs individually, so accounting matches the
+        // vanilla path. BatchExecutor batches its energy checks the same way.
+        int affordable = actual;
+        double wanted = powerOne * actual;
+        if (wanted > 0) {
+            double avail = energyService.extractAEPower(wanted, Actionable.SIMULATE, PowerMultiplier.CONFIG);
+            if (avail < wanted - 0.01D) {
+                affordable = (int) Math.min((long) actual, (long) Math.floor(avail / powerOne));
+            }
+        }
+        if (affordable <= 0) {
+            ParallelBatchCpuHelper.reinject(result, actual, inventory);
+            return new BulkPush(0, RETRY_DELAY_TICKS);
+        }
+
         int dispatched = 0;
-        boolean energyBlocked = false;
         boolean freeProviderRejected = false;
         try {
-            outer:
             for (var provider : providersForSinglePush(craftingService, details)) {
-                while (dispatched < actual) {
-                    if (provider.isBusy()) {
-                        break;
+                if (dispatched >= affordable) {
+                    break;
+                }
+                while (dispatched < affordable && !provider.isBusy()) {
+                    if (pending == null) {
+                        pending = ParallelBatchCpuHelper.cloneSingleCopy(result);
                     }
-                    if (energyService.extractAEPower(powerOne, Actionable.SIMULATE,
-                            PowerMultiplier.CONFIG) < powerOne - 0.01D) {
-                        energyBlocked = true;
-                        break outer;
-                    }
-                    if (!provider.pushPattern(details, ParallelBatchCpuHelper.cloneSingleCopy(result))) {
+                    if (!provider.pushPattern(details, pending)) {
+                        // A rejecting provider must not consume the container, so the clone stays
+                        // valid and is reused for the next provider instead of re-cloning.
                         freeProviderRejected = true;
                         break;
                     }
+                    pending = null; // ownership transferred to the provider
                     energyService.extractAEPower(powerOne, Actionable.MODULATE, PowerMultiplier.CONFIG);
                     ParallelBatchCpuHelper.markDispatched(result, 1);
                     dispatched++;
@@ -439,13 +454,18 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
             ParallelBatchCpuHelper.registerExpectedOutputs(jobView, details, result, dispatched);
             consumeTaskCopies(activeJob, details, dispatched);
             cpu.markDirty();
-            return dispatched;
+            // Energy-capped visits back off on the energy cadence; otherwise re-poll immediately
+            // (delay 0) so the remaining copies keep filling providers this tick.
+            return new BulkPush(dispatched, affordable < actual ? RETRY_DELAY_TICKS : 0);
         }
 
         // Nothing dispatched: if a free provider actually rejected the chosen variant, let AE2's
         // vanilla substitution path try (avoids stalling on a template the provider won't take).
-        // Otherwise it was just busy/out of power, so retry later on the batch-friendly path.
-        return (freeProviderRejected && !energyBlocked) ? BULK_FALLBACK : 0;
+        if (freeProviderRejected) {
+            return null;
+        }
+        // Every provider turned busy since the pre-scan: plain contention, retry next tick.
+        return new BulkPush(0, 1);
     }
 
     private boolean hasFreeProvider(CraftingService craftingService, IPatternDetails details) {
@@ -1041,9 +1061,26 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
             return;
         }
 
-        long delta = Math.max(0L, Math.min(WHEEL_SIZE, now - schedulerTick));
-        wheelCursor = (wheelCursor + (int) delta) & WHEEL_MASK;
+        int delta = (int) Math.max(0L, Math.min(WHEEL_SIZE, now - schedulerTick));
         schedulerTick = now;
+        if (delta == 0) {
+            return;
+        }
+
+        int newCursor = (wheelCursor + delta) & WHEEL_MASK;
+        if (delta > 1) {
+            // A tick gap (server stall, chunk reload) would otherwise jump the cursor straight over
+            // intermediate buckets, stranding their tasks for a whole wheel revolution (up to 63
+            // ticks). Everything in a skipped bucket is due by now, so drain it into the new bucket.
+            var dest = taskWheel[newCursor];
+            for (int i = 1; i < delta; i++) {
+                var skipped = taskWheel[(wheelCursor + i) & WHEEL_MASK];
+                while (!skipped.isEmpty()) {
+                    dest.addLast(skipped.pollFirst());
+                }
+            }
+        }
+        wheelCursor = newCursor;
     }
 
     private void rebuildTaskWheel() {
@@ -1229,6 +1266,14 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
         PUSHED,
         RETRY_SOON,
         RETRY_LATER
+    }
+
+    /**
+     * Result of one {@link #pushBulkForTask} visit. {@code retryDelayTicks} tells the scheduler
+     * when to look at the task again: 0 = re-poll this tick (more copies may still fit), 1 =
+     * provider contention, {@link #RETRY_DELAY_TICKS} = out of energy.
+     */
+    private record BulkPush(int dispatched, int retryDelayTicks) {
     }
 
     private static final class TaskProgress {
