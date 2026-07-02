@@ -171,6 +171,12 @@ public final class ParallelBatchCpuHelper {
         }
     }
 
+    /** Convenience overload keeping {@link BulkResult}'s chosen keys encapsulated for callers in other packages. */
+    public static void registerExpectedOutputs(BatchJobView job, IPatternDetails details,
+                                               BulkResult result, int dispatched) {
+        registerExpectedOutputs(job, details, result.keys, dispatched);
+    }
+
     public static void registerExpectedOutputs(BatchJobView job, IPatternDetails details,
                                                AEKey[] chosenKeys, int dispatched) {
         if (dispatched <= 0) return;

@@ -57,6 +57,7 @@ import appeng.me.service.CraftingService;
 import com.moakiee.thunderbolt.ae2.batch.BatchExecutor;
 import com.moakiee.thunderbolt.ae2.batch.BatchJobView;
 import com.moakiee.thunderbolt.ae2.batch.BatchTaskHandle;
+import com.moakiee.thunderbolt.ae2.batch.ParallelBatchCpuHelper;
 import com.moakiee.thunderbolt.ae2.mixin.ElapsedTimeTrackerAccessor;
 import com.moakiee.thunderbolt.ae2.overload.cpu.OverloadClaimResult;
 import com.moakiee.thunderbolt.ae2.overload.cpu.OverloadCpuStateManager;
@@ -68,6 +69,8 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
     private static final int WHEEL_MASK = WHEEL_SIZE - 1;
     private static final int MAX_TASK_PROBES_PER_TICK = 262_144;
     private static final int RETRY_DELAY_TICKS = 4;
+    /** {@link #pushBulkForTask} sentinel: the pattern must use AE2's one-copy substitution path. */
+    private static final int BULK_FALLBACK = -1;
     private static final String TAG_INVENTORY = "inventory";
     private static final String TAG_JOB = "job";
     private static final String TAG_OVERLOAD_STATE = "ae2ltOverloadState";
@@ -92,6 +95,11 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
     private final Set<IPatternDetails> nonBatchTasksThisTick = Collections.newSetFromMap(new IdentityHashMap<>());
     private final KeyCounter scratchExpectedOutputs = new KeyCounter();
     private final KeyCounter scratchExpectedContainerItems = new KeyCounter();
+    // Pattern power depends only on the (fixed) input amounts of a pattern, so it is constant across
+    // every copy pushed for a given task. Caching it removes calculatePatternPower from the hot
+    // per-copy dispatch loop (it was ~7% of the CPU tick in profiling). Keyed by pattern identity;
+    // cleared on every job lifecycle transition below.
+    private final Map<IPatternDetails, Double> patternPowerCache = new IdentityHashMap<>();
 
     @Nullable
     private TimeWheelJob job;
@@ -140,6 +148,7 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
         var craftId = UUID.randomUUID();
         var linkCpu = new CraftingLink(CraftingCpuHelper.generateLinkData(craftId, requester == null, false), cpu);
         this.job = new TimeWheelJob(plan, this::postChange, linkCpu, playerId);
+        patternPowerCache.clear();
         markWaitingKeysChanged();
         cpu.updateOutput(plan.finalOutput());
         cpu.markDirty();
@@ -238,6 +247,18 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
                     continue;
                 }
 
+                int bulkDispatched = pushBulkForTask(
+                        activeJob, task, details, remainingOps, craftingService, energyService);
+                if (bulkDispatched != BULK_FALLBACK) {
+                    if (bulkDispatched > 0) {
+                        usedOps += bulkDispatched;
+                        rescheduleIfStillPending(activeJob, details, 0);
+                    } else {
+                        rescheduleIfStillPending(activeJob, details, RETRY_DELAY_TICKS);
+                    }
+                    continue;
+                }
+
                 var outcome = pushOnePattern(activeJob, task, details, craftingService, energyService, level);
                 if (outcome == DispatchOutcome.PUSHED) {
                     usedOps++;
@@ -300,18 +321,20 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
 
         var expectedOutputs = scratchExpectedOutputs;
         var expectedContainerItems = scratchExpectedContainerItems;
-        clearScratchCounter(expectedOutputs);
-        clearScratchCounter(expectedContainerItems);
-        @Nullable
-        var craftingContainer = CraftingCpuHelper.extractPatternInputs(
+        // Scratch counters are always emptied on exit (both branches below), so they are clean on
+        // entry and need no leading clear. This halves the per-copy KeyCounter clearing that showed
+        // up as ~7% of the CPU tick in profiling.
+        KeyCounter[] craftingContainer = CraftingCpuHelper.extractPatternInputs(
                 details, inventory, level, expectedOutputs, expectedContainerItems);
         if (craftingContainer == null) {
+            clearScratchCounter(expectedOutputs);
+            clearScratchCounter(expectedContainerItems);
             return DispatchOutcome.RETRY_LATER;
         }
 
         boolean pushed = false;
         try {
-            var patternPower = CraftingCpuHelper.calculatePatternPower(craftingContainer);
+            var patternPower = patternPowerFor(details, craftingContainer);
             for (var provider : providersForSinglePush(craftingService, details)) {
                 if (provider.isBusy()) {
                     continue;
@@ -342,6 +365,96 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
             clearScratchCounter(expectedOutputs);
             clearScratchCounter(expectedContainerItems);
         }
+    }
+
+    /**
+     * Fast path for homogeneous (non-overload) patterns. Instead of paying AE2's full per-copy
+     * extraction (template resolution via {@code getValidItemTemplates}, input extraction and
+     * pattern-power computation) once per copy, this extracts every copy it intends to push this
+     * visit in a single {@link ParallelBatchCpuHelper#bulkExtract} call and then hands the
+     * pre-resolved copies to the (non-batch) providers one {@code pushPattern} at a time.
+     *
+     * @return number of copies dispatched (>= 0), or {@link #BULK_FALLBACK} when the pattern needs
+     *         AE2's one-copy substitution path (overload patterns, non-homogeneous/fuzzy inputs, or
+     *         a variant a free provider rejected).
+     */
+    private int pushBulkForTask(TimeWheelJob activeJob,
+                                TaskProgress task,
+                                IPatternDetails details,
+                                int maxCopies,
+                                CraftingService craftingService,
+                                IEnergyService energyService) {
+        if (details instanceof OverloadedProviderOnlyPatternDetails) {
+            return BULK_FALLBACK;
+        }
+        if (task.value <= 0 || maxCopies <= 0) {
+            return 0;
+        }
+        // Skip the (SIMULATE + MODULATE) extraction entirely if nothing can accept a push right now.
+        if (!hasFreeProvider(craftingService, details)) {
+            return 0;
+        }
+
+        int budget = (int) Math.min(task.value, (long) maxCopies);
+        var result = ParallelBatchCpuHelper.bulkExtract(details, inventory, budget);
+        if (result == null) {
+            return BULK_FALLBACK;
+        }
+
+        int actual = result.actualCopies;
+        double powerOne = patternPowerFor(details, ParallelBatchCpuHelper.cloneSingleCopy(result));
+        int dispatched = 0;
+        boolean energyBlocked = false;
+        boolean freeProviderRejected = false;
+        try {
+            outer:
+            for (var provider : providersForSinglePush(craftingService, details)) {
+                while (dispatched < actual) {
+                    if (provider.isBusy()) {
+                        break;
+                    }
+                    if (energyService.extractAEPower(powerOne, Actionable.SIMULATE,
+                            PowerMultiplier.CONFIG) < powerOne - 0.01D) {
+                        energyBlocked = true;
+                        break outer;
+                    }
+                    if (!provider.pushPattern(details, ParallelBatchCpuHelper.cloneSingleCopy(result))) {
+                        freeProviderRejected = true;
+                        break;
+                    }
+                    energyService.extractAEPower(powerOne, Actionable.MODULATE, PowerMultiplier.CONFIG);
+                    ParallelBatchCpuHelper.markDispatched(result, 1);
+                    dispatched++;
+                }
+            }
+        } finally {
+            int leftover = actual - dispatched;
+            if (leftover > 0) {
+                ParallelBatchCpuHelper.reinject(result, leftover, inventory);
+            }
+        }
+
+        if (dispatched > 0) {
+            var jobView = new SingleTaskBatchJobView(activeJob, details);
+            ParallelBatchCpuHelper.registerExpectedOutputs(jobView, details, result, dispatched);
+            consumeTaskCopies(activeJob, details, dispatched);
+            cpu.markDirty();
+            return dispatched;
+        }
+
+        // Nothing dispatched: if a free provider actually rejected the chosen variant, let AE2's
+        // vanilla substitution path try (avoids stalling on a template the provider won't take).
+        // Otherwise it was just busy/out of power, so retry later on the batch-friendly path.
+        return (freeProviderRejected && !energyBlocked) ? BULK_FALLBACK : 0;
+    }
+
+    private boolean hasFreeProvider(CraftingService craftingService, IPatternDetails details) {
+        for (var provider : providersForSinglePush(craftingService, details)) {
+            if (!provider.isBusy()) {
+                return true;
+            }
+        }
+        return false;
     }
 
     public long insert(AEKey what, long amount, Actionable type) {
@@ -431,6 +544,7 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
                 success ? CraftingJobStatusPacket.Status.FINISHED : CraftingJobStatusPacket.Status.CANCELLED);
 
         this.job = null;
+        patternPowerCache.clear();
         clearTaskWheel();
         storeItems();
     }
@@ -564,6 +678,7 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
                                    @Nullable CompoundTag overloadTag,
                                    HolderLookup.Provider registries) {
         this.job = readJobFromNBT(jobTag, registries);
+        patternPowerCache.clear();
         if (this.job == null || this.job.finalOutput == null) {
             cpu.updateOutput(null);
             finishJob(false);
@@ -1085,8 +1200,19 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
     }
 
     private static void clearScratchCounter(KeyCounter counter) {
+        // Only zero the entries; keep the per-type submaps allocated. These counters are reused every
+        // dispatch, so removeEmptySubmaps() would just churn allocations for no benefit.
         counter.clear();
-        counter.removeEmptySubmaps();
+    }
+
+    private double patternPowerFor(IPatternDetails details, KeyCounter[] craftingContainer) {
+        var cached = patternPowerCache.get(details);
+        if (cached != null) {
+            return cached;
+        }
+        double power = CraftingCpuHelper.calculatePatternPower(craftingContainer);
+        patternPowerCache.put(details, power);
+        return power;
     }
 
     private static long multiplySaturated(long left, long right) {
