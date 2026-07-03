@@ -1111,10 +1111,42 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
 
         for (var entry : activeJob.tasks.entrySet()) {
             if (entry.getValue().value > 0) {
-                scheduleTask(entry.getKey(), 0);
+                scheduleRebuiltTask(activeJob, entry.getKey());
             }
         }
         queueRebuildNeeded = false;
+    }
+
+    private void scheduleRebuiltTask(TimeWheelJob activeJob, IPatternDetails details) {
+        if (!hasOnlyExactInputs(details)) {
+            scheduleTask(details, 0);
+            return;
+        }
+
+        var missingKeys = findMissingInputKeys(details);
+        if (missingKeys.isEmpty()) {
+            scheduleTask(details, 0);
+            return;
+        }
+
+        if (parkTaskForMissingInputs(activeJob, details, missingKeys)) {
+            rescheduleIfStillPending(activeJob, details, PARKED_TASK_SAFETY_DELAY_TICKS);
+        } else {
+            scheduleTask(details, 0);
+        }
+    }
+
+    private boolean hasOnlyExactInputs(IPatternDetails details) {
+        for (var input : details.getInputs()) {
+            var possibles = input.getPossibleInputs();
+            if (possibles.length != 1) {
+                return false;
+            }
+            if (possibles[0].what() == null) {
+                return false;
+            }
+        }
+        return true;
     }
 
     private void clearTaskWheel() {
@@ -1158,7 +1190,10 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
             return false;
         }
 
-        var missingKeys = findMissingInputKeys(details);
+        return parkTaskForMissingInputs(activeJob, details, findMissingInputKeys(details));
+    }
+
+    private boolean parkTaskForMissingInputs(TimeWheelJob activeJob, IPatternDetails details, Set<AEKey> missingKeys) {
         if (missingKeys.isEmpty()) {
             return false;
         }
