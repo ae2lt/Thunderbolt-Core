@@ -86,7 +86,7 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
     private static final String NBT_CRAFTING_PROGRESS = "#craftingProgress";
 
     private final TimeWheelCraftingCPU cpu;
-    private final ListCraftingInventory inventory = new ListCraftingInventory(this::postChange);
+    private final ListCraftingInventory inventory = new ListCraftingInventory(this::postInventoryChange);
     private final Set<Consumer<AEKey>> listeners = new HashSet<>();
     private final Map<IPatternDetails, IdentityHashMap<ICraftingProvider, Boolean>> batchedByTask = new HashMap<>();
     private final ArrayDeque<IPatternDetails>[] taskWheel = createWheel();
@@ -95,8 +95,7 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
     // exact declared input key: providers like the matter warping matrix return container items as a
     // DIFFERENT exact key (e.g. a durability tool at damage+1), and an exact-key index would never see
     // the return and leave the task to the 32-tick safety poll alone.
-    private final Map<Object, Set<IPatternDetails>> parkedByMissingKey = new HashMap<>();
-    private final Map<IPatternDetails, Set<Object>> parkedMissingKeysByTask = new IdentityHashMap<>();
+    private final TimeWheelTaskWakeIndex<IPatternDetails> tasksParkedByMissingKey = new TimeWheelTaskWakeIndex<>();
     private final Set<AEKey> batchedStatusChanges = new HashSet<>();
     private final List<AEKey> statusChangeScratch = new ArrayList<>();
     private final Set<IPatternDetails> nonBatchTasksThisTick = Collections.newSetFromMap(new IdentityHashMap<>());
@@ -545,7 +544,6 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
             }
         } else if (type == Actionable.MODULATE) {
             inventory.insert(what, amount, Actionable.MODULATE);
-            wakeSchedulerForReturnedInput(what);
         }
 
         return inserted;
@@ -943,7 +941,6 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
 
         decrementItems(activeJob.timeTracker, claimed, incoming.getType());
         inventory.insert(incoming, claimed, Actionable.MODULATE);
-        wakeSchedulerForReturnedInput(incoming);
         return claimed;
     }
 
@@ -1056,7 +1053,7 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
     private boolean needsSchedulerRebuild(TimeWheelJob activeJob) {
         return !activeJob.tasks.isEmpty()
                 && queuedTasks.isEmpty()
-                && parkedMissingKeysByTask.isEmpty()
+                && tasksParkedByMissingKey.isEmpty()
                 && !hasScheduledWheelEntries();
     }
 
@@ -1199,49 +1196,19 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
         }
 
         unparkTask(details);
-        var taskKeys = new HashSet<Object>();
+        var taskKeys = new ArrayList<Object>(missingKeys.size());
         for (var key : missingKeys) {
-            if (key == null) {
-                continue;
-            }
-            var primaryKey = key.getPrimaryKey();
-            if (primaryKey == null || !taskKeys.add(primaryKey)) {
-                continue;
-            }
-            parkedByMissingKey
-                    .computeIfAbsent(
-                            primaryKey,
-                            ignored -> Collections.newSetFromMap(new IdentityHashMap<IPatternDetails, Boolean>()))
-                    .add(details);
+            taskKeys.add(key != null ? key.getPrimaryKey() : null);
         }
-        if (taskKeys.isEmpty()) {
-            return false;
-        }
-        parkedMissingKeysByTask.put(details, taskKeys);
-        return true;
+        return tasksParkedByMissingKey.park(details, taskKeys);
     }
 
     private void unparkTask(IPatternDetails details) {
-        var keys = parkedMissingKeysByTask.remove(details);
-        if (keys == null || keys.isEmpty()) {
-            return;
-        }
-
-        for (var key : keys) {
-            var tasks = parkedByMissingKey.get(key);
-            if (tasks == null) {
-                continue;
-            }
-            tasks.remove(details);
-            if (tasks.isEmpty()) {
-                parkedByMissingKey.remove(key);
-            }
-        }
+        tasksParkedByMissingKey.unpark(details);
     }
 
     private void clearParkedTasks() {
-        parkedByMissingKey.clear();
-        parkedMissingKeysByTask.clear();
+        tasksParkedByMissingKey.clear();
     }
 
     private Set<AEKey> findMissingInputKeys(IPatternDetails details) {
@@ -1357,16 +1324,23 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
             return;
         }
 
-        var waitingTasks = parkedByMissingKey.remove(what.getPrimaryKey());
-        if (waitingTasks == null || waitingTasks.isEmpty()) {
+        var tasksToWake = tasksParkedByMissingKey.wake(what.getPrimaryKey());
+        if (tasksToWake.isEmpty()) {
             return;
         }
 
-        var tasksToWake = new ArrayList<>(waitingTasks);
         for (var details : tasksToWake) {
             unparkTask(details);
             unscheduleTask(details);
             scheduleTask(details, 0);
+        }
+    }
+
+    private void postInventoryChange(@Nullable AEKey what) {
+        postChange(what);
+        if (what != null && this.job != null
+                && inventory.extract(what, 1, Actionable.SIMULATE) > 0) {
+            wakeSchedulerForReturnedInput(what);
         }
     }
 
