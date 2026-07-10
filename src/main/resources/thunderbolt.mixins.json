@@ -24,7 +24,9 @@
     "AaeElapsedTimeTrackerAccessor",
     "AaeTaskProgressAccessor"
   ],
-  "client": [],
+  "client": [
+    "client.TooltipsByteAmountMixin"
+  ],
   "injectors": {
     "defaultRequire": 1
   }
