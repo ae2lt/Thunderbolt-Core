@@ -25,6 +25,7 @@
     "AaeTaskProgressAccessor"
   ],
   "client": [
+    "client.CraftConfirmScreenCpuStatusMixin",
     "client.TooltipsByteAmountMixin"
   ],
   "injectors": {
