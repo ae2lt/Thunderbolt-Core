@@ -5,6 +5,7 @@ import org.jetbrains.annotations.Nullable;
 import net.minecraft.network.chat.Component;
 import net.minecraft.world.level.Level;
 
+import appeng.api.config.CpuSelectionMode;
 import appeng.api.networking.IGrid;
 import appeng.api.networking.security.IActionSource;
 
@@ -20,6 +21,10 @@ public interface TimeWheelCraftingCpuHost {
     Level getLevel();
 
     void markCpuDirty();
+
+    default CpuSelectionMode getSelectionMode() {
+        return CpuSelectionMode.ANY;
+    }
 
     /**
      * Display name shown for this CPU (e.g. in the crafting status menu). The concrete

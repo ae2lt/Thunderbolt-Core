@@ -22,7 +22,9 @@
     "TaskProgressAccessor",
     "AaeExecutingCraftingJobAccessor",
     "AaeElapsedTimeTrackerAccessor",
-    "AaeTaskProgressAccessor"
+    "AaeTaskProgressAccessor",
+    "TimeWheelCraftingServiceMixin",
+    "TimeWheelCraftingCPUMenuMixin"
   ],
   "client": [
     "client.CraftConfirmScreenCpuStatusMixin",

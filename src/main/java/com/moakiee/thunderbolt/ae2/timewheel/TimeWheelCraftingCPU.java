@@ -45,7 +45,7 @@ public final class TimeWheelCraftingCPU implements ICraftingCPU, TimeWheelFastPl
 
     @Override
     public boolean isBusy() {
-        return craftingLogic.hasJob();
+        return craftingLogic.hasPersistentState();
     }
 
     @Nullable
@@ -90,7 +90,7 @@ public final class TimeWheelCraftingCPU implements ICraftingCPU, TimeWheelFastPl
 
     @Override
     public CpuSelectionMode getSelectionMode() {
-        return CpuSelectionMode.ANY;
+        return host.getSelectionMode();
     }
 
     @Override
