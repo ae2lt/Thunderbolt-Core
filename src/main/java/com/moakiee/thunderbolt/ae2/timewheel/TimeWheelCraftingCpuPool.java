@@ -169,13 +169,15 @@ public final class TimeWheelCraftingCpuPool implements ICraftingCPU, TimeWheelFa
             return CraftingSubmitResult.CPU_OFFLINE;
         }
 
-        long reservedBytes = Math.max(0L, plan.bytes());
-        if (reservedBytes > remainingStorage) {
+        boolean infiniteStorage = hasInfiniteStorage();
+        long reservedBytes = infiniteStorage ? 0L : Math.max(0L, plan.bytes());
+        if (!infiniteStorage && reservedBytes > remainingStorage) {
             return CraftingSubmitResult.CPU_TOO_SMALL;
         }
 
         var id = UUID.randomUUID();
-        var cpu = new TimeWheelCraftingCPU(host, reservedBytes, sharedCoProcessors);
+        long cpuStorage = infiniteStorage ? Long.MAX_VALUE : reservedBytes;
+        var cpu = new TimeWheelCraftingCPU(host, cpuStorage, sharedCoProcessors);
         var entry = new PoolEntry(id, reservedBytes, cpu);
         activeCpus.put(id, entry);
         remainingStorage -= reservedBytes;
@@ -247,8 +249,10 @@ public final class TimeWheelCraftingCpuPool implements ICraftingCPU, TimeWheelFa
             if (activeCpus.containsKey(id)) {
                 id = UUID.randomUUID();
             }
-            long reservedBytes = Math.max(0L, entryTag.getLong(TAG_RESERVED_BYTES));
-            var cpu = new TimeWheelCraftingCPU(host, reservedBytes, sharedCoProcessors);
+            boolean infiniteStorage = hasInfiniteStorage();
+            long reservedBytes = infiniteStorage ? 0L : Math.max(0L, entryTag.getLong(TAG_RESERVED_BYTES));
+            long cpuStorage = infiniteStorage ? Long.MAX_VALUE : reservedBytes;
+            var cpu = new TimeWheelCraftingCPU(host, cpuStorage, sharedCoProcessors);
             cpu.readFromNBT(entryTag.getCompound(TAG_STATE), registries);
             activeCpus.put(id, new PoolEntry(id, reservedBytes, cpu));
         }
@@ -306,6 +310,10 @@ public final class TimeWheelCraftingCpuPool implements ICraftingCPU, TimeWheelFa
 
     public long getTotalStorage() {
         return totalStorage;
+    }
+
+    public boolean hasInfiniteStorage() {
+        return totalStorage == Long.MAX_VALUE;
     }
 
     @Override
