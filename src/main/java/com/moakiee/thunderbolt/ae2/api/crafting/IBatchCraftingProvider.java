@@ -14,6 +14,17 @@ import appeng.api.stacks.KeyCounter;
  */
 public interface IBatchCraftingProvider extends ICraftingProvider {
     /**
+     * Controls CPU-side copy accounting for this pattern.
+     *
+     * <p>{@link BatchDispatchMode#UNBOUNDED} only bypasses the CPU's copy-count budget. Input
+     * extraction, energy payment, the provider's reported capacity and the provider's own
+     * acceptance checks still apply normally.
+     */
+    default BatchDispatchMode getBatchDispatchMode(IPatternDetails details) {
+        return BatchDispatchMode.NORMAL;
+    }
+
+    /**
      * Optional hint: how many copies this provider could accept for this pattern right now.
      *
      * <p>This is only an advisory upper bound on how many copies the CPU pre-extracts before

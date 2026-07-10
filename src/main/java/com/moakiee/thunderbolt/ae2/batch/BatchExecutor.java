@@ -17,6 +17,7 @@ import appeng.crafting.inv.ListCraftingInventory;
 import appeng.me.service.CraftingService;
 
 import com.moakiee.thunderbolt.ae2.api.crafting.IBatchCraftingProvider;
+import com.moakiee.thunderbolt.ae2.api.crafting.BatchDispatchMode;
 
 public final class BatchExecutor {
     private BatchExecutor() {
@@ -81,32 +82,57 @@ public final class BatchExecutor {
 
             var perTaskBatched = batchedByTask.get(details);
             java.util.ArrayList<EligibleProvider> eligible = null;
-            long availableBatchCapacity = 0;
             for (var provider : cs.getProviders(details)) {
                 if (!(provider instanceof IBatchCraftingProvider batch)) continue;
                 sawBatchProvider = true;
                 if (perTaskBatched != null && perTaskBatched.containsKey(provider)) continue;
                 int capacity = batch.getBatchCapacity(details);
                 if (capacity <= 0) continue;
+                var dispatchMode = batch.getBatchDispatchMode(details);
+                if (dispatchMode == null) {
+                    dispatchMode = BatchDispatchMode.NORMAL;
+                }
                 if (eligible == null) {
                     eligible = new java.util.ArrayList<>();
                 }
-                eligible.add(new EligibleProvider(batch, capacity));
-                availableBatchCapacity += capacity;
-                if (availableBatchCapacity >= Integer.MAX_VALUE) {
-                    availableBatchCapacity = Integer.MAX_VALUE;
-                    break;
+                eligible.add(new EligibleProvider(batch, capacity, dispatchMode));
+            }
+            if (eligible == null) continue;
+
+            boolean hasUnboundedProvider = eligible.stream()
+                    .anyMatch(provider -> provider.mode() == BatchDispatchMode.UNBOUNDED);
+            if (!hasUnboundedProvider) {
+                // Preserve the original normal-only provider cutoff: once their combined capacity
+                // reaches Integer.MAX_VALUE, later providers do not participate in this run.
+                long capacity = 0;
+                int participatingProviders = 0;
+                for (var provider : eligible) {
+                    capacity += provider.capacity();
+                    participatingProviders++;
+                    if (capacity >= Integer.MAX_VALUE) break;
+                }
+                if (participatingProviders < eligible.size()) {
+                    eligible.subList(participatingProviders, eligible.size()).clear();
                 }
             }
-            if (eligible == null || availableBatchCapacity <= 0) continue;
 
-            // Dispatch smaller-capacity providers first: the even split (leftover/remaining) grows
-            // as remaining shrinks, so leaving the largest provider last lets it absorb the
-            // remainder. Front-loading large providers caps them to the small even share and leaves
-            // the batch under-filled.
-            eligible.sort(java.util.Comparator.comparingInt(EligibleProvider::capacity));
+            long availableBatchCapacity = 0;
+            for (var provider : eligible) {
+                availableBatchCapacity = Math.min(
+                        Integer.MAX_VALUE,
+                        availableBatchCapacity + provider.capacity());
+            }
+            if (availableBatchCapacity <= 0) continue;
 
-            int copyBudget = BatchCpuAccounting.maxCopiesForCpuOps(opsBudget);
+            // Unbounded providers must see the whole task before normal providers can consume the
+            // CPU copy budget. Normal providers retain the smaller-first balancing order.
+            eligible.sort(java.util.Comparator
+                    .comparing((EligibleProvider provider) -> provider.mode() != BatchDispatchMode.UNBOUNDED)
+                    .thenComparingInt(EligibleProvider::capacity));
+
+            int copyBudget = hasUnboundedProvider
+                    ? Integer.MAX_VALUE
+                    : BatchCpuAccounting.maxCopiesForCpuOps(opsBudget);
             if (copyBudget <= 0) {
                 if (dirty) markDirty.run();
                 return new BatchRunResult(totalPushed, consumedOps, sawBatchProvider);
@@ -143,14 +169,23 @@ public final class BatchExecutor {
             KeyCounter[] oneCopy = ParallelBatchCpuHelper.cloneSingleCopy(result);
 
             for (int i = 0; i < eligible.size() && leftover > 0; i++) {
-                var batch = eligible.get(i).provider();
-                int sliceCap = BatchCpuAccounting.maxCopiesForCpuOps(opsBudget);
+                var eligibleProvider = eligible.get(i);
+                var batch = eligibleProvider.provider();
+                boolean unbounded = eligibleProvider.mode() == BatchDispatchMode.UNBOUNDED;
+                int sliceCap = unbounded
+                        ? Integer.MAX_VALUE
+                        : BatchCpuAccounting.maxCopiesForCpuOps(opsBudget);
                 if (sliceCap <= 0) break;
-                int remainingProviders = eligible.size() - i;
-                int slice = Math.max(1, leftover / remainingProviders);
+                int slice;
+                if (unbounded) {
+                    slice = leftover;
+                } else {
+                    int remainingProviders = eligible.size() - i;
+                    slice = Math.max(1, leftover / remainingProviders);
+                }
                 slice = Math.min(slice, leftover);
                 slice = Math.min(slice, sliceCap);
-                slice = Math.min(slice, eligible.get(i).capacity()); // cap by this provider's reported capacity
+                slice = Math.min(slice, eligibleProvider.capacity());
 
                 int subLeftover;
                 try {
@@ -174,13 +209,13 @@ public final class BatchExecutor {
                 ParallelBatchCpuHelper.registerExpectedOutputs(job, details, result.keys, dispatched);
                 dirty = true;
 
-                int opsCost = BatchCpuAccounting.cpuOpsForCopies(dispatched);
+                int opsCost = unbounded ? 1 : BatchCpuAccounting.cpuOpsForCopies(dispatched);
                 consumedOps += opsCost;
                 opsBudget -= opsCost;
 
                 long newValue = task.getValue() - dispatched;
                 task.setValue(newValue);
-                totalPushed += dispatched;
+                totalPushed = saturatingAdd(totalPushed, dispatched);
                 leftover -= dispatched;
 
                 if (initialRealCraft > 1) {
@@ -222,7 +257,12 @@ public final class BatchExecutor {
         return new BatchRunResult(totalPushed, consumedOps, sawBatchProvider);
     }
 
-    private record EligibleProvider(IBatchCraftingProvider provider, int capacity) {
+    private static int saturatingAdd(int left, int right) {
+        if (right <= 0) return left;
+        return left > Integer.MAX_VALUE - right ? Integer.MAX_VALUE : left + right;
+    }
+
+    private record EligibleProvider(IBatchCraftingProvider provider, int capacity, BatchDispatchMode mode) {
     }
 
     public record BatchRunResult(int dispatchedCopies, int consumedCpuOps, boolean sawBatchProvider) {
