@@ -56,6 +56,7 @@ import appeng.hooks.ticking.TickHandler;
 import appeng.me.service.CraftingService;
 
 import com.moakiee.thunderbolt.ae2.batch.BatchExecutor;
+import com.moakiee.thunderbolt.ae2.batch.BatchCpuAccounting;
 import com.moakiee.thunderbolt.ae2.batch.BatchJobView;
 import com.moakiee.thunderbolt.ae2.batch.BatchTaskHandle;
 import com.moakiee.thunderbolt.ae2.batch.ParallelBatchCpuHelper;
@@ -294,6 +295,7 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
 
         var result = BatchExecutor.runBatchOnly(
                 remainingOps,
+                BatchCpuAccounting.Mode.QUADRATIC,
                 craftingService,
                 energyService,
                 level,

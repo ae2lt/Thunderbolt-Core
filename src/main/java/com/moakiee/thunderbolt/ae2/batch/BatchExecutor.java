@@ -45,6 +45,7 @@ public final class BatchExecutor {
     }
 
     public static BatchRunResult runBatchOnly(int remainingOps,
+                                              BatchCpuAccounting.Mode accountingMode,
                                               CraftingService cs,
                                               IEnergyService es,
                                               Level level,
@@ -61,6 +62,7 @@ public final class BatchExecutor {
         int consumedOps = 0;
         int opsBudget = remainingOps;
         if (opsBudget <= 0) return BatchRunResult.EMPTY;
+        if (accountingMode == null) accountingMode = BatchCpuAccounting.Mode.LINEAR;
         boolean dirty = false;
         boolean sawBatchProvider = false;
 
@@ -132,7 +134,7 @@ public final class BatchExecutor {
 
             int copyBudget = hasUnboundedProvider
                     ? Integer.MAX_VALUE
-                    : BatchCpuAccounting.maxCopiesForCpuOps(opsBudget);
+                    : BatchCpuAccounting.maxCopiesForCpuOps(opsBudget, accountingMode);
             if (copyBudget <= 0) {
                 if (dirty) markDirty.run();
                 return new BatchRunResult(totalPushed, consumedOps, sawBatchProvider);
@@ -174,7 +176,7 @@ public final class BatchExecutor {
                 boolean unbounded = eligibleProvider.mode() == BatchDispatchMode.UNBOUNDED;
                 int sliceCap = unbounded
                         ? Integer.MAX_VALUE
-                        : BatchCpuAccounting.maxCopiesForCpuOps(opsBudget);
+                        : BatchCpuAccounting.maxCopiesForCpuOps(opsBudget, accountingMode);
                 if (sliceCap <= 0) break;
                 int slice;
                 if (unbounded) {
@@ -209,7 +211,9 @@ public final class BatchExecutor {
                 ParallelBatchCpuHelper.registerExpectedOutputs(job, details, result.keys, dispatched);
                 dirty = true;
 
-                int opsCost = unbounded ? 1 : BatchCpuAccounting.cpuOpsForCopies(dispatched);
+                int opsCost = unbounded
+                        ? 1
+                        : BatchCpuAccounting.cpuOpsForCopies(dispatched, accountingMode);
                 consumedOps += opsCost;
                 opsBudget -= opsCost;
 

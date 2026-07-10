@@ -27,6 +27,7 @@ import appeng.hooks.ticking.TickHandler;
 import appeng.me.service.CraftingService;
 
 import com.moakiee.thunderbolt.ae2.batch.AaeBatchJobView;
+import com.moakiee.thunderbolt.ae2.batch.BatchCpuAccounting;
 import com.moakiee.thunderbolt.ae2.batch.BatchExecutor;
 import com.moakiee.thunderbolt.ae2.batch.BatchProviderFilterIterable;
 
@@ -82,6 +83,7 @@ public abstract class AdvCraftingCpuLogicBatchMixin {
 
         var batchResult = BatchExecutor.runBatchOnly(
                 remainingOps,
+                BatchCpuAccounting.Mode.LINEAR,
                 craftingService,
                 energyService,
                 level,
@@ -91,9 +93,8 @@ public abstract class AdvCraftingCpuLogicBatchMixin {
                 cpu::markDirty);
 
         if (batchResult.dispatchedCopies() > 0) {
-            // Batch providers supply the internal parallel capacity, while the CPU pays dispatch pressure:
-            // each pushBatch dispatch of d copies costs ceil(sqrt(d)) ops, summed across this tick's
-            // dispatches. The ops budget caps the running sum, so a tick never exceeds its rolling usedOps.
+            // AdvancedAE CPUs keep batch extraction/provider dispatch, but pay one operation per copy.
+            // UNBOUNDED providers (such as creative item sources) still pay one operation per dispatch.
             return batchResult.consumedCpuOps();
         }
 

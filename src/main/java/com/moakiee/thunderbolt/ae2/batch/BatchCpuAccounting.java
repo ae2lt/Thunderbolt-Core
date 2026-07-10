@@ -4,6 +4,23 @@ public final class BatchCpuAccounting {
     private BatchCpuAccounting() {
     }
 
+    public enum Mode {
+        LINEAR,
+        QUADRATIC
+    }
+
+    public static int maxCopiesForCpuOps(int cpuOps, Mode mode) {
+        if (cpuOps <= 0) return 0;
+        if (mode == Mode.LINEAR) return cpuOps;
+        return maxCopiesForCpuOps(cpuOps);
+    }
+
+    public static int cpuOpsForCopies(int copies, Mode mode) {
+        if (copies <= 0) return 0;
+        if (mode == Mode.LINEAR) return copies;
+        return cpuOpsForCopies(copies);
+    }
+
     public static int maxCopiesForCpuOps(int cpuOps) {
         if (cpuOps <= 0) return 0;
         long maxCopies = (long) cpuOps * cpuOps;
