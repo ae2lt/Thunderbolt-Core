@@ -27,6 +27,7 @@
     "TimeWheelCraftingCPUMenuMixin"
   ],
   "client": [
+    "client.CPUSelectionListStorageMixin",
     "client.CraftConfirmScreenCpuStatusMixin",
     "client.TooltipsByteAmountMixin"
   ],
