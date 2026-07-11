@@ -87,7 +87,7 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
     private static final String NBT_CRAFTING_PROGRESS = "#craftingProgress";
 
     private final TimeWheelCraftingCPU cpu;
-    private final ListCraftingInventory inventory = new ListCraftingInventory(this::postInventoryChange);
+    private final ListCraftingInventory inventory = new ListCraftingInventory(this::postChange);
     private final Set<Consumer<AEKey>> listeners = new HashSet<>();
     private final Map<IPatternDetails, IdentityHashMap<ICraftingProvider, Boolean>> batchedByTask = new HashMap<>();
     private final ArrayDeque<IPatternDetails>[] taskWheel = createWheel();
@@ -546,6 +546,7 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
             }
         } else if (type == Actionable.MODULATE) {
             inventory.insert(what, amount, Actionable.MODULATE);
+            wakeSchedulerForReturnedInput(what);
         }
 
         return inserted;
@@ -943,6 +944,7 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
 
         decrementItems(activeJob.timeTracker, claimed, incoming.getType());
         inventory.insert(incoming, claimed, Actionable.MODULATE);
+        wakeSchedulerForReturnedInput(incoming);
         return claimed;
     }
 
@@ -1122,7 +1124,7 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
             return;
         }
 
-        var missingKeys = findMissingInputKeys(details);
+        var missingKeys = findMissingExactInputKeys(details);
         if (missingKeys.isEmpty()) {
             scheduleTask(details, 0);
             return;
@@ -1185,11 +1187,11 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
     }
 
     private boolean parkTaskForMissingInputs(TimeWheelJob activeJob, IPatternDetails details) {
-        if (!activeJob.tasks.containsKey(details)) {
+        if (!activeJob.tasks.containsKey(details) || !hasOnlyExactInputs(details)) {
             return false;
         }
 
-        return parkTaskForMissingInputs(activeJob, details, findMissingInputKeys(details));
+        return parkTaskForMissingInputs(activeJob, details, findMissingExactInputKeys(details));
     }
 
     private boolean parkTaskForMissingInputs(TimeWheelJob activeJob, IPatternDetails details, Set<AEKey> missingKeys) {
@@ -1213,58 +1215,31 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
         tasksParkedByMissingKey.clear();
     }
 
-    private Set<AEKey> findMissingInputKeys(IPatternDetails details) {
+    private Set<AEKey> findMissingExactInputKeys(IPatternDetails details) {
         var exactRequired = new HashMap<AEKey, Long>();
-        var ambiguousKeys = new HashSet<AEKey>();
-        var missing = new HashSet<AEKey>();
 
         for (var input : details.getInputs()) {
             long multiplier = input.getMultiplier();
             var possibles = input.getPossibleInputs();
-            if (possibles.length == 0) {
+            if (possibles.length != 1) {
+                return Set.of();
+            }
+
+            var possible = possibles[0];
+            var key = possible.what();
+            long perCopy = multiplySaturated(possible.amount(), multiplier);
+            if (key == null || perCopy <= 0) {
                 continue;
             }
-
-            if (possibles.length == 1) {
-                var possible = possibles[0];
-                var key = possible.what();
-                long perCopy = multiplySaturated(possible.amount(), multiplier);
-                if (key == null || perCopy <= 0) {
-                    continue;
-                }
-                exactRequired.merge(key, perCopy, Ae2LtTimeWheelCraftingCpuLogic::addSaturated);
-                continue;
-            }
-
-            boolean slotSatisfied = false;
-            var slotKeys = new HashSet<AEKey>();
-            for (var possible : possibles) {
-                var key = possible.what();
-                long perCopy = multiplySaturated(possible.amount(), multiplier);
-                if (key == null || perCopy <= 0) {
-                    continue;
-                }
-                slotKeys.add(key);
-                if (inventory.extract(key, perCopy, Actionable.SIMULATE) >= perCopy) {
-                    slotSatisfied = true;
-                }
-            }
-
-            ambiguousKeys.addAll(slotKeys);
-            if (!slotSatisfied) {
-                missing.addAll(slotKeys);
-            }
+            exactRequired.merge(key, perCopy, Ae2LtTimeWheelCraftingCpuLogic::addSaturated);
         }
 
+        var missing = new HashSet<AEKey>();
         for (var entry : exactRequired.entrySet()) {
             long required = entry.getValue();
             if (required > 0 && inventory.extract(entry.getKey(), required, Actionable.SIMULATE) < required) {
                 missing.add(entry.getKey());
             }
-        }
-
-        if (missing.isEmpty()) {
-            missing.addAll(ambiguousKeys);
         }
         return missing;
     }
@@ -1335,14 +1310,6 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
             unparkTask(details);
             unscheduleTask(details);
             scheduleTask(details, 0);
-        }
-    }
-
-    private void postInventoryChange(@Nullable AEKey what) {
-        postChange(what);
-        if (what != null && this.job != null
-                && inventory.extract(what, 1, Actionable.SIMULATE) > 0) {
-            wakeSchedulerForReturnedInput(what);
         }
     }
 
