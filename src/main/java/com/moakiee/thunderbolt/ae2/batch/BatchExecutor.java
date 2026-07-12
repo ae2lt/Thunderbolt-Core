@@ -87,6 +87,8 @@ public final class BatchExecutor {
             for (var provider : cs.getProviders(details)) {
                 if (!(provider instanceof IBatchCraftingProvider batch)) continue;
                 sawBatchProvider = true;
+                if (details instanceof SharedBatchInputPattern
+                        && !batch.supportsSingleSeedBatch()) continue;
                 if (perTaskBatched != null && perTaskBatched.containsKey(provider)) continue;
                 int capacity = batch.getBatchCapacity(details);
                 if (capacity <= 0) continue;
@@ -100,6 +102,14 @@ public final class BatchExecutor {
                 eligible.add(new EligibleProvider(batch, capacity, dispatchMode));
             }
             if (eligible == null) continue;
+
+            if (details instanceof SharedBatchInputPattern && eligible.size() > 1) {
+                // One reusable seed cannot be in multiple executing providers simultaneously.
+                eligible.sort(java.util.Comparator
+                        .comparing((EligibleProvider provider) -> provider.mode() != BatchDispatchMode.UNBOUNDED)
+                        .thenComparing(EligibleProvider::capacity, java.util.Comparator.reverseOrder()));
+                eligible.subList(1, eligible.size()).clear();
+            }
 
             boolean hasUnboundedProvider = eligible.stream()
                     .anyMatch(provider -> provider.mode() == BatchDispatchMode.UNBOUNDED);
@@ -141,6 +151,9 @@ public final class BatchExecutor {
             }
 
             int budget = (int) Math.min(Math.min(taskValue, availableBatchCapacity), copyBudget);
+            if (details instanceof BatchCopyLimitPattern limited) {
+                budget = Math.min(budget, Math.max(1, limited.maxBatchCopies()));
+            }
             if (budget <= 0) continue;
 
             var result = ParallelBatchCpuHelper.bulkExtract(details, inv, budget);
@@ -208,7 +221,7 @@ public final class BatchExecutor {
 
                 ParallelBatchCpuHelper.markDispatched(result, dispatched);
                 es.extractAEPower(powerOne * dispatched, Actionable.MODULATE, PowerMultiplier.CONFIG);
-                ParallelBatchCpuHelper.registerExpectedOutputs(job, details, result.keys, dispatched);
+                ParallelBatchCpuHelper.registerExpectedOutputs(job, details, result, dispatched);
                 dirty = true;
 
                 int opsCost = unbounded

@@ -126,6 +126,31 @@ class CraftPlannerV2Test {
         assertEquals(1L, plan.usedStock().get("bucket"));
     }
 
+    @Test
+    void returnedSeedShortfallIsReportedOnceForTheWholeCalculation() {
+        CraftGraph<String> noSeed = CraftGraph.<String>builder()
+                .pattern("product", 1, List.of(
+                        CraftInput.of("material", 4), CraftInput.returned("seed", 2)))
+                .stock("material", 400)
+                .build();
+        CraftGraph<String> oneOfTwoSeeds = CraftGraph.<String>builder()
+                .pattern("product", 1, List.of(
+                        CraftInput.of("material", 4), CraftInput.returned("seed", 2)))
+                .stock("material", 400)
+                .stock("seed", 1)
+                .build();
+
+        CraftPlan<String> missingAll = CraftPlannerV2.plan(noSeed, "product", 100);
+        CraftPlan<String> missingOne = CraftPlannerV2.plan(oneOfTwoSeeds, "product", 100);
+
+        assertFalse(missingAll.feasible());
+        assertEquals(2L, missingAll.missing().get("seed"));
+        assertFalse(missingOne.feasible());
+        assertEquals(1L, missingOne.usedStock().get("seed"));
+        assertEquals(1L, missingOne.missing().get("seed"));
+        assertEquals(400L, missingOne.grossDemand().get("material"));
+    }
+
     /**
      * Durability tool {@code 1·tool(4) + 1·B → 1·C + tool(3)}: the degradation chain is solved once
      * and reduced to the closed form {@code tools = ceil(times / uses)} — 100 crafts need ceil(100/4)

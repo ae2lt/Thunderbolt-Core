@@ -19,4 +19,20 @@ public interface OverloadedProviderOnlyPatternDetails {
      * can inspect without relying on AE2 global semantics.
      */
     OverloadPatternDetails overloadPatternDetailsView();
+
+    /** True when at least one input slot accepts same-id variants while ignoring components. */
+    default boolean hasFuzzyInputs() {
+        var view = overloadPatternDetailsView();
+        return view != null && view.inputs().stream().anyMatch(input -> input.matchMode().ignoresComponents());
+    }
+
+    default boolean isFuzzyInput(int slot) {
+        var view = overloadPatternDetailsView();
+        return view != null && view.inputMode(slot).ignoresComponents();
+    }
+
+    default boolean isFuzzyOutput(int slot) {
+        var view = overloadPatternDetailsView();
+        return view != null && view.outputMode(slot).ignoresComponents();
+    }
 }

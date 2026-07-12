@@ -25,6 +25,7 @@ import appeng.api.networking.IGrid;
 import appeng.api.networking.crafting.CraftingJobStatus;
 import appeng.api.networking.crafting.ICraftingCPU;
 import appeng.api.networking.crafting.ICraftingPlan;
+import appeng.api.crafting.IPatternDetails;
 import appeng.api.networking.crafting.ICraftingRequester;
 import appeng.api.networking.crafting.ICraftingSubmitResult;
 import appeng.api.networking.energy.IEnergyService;
@@ -165,7 +166,7 @@ public final class TimeWheelCraftingCpuPool implements ICraftingCPU, TimeWheelFa
                                             ICraftingPlan plan,
                                             IActionSource src,
                                             @Nullable ICraftingRequester requester) {
-        if (!isActive()) {
+        if (!isActive() || !acceptsPlan(plan)) {
             return CraftingSubmitResult.CPU_OFFLINE;
         }
 
@@ -197,6 +198,17 @@ public final class TimeWheelCraftingCpuPool implements ICraftingCPU, TimeWheelFa
         cpuListChanged = true;
         host.markCpuDirty();
         return result;
+    }
+
+    public boolean acceptsPlan(ICraftingPlan plan) {
+        if (plan == null) return false;
+        for (IPatternDetails details : plan.patternTimes().keySet()) {
+            if (details instanceof TimeWheelPoolRestrictedPattern restricted
+                    && !restricted.acceptsTimeWheelPool(host)) {
+                return false;
+            }
+        }
+        return true;
     }
 
     public void cancelAll() {

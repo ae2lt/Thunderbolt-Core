@@ -49,6 +49,7 @@ import com.moakiee.thunderbolt.ae2.timewheel.TimeWheelCraftingCPU;
 import com.moakiee.thunderbolt.ae2.timewheel.TimeWheelCraftingCpuPool;
 import com.moakiee.thunderbolt.ae2.timewheel.TimeWheelCraftingCpuPoolHost;
 import com.moakiee.thunderbolt.ae2.timewheel.TimeWheelFastPlanningGate;
+import com.moakiee.thunderbolt.ae2.timewheel.TimeWheelPoolRestrictedPattern;
 
 @Mixin(value = CraftingService.class, remap = false)
 public abstract class TimeWheelCraftingServiceMixin {
@@ -191,6 +192,18 @@ public abstract class TimeWheelCraftingServiceMixin {
 
         if (target instanceof TimeWheelCraftingCPU) {
             cir.setReturnValue(CraftingSubmitResult.CPU_BUSY);
+            return;
+        }
+
+        if (thunderbolt$isTimeWheelRestricted(job)) {
+            if (target != null) {
+                cir.setReturnValue(CraftingSubmitResult.CPU_OFFLINE);
+                return;
+            }
+            var pool = thunderbolt$findSuitableTimeWheelPool(job, src, new MutableObject<>());
+            cir.setReturnValue(pool != null
+                    ? pool.submitJob(this.grid, job, src, requestingMachine)
+                    : CraftingSubmitResult.CPU_OFFLINE);
         }
     }
 
@@ -286,6 +299,10 @@ public abstract class TimeWheelCraftingServiceMixin {
                 tooSmall++;
                 continue;
             }
+            if (!pool.acceptsPlan(job)) {
+                excluded++;
+                continue;
+            }
             if (!pool.canBeAutoSelectedFor(src)) {
                 excluded++;
                 continue;
@@ -318,6 +335,15 @@ public abstract class TimeWheelCraftingServiceMixin {
             return THUNDERBOLT_TIME_WHEEL_FAST_FIRST.compare(a, b);
         });
         return valid.getFirst();
+    }
+
+    @Unique
+    private static boolean thunderbolt$isTimeWheelRestricted(ICraftingPlan job) {
+        if (job == null) return false;
+        for (var details : job.patternTimes().keySet()) {
+            if (details instanceof TimeWheelPoolRestrictedPattern) return true;
+        }
+        return false;
     }
 
     @Unique

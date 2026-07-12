@@ -1,5 +1,8 @@
 package com.moakiee.thunderbolt.ae2.timewheel;
 
+import appeng.api.config.Actionable;
+import appeng.api.stacks.AEKey;
+
 import org.jetbrains.annotations.Nullable;
 
 import net.minecraft.network.chat.Component;
@@ -21,6 +24,16 @@ public interface TimeWheelCraftingCpuHost {
     Level getLevel();
 
     void markCpuDirty();
+
+    /** Extracts reusable seeds from host-owned storage before ME-network extraction. */
+    default long extractReusableSeed(AEKey key, long amount, Actionable mode) {
+        return 0L;
+    }
+
+    /** Inserts returned reusable seeds into host-owned storage before normal ME insertion. */
+    default long insertReusableSeed(AEKey key, long amount, Actionable mode) {
+        return 0L;
+    }
 
     default CpuSelectionMode getSelectionMode() {
         return CpuSelectionMode.ANY;

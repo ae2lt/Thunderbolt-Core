@@ -94,11 +94,24 @@ public final class CraftingCore implements Sweepable {
             return 0;
         }
 
-        accumulate(cell, assembled.output(), saturatedMultiply(assembled.outputCount(), accepted));
+        long sharedOutput = details instanceof com.moakiee.thunderbolt.ae2.batch.SharedBatchInputPattern shared
+                ? Math.min(assembled.outputCount(), Math.max(0L,
+                        shared.sharedBatchOutputAmount(assembled.output())))
+                : 0L;
+        accumulate(cell, assembled.output(), saturatedAdd(
+                sharedOutput,
+                saturatedMultiply(assembled.outputCount() - sharedOutput, accepted)));
         if (assembled.remainders() != null) {
             for (var remainder : assembled.remainders()) {
                 if (remainder != null) {
                     accumulate(cell, remainder.key(), saturatedMultiply(remainder.count(), accepted));
+                }
+            }
+        }
+        if (assembled.sharedRemainders() != null) {
+            for (var remainder : assembled.sharedRemainders()) {
+                if (remainder != null) {
+                    accumulate(cell, remainder.key(), remainder.count());
                 }
             }
         }

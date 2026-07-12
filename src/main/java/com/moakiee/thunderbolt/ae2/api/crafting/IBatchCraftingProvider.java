@@ -40,6 +40,11 @@ public interface IBatchCraftingProvider extends ICraftingProvider {
         return isBusy() ? 0 : Integer.MAX_VALUE;
     }
 
+    /** Explicit opt-in for one reusable seed being sent once for an entire batch. */
+    default boolean supportsSingleSeedBatch() {
+        return false;
+    }
+
     /**
      * Try to consume up to {@code maxCraft} copies of {@code details}.
      *

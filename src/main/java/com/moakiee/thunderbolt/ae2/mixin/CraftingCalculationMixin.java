@@ -82,7 +82,9 @@ public abstract class CraftingCalculationMixin implements FastCraftingControl {
                 "output=" + this.output + " requested=" + amount + " simulate=" + simulate + " engine=thunderbolt");
         try {
             var attempt = FastCraftingPlanner.tryAttempt(
-                    craftingService, networkInv, getLevel(), output, amount, simulate);
+                    craftingService, networkInv, getLevel(), output, amount, simulate,
+                    simRequester instanceof com.moakiee.thunderbolt.ae2.crafting.ReservedStockCraftingRequester reserved
+                            ? reserved : null);
             if (attempt.handled()) {
                 // Reproduce the side effect of the real method body we are skipping, so that
                 // CraftingCalculation#isSimulation() reflects the attempt that produced this plan.
