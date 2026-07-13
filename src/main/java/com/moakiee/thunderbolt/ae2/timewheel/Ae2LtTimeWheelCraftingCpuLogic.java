@@ -226,6 +226,11 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
             return;
         }
 
+        if (job.softCancelling) {
+            finishSoftCancelIfReady(job);
+            return;
+        }
+
         if (job.link.isCanceled()) {
             if (!job.softCancelling) {
                 if (hasReusableSeedPattern(job)) beginSoftCancel(job);
@@ -234,7 +239,8 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
             return;
         }
 
-        if (job.softCancelling) {
+        if (job.remainingAmount <= 0) {
+            finishSuccessfulIfReady(job);
             return;
         }
 
@@ -537,11 +543,13 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
 
         long overloadRemainder = Math.max(0L, amount - strictMatched);
         if (overloadRemainder <= 0 || !OverloadCpuStateManager.INSTANCE.hasAnyPending(this)) {
+            if (type == Actionable.MODULATE) finishSuccessfulIfReady(activeJob);
             return returned;
         }
 
         var claims = OverloadCpuStateManager.INSTANCE.claim(this, what, overloadRemainder, type);
         if (!claims.claimedAnything()) {
+            if (type == Actionable.MODULATE) finishSuccessfulIfReady(activeJob);
             return returned;
         }
 
@@ -554,12 +562,12 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
                 returned += claimed;
                 if (activeJob.waitingKeys.isEmpty()
                         && !OverloadCpuStateManager.INSTANCE.hasAnyPending(this)) {
-                    finishJob(false);
-                    cpu.updateOutput(null);
+                    finishSoftCancelIfReady(activeJob);
                 }
             } else {
                 returned += applyInventoryClaims(activeJob, what, claims);
                 returned += applyRequesterClaims(activeJob, what, claims);
+                finishSuccessfulIfReady(activeJob);
             }
             cpu.markDirty();
         } else {
@@ -581,8 +589,7 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
                 inventory.insert(what, amount, Actionable.MODULATE);
                 if (activeJob.waitingKeys.isEmpty()
                         && !OverloadCpuStateManager.INSTANCE.hasAnyPending(this)) {
-                    finishJob(false);
-                    cpu.updateOutput(null);
+                    finishSoftCancelIfReady(activeJob);
                 }
             }
             return amount;
@@ -656,11 +663,71 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
     private void finishDeliveredFinalOutput(TimeWheelJob activeJob, AEKey what, long delivered) {
         postChange(what);
         activeJob.remainingAmount = Math.max(0L, activeJob.remainingAmount - delivered);
-        if (activeJob.remainingAmount <= 0) {
-            finishJob(true);
-            cpu.updateOutput(null);
-        } else {
+        if (activeJob.remainingAmount > 0) {
             cpu.updateOutput(new GenericStack(activeJob.finalOutput.what(), activeJob.remainingAmount));
+        } else {
+            // The requested output may arrive before an external executor returns its catalyst.
+            // Keep the job/link alive until every reusable seed is physically back in this CPU.
+            cpu.updateOutput(null);
+        }
+    }
+
+    private void finishSuccessfulIfReady(TimeWheelJob activeJob) {
+        if (job != activeJob || activeJob.softCancelling) return;
+        if (activeJob.remainingAmount > 0 || !returnReusableSeedsToHost()) return;
+        finishJob(true);
+        cpu.updateOutput(null);
+    }
+
+    private void finishSoftCancelIfReady(TimeWheelJob activeJob) {
+        if (job != activeJob || !activeJob.softCancelling
+                || !activeJob.waitingKeys.isEmpty()
+                || OverloadCpuStateManager.INSTANCE.hasAnyPending(this)) return;
+        if (!returnReusableSeedsToHost()) return;
+        finishJob(false);
+        cpu.updateOutput(null);
+    }
+
+    /** Moves returned seeds into the private host drive before the link is allowed to finish. */
+    private boolean returnReusableSeedsToHost() {
+        if (seedReturnQuota.isEmpty()) return true;
+        for (var seed : seedReturnQuota) {
+            if (inventory.extract(seed.getKey(), Long.MAX_VALUE, Actionable.SIMULATE)
+                    < seed.getLongValue()) return false;
+        }
+        var returnedSeeds = new ArrayList<GenericStack>();
+        for (var seed : seedReturnQuota) {
+            returnedSeeds.add(new GenericStack(seed.getKey(), seed.getLongValue()));
+        }
+        boolean changed = false;
+        for (var seed : returnedSeeds) {
+            long held = inventory.extract(seed.what(), Long.MAX_VALUE, Actionable.SIMULATE);
+            long acceptable = cpu.getHost().insertReusableSeed(
+                    seed.what(), seed.amount(), Actionable.SIMULATE);
+            long transferable = ReusableSeedStorageProgress.transferable(
+                    seed.amount(), held, acceptable);
+            if (transferable <= 0) continue;
+            long removed = inventory.extract(
+                    seed.what(), transferable, Actionable.MODULATE);
+            long inserted = removed > 0
+                    ? cpu.getHost().insertReusableSeed(
+                            seed.what(), removed, Actionable.MODULATE) : 0L;
+            if (inserted < removed) {
+                inventory.insert(seed.what(), removed - inserted, Actionable.MODULATE);
+            }
+            if (inserted > 0) {
+                seedReturnQuota.remove(seed.what(), inserted);
+                changed = true;
+            }
+        }
+        if (!seedReturnQuota.isEmpty()) cantStoreItems = true;
+        if (changed) cpu.markDirty();
+        return seedReturnQuota.isEmpty();
+    }
+
+    private void discardHeldReusableSeeds() {
+        for (var seed : seedReturnQuota) {
+            inventory.extract(seed.getKey(), seed.getLongValue(), Actionable.MODULATE);
         }
     }
 
@@ -701,6 +768,7 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
             beginSoftCancel(job);
             return;
         }
+        discardHeldReusableSeeds();
         seedReturnQuota.clear();
         cpu.updateOutput(null);
         finishJob(false);
@@ -722,7 +790,7 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
         cpu.markDirty();
         if (activeJob.waitingKeys.isEmpty()
                 && !OverloadCpuStateManager.INSTANCE.hasAnyPending(this)) {
-            finishJob(false);
+            finishSoftCancelIfReady(activeJob);
         }
     }
 
@@ -731,6 +799,7 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
             // A removed CPU cannot remain in the first-stage "wait for seed" state. Removal is the
             // destructive second cancellation: stop tracking late returns, cancel the link and
             // return/drop only content that is still physically in the CPU.
+            discardHeldReusableSeeds();
             seedReturnQuota.clear();
             finishJob(false);
         }
@@ -776,8 +845,8 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
             long seedInserted = intercept > 0
                     ? cpu.getHost().insertReusableSeed(entry.getKey(), intercept, Actionable.MODULATE)
                     : 0L;
-            if (intercept > 0) {
-                seedReturnQuota.remove(entry.getKey(), intercept);
+            if (seedInserted > 0) {
+                seedReturnQuota.remove(entry.getKey(), seedInserted);
                 entry.setValue(entry.getLongValue() - seedInserted);
             }
             var inserted = storage.insert(entry.getKey(), entry.getLongValue(), Actionable.MODULATE, cpu.getSrc());
@@ -1163,11 +1232,10 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
         postChange(incoming);
 
         activeJob.remainingAmount = Math.max(0L, activeJob.remainingAmount - claimed);
-        if (activeJob.remainingAmount <= 0) {
-            finishJob(true);
-            cpu.updateOutput(null);
-        } else {
+        if (activeJob.remainingAmount > 0) {
             cpu.updateOutput(new GenericStack(activeJob.finalOutput.what(), activeJob.remainingAmount));
+        } else {
+            cpu.updateOutput(null);
         }
         return inserted;
     }
