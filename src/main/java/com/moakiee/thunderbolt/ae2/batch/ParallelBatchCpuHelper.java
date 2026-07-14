@@ -2,6 +2,7 @@ package com.moakiee.thunderbolt.ae2.batch;
 
 import java.util.Arrays;
 import java.util.HashMap;
+import java.util.Map;
 
 import org.jetbrains.annotations.Nullable;
 
@@ -17,6 +18,12 @@ public final class ParallelBatchCpuHelper {
 
     @Nullable
     public static BulkResult bulkExtract(IPatternDetails details, ListCraftingInventory inv, int maxCraft) {
+        return bulkExtract(details, inv, maxCraft, true, Map.of());
+    }
+
+    @Nullable
+    public static BulkResult bulkExtract(IPatternDetails details, ListCraftingInventory inv, int maxCraft,
+                                         boolean allowSharedInputs, Map<AEKey, Long> reservedStock) {
         if (maxCraft <= 0) return null;
 
         var inputs = details.getInputs();
@@ -25,7 +32,9 @@ public final class ParallelBatchCpuHelper {
         var units = new long[slots];
         var available = new long[slots];
         var shared = new boolean[slots];
-        var sharedPattern = details instanceof SharedBatchInputPattern pattern ? pattern : null;
+        var sharedPattern = allowSharedInputs && details instanceof SharedBatchInputPattern pattern
+                ? pattern : null;
+        var reserved = reservedStock != null ? reservedStock : Map.<AEKey, Long>of();
 
         for (int slot = 0; slot < slots; slot++) {
             var input = inputs[slot];
@@ -39,7 +48,9 @@ public final class ParallelBatchCpuHelper {
                 if (possible.what() == null) continue;
                 long perCopy = saturatingMultiply(possible.amount(), input.getMultiplier());
                 if (perCopy <= 0) continue;
-                long inInventory = inv.extract(possible.what(), Long.MAX_VALUE, Actionable.SIMULATE);
+                long inInventory = Math.max(0L,
+                        inv.extract(possible.what(), Long.MAX_VALUE, Actionable.SIMULATE)
+                                - Math.max(0L, reserved.getOrDefault(possible.what(), 0L)));
                 boolean isShared = sharedPattern != null
                         && sharedPattern.isSharedBatchInput(slot, possible.what());
                 long copies = isShared ? (inInventory >= perCopy ? maxCraft : 0L) : inInventory / perCopy;

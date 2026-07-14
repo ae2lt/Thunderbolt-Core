@@ -18,6 +18,7 @@ import appeng.me.service.CraftingService;
 
 import com.moakiee.thunderbolt.ae2.api.crafting.IBatchCraftingProvider;
 import com.moakiee.thunderbolt.ae2.api.crafting.BatchDispatchMode;
+import com.moakiee.thunderbolt.ae2.api.crafting.CraftingPatternDelegates;
 
 public final class BatchExecutor {
     private BatchExecutor() {
@@ -53,6 +54,20 @@ public final class BatchExecutor {
                                               ListCraftingInventory inv,
                                               Map<IPatternDetails, IdentityHashMap<ICraftingProvider, Boolean>> batchedByTask,
                                               Runnable markDirty) {
+        return runBatchOnly(remainingOps, accountingMode, cs, es, level, job, inv,
+                batchedByTask, markDirty, Map.of());
+    }
+
+    public static BatchRunResult runBatchOnly(int remainingOps,
+                                              BatchCpuAccounting.Mode accountingMode,
+                                              CraftingService cs,
+                                              IEnergyService es,
+                                              Level level,
+                                              BatchJobView job,
+                                              ListCraftingInventory inv,
+                                              Map<IPatternDetails, IdentityHashMap<ICraftingProvider, Boolean>> batchedByTask,
+                                              Runnable markDirty,
+                                              Map<appeng.api.stacks.AEKey, Long> reservedStock) {
         if (job == null) return BatchRunResult.EMPTY;
 
         var taskIter = job.taskIterator();
@@ -82,9 +97,10 @@ public final class BatchExecutor {
                 continue;
             }
 
+            var providerPattern = CraftingPatternDelegates.forProviderLookup(details);
             var perTaskBatched = batchedByTask.get(details);
             java.util.ArrayList<EligibleProvider> eligible = null;
-            for (var provider : cs.getProviders(details)) {
+            for (var provider : cs.getProviders(providerPattern)) {
                 if (!(provider instanceof IBatchCraftingProvider batch)) continue;
                 sawBatchProvider = true;
                 if (details instanceof SharedBatchInputPattern
@@ -156,7 +172,8 @@ public final class BatchExecutor {
             }
             if (budget <= 0) continue;
 
-            var result = ParallelBatchCpuHelper.bulkExtract(details, inv, budget);
+            var result = ParallelBatchCpuHelper.bulkExtract(
+                    details, inv, budget, true, reservedStock);
             if (result == null) {
                 continue;
             }
