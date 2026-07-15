@@ -927,6 +927,18 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
         finishJob(false);
     }
 
+    /**
+     * Starts the normal safe-cancellation path and releases everything that can
+     * be returned immediately. Closed-loop jobs that are still waiting for
+     * reusable seeds remain persistent instead of discarding their ledger.
+     */
+    void tryReleaseContents() {
+        cancel();
+        if (job == null) {
+            storeItems();
+        }
+    }
+
     private boolean hasReusableSeedPattern(TimeWheelJob activeJob) {
         return !seedReturnQuota.isEmpty() || activeJob.closedLoopJob;
     }

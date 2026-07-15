@@ -171,4 +171,8 @@ public final class TimeWheelCraftingCPU implements ICraftingCPU, TimeWheelFastPl
     public void clearRemovedContent() {
         craftingLogic.clearRemovedContent();
     }
+
+    void tryReleaseContents() {
+        craftingLogic.tryReleaseContents();
+    }
 }

@@ -218,6 +218,18 @@ public final class TimeWheelCraftingCpuPool
         removeDrainedCpus();
     }
 
+    /**
+     * Best-effort release used before a host controller is removed. Ordinary
+     * jobs and already-held contents are returned to host storage/the ME
+     * network; a closed-loop job waiting for reusable seeds remains serialized.
+     */
+    public void tryReleaseContents() {
+        for (var entry : List.copyOf(activeCpus.values())) {
+            entry.cpu().tryReleaseContents();
+        }
+        removeDrainedCpus();
+    }
+
     public boolean hasPersistentState() {
         return !activeCpus.isEmpty();
     }
