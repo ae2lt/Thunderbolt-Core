@@ -23,9 +23,7 @@ import appeng.api.config.Actionable;
 import appeng.api.config.CpuSelectionMode;
 import appeng.api.networking.IGrid;
 import appeng.api.networking.crafting.CraftingJobStatus;
-import appeng.api.networking.crafting.ICraftingCPU;
 import appeng.api.networking.crafting.ICraftingPlan;
-import appeng.api.crafting.IPatternDetails;
 import appeng.api.networking.crafting.ICraftingRequester;
 import appeng.api.networking.crafting.ICraftingSubmitResult;
 import appeng.api.networking.energy.IEnergyService;
@@ -35,10 +33,14 @@ import appeng.crafting.CraftingLink;
 import appeng.crafting.execution.CraftingSubmitResult;
 import appeng.me.service.CraftingService;
 
+import com.moakiee.thunderbolt.ae2.crafting.ExtendedCraftingCpuCluster;
+import com.moakiee.thunderbolt.ae2.crafting.LoopCraftingPlan;
+
 /**
  * Shared-capacity time-wheel CPU that creates one virtual CPU per crafting job.
  */
-public final class TimeWheelCraftingCpuPool implements ICraftingCPU, TimeWheelFastPlanningGate.CpuState {
+public final class TimeWheelCraftingCpuPool
+        implements ExtendedCraftingCpuCluster, TimeWheelFastPlanningGate.CpuState {
     private static final int DATA_VERSION = 1;
     private static final String TAG_VERSION = "version";
     private static final String TAG_CPUS = "cpus";
@@ -73,6 +75,10 @@ public final class TimeWheelCraftingCpuPool implements ICraftingCPU, TimeWheelFa
         this.remainingStorage = totalStorage;
     }
 
+    public TimeWheelCraftingCpuPoolHost getHost() {
+        return host;
+    }
+
     public void reconfigure(long totalStorage, int sharedCoProcessors) {
         if (!activeCpus.isEmpty()) {
             throw new IllegalStateException("Cannot reconfigure a time-wheel CPU pool with retained state.");
@@ -90,6 +96,7 @@ public final class TimeWheelCraftingCpuPool implements ICraftingCPU, TimeWheelFa
         host.markCpuDirty();
     }
 
+    @Override
     public List<TimeWheelCraftingCPU> getActiveCpus() {
         var result = new ArrayList<TimeWheelCraftingCPU>(activeCpus.size());
         for (var entry : activeCpus.values()) {
@@ -98,18 +105,7 @@ public final class TimeWheelCraftingCpuPool implements ICraftingCPU, TimeWheelFa
         return List.copyOf(result);
     }
 
-    public boolean containsCpu(ICraftingCPU cpu) {
-        if (cpu == this) {
-            return true;
-        }
-        for (var entry : activeCpus.values()) {
-            if (entry.cpu() == cpu) {
-                return true;
-            }
-        }
-        return false;
-    }
-
+    @Override
     public long tickCraftingLogic(IEnergyService energyService, CraftingService craftingService) {
         resolvePendingLoad();
         long latestChange = Long.MIN_VALUE;
@@ -122,12 +118,14 @@ public final class TimeWheelCraftingCpuPool implements ICraftingCPU, TimeWheelFa
         return latestChange;
     }
 
+    @Override
     public void addWaitingKeys(Set<AEKey> waitingKeys) {
         for (var entry : activeCpus.values()) {
             entry.cpu().getCraftingLogic().getAllWaitingFor(waitingKeys);
         }
     }
 
+    @Override
     public long insert(AEKey what, long amount, Actionable mode) {
         long inserted = 0L;
         for (var entry : activeCpus.values()) {
@@ -139,6 +137,7 @@ public final class TimeWheelCraftingCpuPool implements ICraftingCPU, TimeWheelFa
         return inserted;
     }
 
+    @Override
     public long getRequestedAmount(AEKey what) {
         long requested = 0L;
         for (var entry : activeCpus.values()) {
@@ -147,6 +146,7 @@ public final class TimeWheelCraftingCpuPool implements ICraftingCPU, TimeWheelFa
         return requested;
     }
 
+    @Override
     public void restoreCraftingLinks(Consumer<CraftingLink> consumer) {
         for (var entry : activeCpus.values()) {
             var maybeLink = entry.cpu().getCraftingLogic().getLastLink();
@@ -156,17 +156,19 @@ public final class TimeWheelCraftingCpuPool implements ICraftingCPU, TimeWheelFa
         }
     }
 
+    @Override
     public boolean consumeCpuListChanged() {
         boolean changed = cpuListChanged;
         cpuListChanged = false;
         return changed;
     }
 
+    @Override
     public ICraftingSubmitResult submitJob(IGrid grid,
                                             ICraftingPlan plan,
                                             IActionSource src,
                                             @Nullable ICraftingRequester requester) {
-        if (!isActive() || !acceptsPlan(plan)) {
+        if (!isActive() || !canAcceptPlan(plan)) {
             return CraftingSubmitResult.CPU_OFFLINE;
         }
 
@@ -200,15 +202,12 @@ public final class TimeWheelCraftingCpuPool implements ICraftingCPU, TimeWheelFa
         return result;
     }
 
-    public boolean acceptsPlan(ICraftingPlan plan) {
-        if (plan == null) return false;
-        for (IPatternDetails details : plan.patternTimes().keySet()) {
-            if (details instanceof TimeWheelPoolRestrictedPattern restricted
-                    && !restricted.acceptsTimeWheelPool(host)) {
-                return false;
-            }
+    @Override
+    public boolean canAcceptPlan(ICraftingPlan plan) {
+        if (plan instanceof LoopCraftingPlan loopPlan) {
+            return loopPlan.canRunOn(host);
         }
-        return true;
+        return ExtendedCraftingCpuCluster.super.canAcceptPlan(plan);
     }
 
     public void cancelAll() {
@@ -270,6 +269,11 @@ public final class TimeWheelCraftingCpuPool implements ICraftingCPU, TimeWheelFa
         }
         recalculateRemainingStorage();
         cpuListChanged = !activeCpus.isEmpty();
+    }
+
+    @Override
+    public void prepareForCraftingService() {
+        resolvePendingLoad();
     }
 
     public void resolvePendingLoad() {
@@ -347,22 +351,6 @@ public final class TimeWheelCraftingCpuPool implements ICraftingCPU, TimeWheelFa
     @Override
     public boolean isActive() {
         return host.isCpuActive();
-    }
-
-    public boolean canBeAutoSelectedFor(IActionSource source) {
-        return switch (getSelectionMode()) {
-            case ANY -> true;
-            case PLAYER_ONLY -> source.player().isPresent();
-            case MACHINE_ONLY -> source.player().isEmpty();
-        };
-    }
-
-    public boolean isPreferredFor(IActionSource source) {
-        return switch (getSelectionMode()) {
-            case ANY -> false;
-            case PLAYER_ONLY -> source.player().isPresent();
-            case MACHINE_ONLY -> source.player().isEmpty();
-        };
     }
 
     private void removeDrainedCpus() {

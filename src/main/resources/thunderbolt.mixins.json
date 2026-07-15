@@ -23,7 +23,7 @@
     "AaeExecutingCraftingJobAccessor",
     "AaeElapsedTimeTrackerAccessor",
     "AaeTaskProgressAccessor",
-    "TimeWheelCraftingServiceMixin",
+    "ExtendedCraftingCpuServiceMixin",
     "TimeWheelCraftingCPUMenuMixin"
   ],
   "client": [

@@ -5,9 +5,9 @@ package com.moakiee.thunderbolt.ae2.crafting;
  * {@code CraftingCalculation} mixin and driven by the host mod.
  *
  * <p>Thunderbolt Core can run standalone (the planner is enabled by {@code CoreConfig.FAST_PATH_ENABLED}
- * for every calculation). When AE2 Lightning Tech is present it uses this hook to gate the fast path to
- * exactly the jobs it wants accelerated (e.g. only when a TimeWheel CPU is active), by calling
- * {@link #ae2lt$setFastPlanningEnabled(boolean)} on the freshly created calculation.
+ * for every calculation). The crafting-service extension uses this hook to gate the portable fast
+ * path when an active time-wheel CPU is registered. CPU ownership is a separate plan-level concern represented by
+ * {@link LoopCraftingPlan}; enabling this optimization does not itself lock a plan to one CPU.
  *
  * <p>The {@code ae2lt$} prefix keeps the synthetic members unique on the mixed-in AE2 class.
  */

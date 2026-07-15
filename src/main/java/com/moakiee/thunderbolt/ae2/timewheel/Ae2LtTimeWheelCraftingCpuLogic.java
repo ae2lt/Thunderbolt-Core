@@ -69,6 +69,7 @@ import com.moakiee.thunderbolt.ae2.overload.cpu.OverloadCpuStateManager;
 import com.moakiee.thunderbolt.ae2.overload.cpu.OverloadPatternReference;
 import com.moakiee.thunderbolt.ae2.overload.pattern.OverloadedProviderOnlyPatternDetails;
 import com.moakiee.thunderbolt.ae2.crafting.PatternFiringExpander;
+import com.moakiee.thunderbolt.ae2.crafting.LoopCraftingPlan;
 
 public final class Ae2LtTimeWheelCraftingCpuLogic {
     private static final int WHEEL_SIZE = 64;
@@ -154,30 +155,30 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
             AELog.warn("Time wheel crafting CPU inventory is not empty yet a job was submitted.");
         }
 
-        var seedRequirements = collectReusableSeeds(plan);
-        var maximumSeedRequirements = collectMaximumReusableSeeds(plan);
+        var loopPlan = plan instanceof LoopCraftingPlan loop ? loop : null;
+        var seedRequirements = loopPlan != null
+                ? copyToCounter(loopPlan.totalReusableSeeds()) : new KeyCounter();
+        var hostSeedAllocation = loopPlan != null
+                ? copyToCounter(loopPlan.hostReusableSeeds()) : new KeyCounter();
         var adjustedUsedItems = copyCounter(plan.usedItems());
         var hostSeeds = new KeyCounter();
-        for (var entry : maximumSeedRequirements) {
-            long plannedUsed = adjustedUsedItems.get(entry.getKey());
-            long requested = Math.max(
-                    ReusableSeedAllocation.hostRequest(
-                            plannedUsed, seedRequirements.get(entry.getKey())),
-                    entry.getLongValue());
-            if (requested <= 0) continue;
+        boolean hostShortfall = false;
+        for (var entry : hostSeedAllocation) {
+            long requested = entry.getLongValue();
             long extracted = cpu.getHost().extractReusableSeed(
                     entry.getKey(), requested, Actionable.MODULATE);
-            if (extracted <= 0) continue;
-            inventory.insert(entry.getKey(), extracted, Actionable.MODULATE);
-            long coveredPlanned = Math.min(plannedUsed, extracted);
-            long networkRemainder = ReusableSeedAllocation.networkRemainder(
-                    plannedUsed, coveredPlanned);
-            adjustedUsedItems.remove(entry.getKey(), plannedUsed - networkRemainder);
-            hostSeeds.add(entry.getKey(), extracted);
+            if (extracted > 0) {
+                inventory.insert(entry.getKey(), extracted, Actionable.MODULATE);
+                hostSeeds.add(entry.getKey(), extracted);
+            }
+            if (extracted < requested) {
+                adjustedUsedItems.add(entry.getKey(), requested - extracted);
+                hostShortfall = true;
+            }
         }
 
-        ICraftingPlan extractionPlan = hostSeeds.isEmpty()
-                ? plan : new UsedItemsOverridePlan(plan, adjustedUsedItems);
+        ICraftingPlan extractionPlan = hostShortfall
+                ? new UsedItemsOverridePlan(plan, adjustedUsedItems) : plan;
         var missingIngredient = CraftingCpuHelper.tryExtractInitialItems(extractionPlan, grid, inventory, src);
         if (missingIngredient != null) {
             rollbackHostSeeds(hostSeeds);
@@ -192,13 +193,7 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
         this.job = new TimeWheelJob(plan, this::postChange, linkCpu, playerId);
         seedReturnQuota.clear();
         for (var entry : seedRequirements) {
-            seedReturnQuota.add(entry.getKey(), Math.max(
-                    entry.getLongValue(), hostSeeds.get(entry.getKey())));
-        }
-        for (var entry : hostSeeds) {
-            if (seedRequirements.get(entry.getKey()) <= 0) {
-                seedReturnQuota.add(entry.getKey(), entry.getLongValue());
-            }
+            seedReturnQuota.add(entry.getKey(), entry.getLongValue());
         }
         seedInFlightCredit.clear();
         patternPowerCache.clear();
@@ -898,34 +893,11 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
         cpu.markDirty();
     }
 
-    private KeyCounter collectReusableSeeds(ICraftingPlan plan) {
+    private static KeyCounter copyToCounter(Map<AEKey, Long> source) {
         var result = new KeyCounter();
-        for (var details : plan.patternTimes().keySet()) {
-            if (!(details instanceof ReusableSeedPattern seeded)) continue;
-            for (var entry : seeded.reusableSeedRequirements().entrySet()) {
-                if (entry.getKey() != null && entry.getValue() != null && entry.getValue() > 0) {
-                    result.add(entry.getKey(), entry.getValue());
-                }
-            }
-        }
-        return result;
-    }
-
-    private KeyCounter collectMaximumReusableSeeds(ICraftingPlan plan) {
-        var result = new KeyCounter();
-        for (var details : plan.patternTimes().keySet()) {
-            if (!(details instanceof ReusableSeedPattern seeded)) continue;
-            var minimum = seeded.reusableSeedRequirements();
-            var maximum = seeded.maximumReusableSeedRequirements();
-            var keys = new HashSet<AEKey>();
-            keys.addAll(minimum.keySet());
-            keys.addAll(maximum.keySet());
-            for (var key : keys) {
-                if (key == null) continue;
-                long value = Math.max(
-                        Math.max(0L, minimum.getOrDefault(key, 0L)),
-                        Math.max(0L, maximum.getOrDefault(key, 0L)));
-                if (value > 0) result.add(key, value);
+        for (var entry : source.entrySet()) {
+            if (entry.getKey() != null && entry.getValue() != null && entry.getValue() > 0) {
+                result.add(entry.getKey(), entry.getValue());
             }
         }
         return result;

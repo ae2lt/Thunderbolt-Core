@@ -8,6 +8,7 @@ import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
 
 import appeng.api.networking.crafting.ICraftingSimulationRequester;
+import appeng.api.networking.crafting.ICraftingPlan;
 import appeng.api.stacks.AEKey;
 import appeng.crafting.CraftingCalculation;
 import appeng.crafting.CraftingPlan;
@@ -18,6 +19,7 @@ import com.moakiee.thunderbolt.CoreConfig;
 import com.moakiee.thunderbolt.ae2.crafting.FastCraftingControl;
 import com.moakiee.thunderbolt.ae2.crafting.FastCraftingPlanner;
 import com.moakiee.thunderbolt.ae2.crafting.FastPlanningWatchdog;
+import com.moakiee.thunderbolt.ae2.crafting.LoopCraftingPlan;
 
 /**
  * Installs the linear-time autocrafting fast path inside AE2's per-amount attempt
@@ -29,9 +31,10 @@ import com.moakiee.thunderbolt.ae2.crafting.FastPlanningWatchdog;
  * simulator (Policy A) — that quadratic/NBT-fuzzy path is exactly what hangs on heavy graphs.
  *
  * <p>Gating: {@link #ae2lt$fastPlanningEnabled} defaults to {@link CoreConfig#FAST_PATH_ENABLED} so the
- * lib accelerates every calculation when running standalone. A host mod (AE2 Lightning Tech) can call
- * {@link FastCraftingControl#ae2lt$setFastPlanningEnabled(boolean)} on a fresh calculation to restrict
- * the fast path to specific jobs (e.g. only when a TimeWheel CPU is active).
+ * lib accelerates every calculation when running standalone. The crafting-service extension calls
+ * {@link FastCraftingControl#ae2lt$setFastPlanningEnabled(boolean)} on a fresh calculation when a
+ * registered time-wheel CPU enables the current fast-planning path. Closed-loop results are wrapped in a
+ * {@link LoopCraftingPlan} before leaving the calculation.
  *
  * <p>Every attempt is wrapped by {@link FastPlanningWatchdog} so a hang is captured with a live stack.
  */
@@ -64,6 +67,11 @@ public abstract class CraftingCalculationMixin implements FastCraftingControl {
     @Override
     public boolean ae2lt$isFastPlanningEnabled() {
         return this.ae2lt$fastPlanningEnabled;
+    }
+
+    @Inject(method = "run", at = @At("RETURN"), cancellable = true, remap = false)
+    private void thunderbolt$wrapLoopPlan(CallbackInfoReturnable<ICraftingPlan> cir) {
+        cir.setReturnValue(LoopCraftingPlan.wrapIfNeeded(cir.getReturnValue()));
     }
 
     @Inject(method = "runCraftAttempt", at = @At("HEAD"), cancellable = true, remap = false)
