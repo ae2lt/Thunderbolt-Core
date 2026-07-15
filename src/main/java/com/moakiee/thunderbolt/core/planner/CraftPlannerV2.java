@@ -135,7 +135,7 @@ public final class CraftPlannerV2<K> {
         //    deduction (no recompute loop). When this fully succeeds, contention never mattered.
         CraftPlan<K> linear = linearPass(order, target, amount);
         if (linear.feasible()) {
-            return linear;
+            return enforceContainerBootstrap(linear);
         }
 
         // 2) Contended cone only: fall back to the bounded recursive search (trail + per-node cap K).
@@ -151,6 +151,82 @@ public final class CraftPlannerV2<K> {
                 new HashMap<>(grossDemand),
                 processed,
                 budgetExhausted);
+    }
+
+    /**
+     * A balanced container cycle still needs one physical state token to start. A purely algebraic
+     * flow can otherwise schedule {@code full -> empty -> full} with zero initial containers. When a
+     * fired consumed-returning input is refilled by another fired pattern, require one batch from
+     * inventory unless some fired acyclic producer supplies either state from outside the pair.
+     */
+    private CraftPlan<K> enforceContainerBootstrap(CraftPlan<K> plan) {
+        Map<K, List<CraftPattern<K>>> firedByOutput = new HashMap<>();
+        for (Map.Entry<CraftPattern<K>, Long> entry : plan.firings().entrySet()) {
+            if (entry.getValue() > 0) {
+                firedByOutput.computeIfAbsent(entry.getKey().output(), ignored -> new ArrayList<>())
+                        .add(entry.getKey());
+            }
+        }
+
+        Map<K, Long> used = new HashMap<>(plan.usedStock());
+        Map<K, Long> missing = new HashMap<>(plan.missing());
+        Set<Set<K>> handled = new java.util.HashSet<>();
+
+        for (CraftPattern<K> consumer : plan.firings().keySet()) {
+            if (plan.firings().getOrDefault(consumer, 0L) <= 0) continue;
+            for (CraftInput<K> transition : consumer.inputs()) {
+                K remainder = transition.remainder();
+                if (remainder == null) continue;
+                if (transition.key().equals(remainder)) continue;
+
+                long refillRequirement = Long.MAX_VALUE;
+                for (CraftPattern<K> refill : firedByOutput.getOrDefault(transition.key(), List.of())) {
+                    for (CraftInput<K> refillInput : refill.inputs()) {
+                        if (remainder.equals(refillInput.key())) {
+                            refillRequirement = Math.min(refillRequirement, refillInput.amount());
+                        }
+                    }
+                }
+                if (refillRequirement == Long.MAX_VALUE) continue;
+
+                Set<K> states = Set.of(transition.key(), remainder);
+                if (!handled.add(states)) continue;
+                if (used.getOrDefault(transition.key(), 0L) > 0
+                        || used.getOrDefault(remainder, 0L) > 0
+                        || hasExternalBootstrapProducer(states, firedByOutput)) {
+                    continue;
+                }
+
+                long required = Math.max(1L, Math.min(transition.amount(), refillRequirement));
+                K chosen = graph.stock(transition.key()) >= graph.stock(remainder)
+                        ? transition.key() : remainder;
+                long extracted = Math.min(required, graph.stock(chosen));
+                if (extracted > 0) {
+                    used.merge(chosen, extracted, Sat::add);
+                }
+                if (extracted < required) {
+                    missing.merge(chosen, required - extracted, Sat::add);
+                }
+            }
+        }
+
+        return new CraftPlan<>(plan.supported(), missing.isEmpty(), plan.firings(), used, missing,
+                plan.grossDemand(), plan.itemsProcessed(), plan.budgetExhausted());
+    }
+
+    private boolean hasExternalBootstrapProducer(
+            Set<K> states,
+            Map<K, List<CraftPattern<K>>> firedByOutput) {
+        for (K state : states) {
+            for (CraftPattern<K> producer : firedByOutput.getOrDefault(state, List.of())) {
+                boolean consumesCycleState = producer.inputs().stream()
+                        .anyMatch(input -> states.contains(input.key()));
+                if (!consumesCycleState) {
+                    return true;
+                }
+            }
+        }
+        return false;
     }
 
     // ---- graph construction ------------------------------------------------

@@ -431,6 +431,28 @@ class CraftPlannerV2Test {
     }
 
     @Test
+    void containerCycleCanBootstrapFromReturnedStateButNotFromNothing() {
+        CraftPattern<String> makeP = new CraftPattern<>(
+                "P", 1, List.of(CraftInput.consumedReturning("full", 1, "empty")),
+                List.of(CraftOutput.of("empty", 1)), "makeP");
+        CraftPattern<String> refill = new CraftPattern<>(
+                "full", 1, List.of(CraftInput.of("empty", 1), CraftInput.of("water", 1)), "refill");
+
+        CraftGraph<String> withSeed = CraftGraph.<String>builder()
+                .pattern(makeP).pattern(refill).stock("empty", 1).stock("water", 100).build();
+        CraftGraph<String> withoutSeed = CraftGraph.<String>builder()
+                .pattern(makeP).pattern(refill).stock("water", 100).build();
+
+        CraftPlan<String> seeded = CraftPlannerV2.plan(withSeed, "P", 10);
+        CraftPlan<String> unseeded = CraftPlannerV2.plan(withoutSeed, "P", 10);
+
+        assertTrue(seeded.feasible());
+        assertEquals(1L, seeded.usedStock().get("empty"));
+        assertFalse(unseeded.feasible());
+        assertEquals(1L, unseeded.missing().get("full"));
+    }
+
+    @Test
     void decompressCycleMakesIngotsFromBlockStock() {
         // Same pair, opposite direction: target = ingot, stock = blocks. Now the compress recipe is the
         // back-edge that gets cut, so ingots come from decompressing blocks.

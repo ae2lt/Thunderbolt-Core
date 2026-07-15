@@ -178,7 +178,8 @@ public final class FastCraftingPlanner {
         // Emittable shortfalls are supplied by emitters, not crafted, so they don't make a plan
         // infeasible — only a non-emittable shortfall does.
         if (plan.feasible() || noNonEmittableMissing(plan, emittable)) {
-            return FastAttempt.handled(toAe2Plan(output, amount, plan, multi, false, durability, emittable));
+            return FastAttempt.handled(toAe2Plan(output, amount, plan, multi, false, durability, emittable,
+                    snapshot, reservedStock));
         }
         // Infeasible at this amount. Best-effort policy (Policy A): we never fall back to AE2's
         // exhaustive simulator for performance — that is the slow path this engine exists to avoid.
@@ -189,7 +190,8 @@ public final class FastCraftingPlanner {
         if (!simulate) {
             return FastAttempt.handled(null); // this amount can't be made within our bounded search
         }
-        return FastAttempt.handled(toAe2Plan(output, amount, plan, multi, true, durability, emittable)); // partial + missing
+        return FastAttempt.handled(toAe2Plan(output, amount, plan, multi, true, durability, emittable,
+                snapshot, reservedStock)); // partial + missing
     }
 
     private static boolean noNonEmittableMissing(CraftPlan<AEKey> plan, Set<AEKey> emittable) {
@@ -264,6 +266,7 @@ public final class FastCraftingPlanner {
             // in toAe2Plan) rather than crafted. Never decline just because an item is emittable.
             if (craftingService.canEmitFor(key)) {
                 emittable.add(key);
+                builder.stock(key, Sat.SAT);
                 continue;
             }
 
@@ -321,7 +324,7 @@ public final class FastCraftingPlanner {
                 OverloadPatternDetails overloadView = details instanceof OverloadedProviderOnlyPatternDetails op
                         ? op.overloadPatternDetailsView()
                         : null;
-                List<List<CraftInput<AEKey>>> slotOptions = new ArrayList<>(inputs.length);
+                List<List<SlotChoice>> slotOptions = new ArrayList<>(inputs.length);
                 long combos = 1;
                 boolean patternUnsatisfiable = false;
                 for (int slot = 0; slot < inputs.length; slot++) {
@@ -341,7 +344,8 @@ public final class FastCraftingPlanner {
                         long usesPerFiring = Sat.mul(
                                 Math.max(1, in.getPossibleInputs()[0].amount()),
                                 Math.max(1, in.getMultiplier()));
-                        slotOptions.add(List.of(CraftInput.of(chain.carrier(), usesPerFiring)));
+                        slotOptions.add(List.of(new SlotChoice(List.of(
+                                CraftInput.of(chain.carrier(), usesPerFiring)))));
                         continue; // single deterministic option, never enqueued for crafting
                     }
                     boolean idOnly = overloadView != null && overloadView.inputMode(slot) == MatchMode.ID_ONLY;
@@ -355,14 +359,13 @@ public final class FastCraftingPlanner {
                             return false;
                         }
                         itemUnitKeys.add(inputKey);
-                        long amt = Sat.mul(template.amount(), in.getMultiplier());
                         AEKey remaining = in.getRemainingKey(inputKey) instanceof AEKey r ? r : null;
                         if (remaining == null) {
-                            opts.add(CraftInput.of(inputKey, amt));
+                            opts.add(CraftInput.of(inputKey, template.amount()));
                         } else if (remaining.equals(inputKey)) {
                             // Returned unchanged: a true catalyst / non-degrading container. One seed
                             // serves the whole batch (AE2's limitQty), modelled as a returned input.
-                            opts.add(CraftInput.returned(inputKey, amt));
+                            opts.add(CraftInput.returned(inputKey, template.amount()));
                         } else if (sameItem(inputKey, remaining)) {
                             // Same item, lower durability, but durabilityChain declined it (chain longer
                             // than the cyclic budget). Report missing rather than decline: drop the option.
@@ -371,7 +374,7 @@ public final class FastCraftingPlanner {
                             // Different leftover item (e.g. filled bucket -> empty bucket): consume the
                             // full input and hand back the remainder as a byproduct, so refilling it
                             // closes a cycle the planner resolves instead of declining.
-                            opts.add(CraftInput.consumedReturning(inputKey, amt, remaining));
+                            opts.add(CraftInput.consumedReturning(inputKey, template.amount(), remaining));
                         }
                     }
                     if (opts.isEmpty()) {
@@ -390,11 +393,12 @@ public final class FastCraftingPlanner {
                         opts.sort(Comparator.comparingLong(
                             (CraftInput<AEKey> o) -> availability.get(o.key())).reversed());
                     }
-                    slotOptions.add(opts);
+                    List<SlotChoice> choices = expandSlotChoices(opts, in.getMultiplier(), availability);
+                    slotOptions.add(choices);
                     // Saturating product: a raw `combos *= opts.size()` can overflow Long for patterns
                     // with many fuzzy slots over large tags, wrapping to a small value that slips past
                     // the budget check below. Sat.mul clamps so the budget comparison stays correct.
-                    combos = Sat.mul(combos, opts.size());
+                    combos = Sat.mul(combos, choices.size());
                 }
                 if (patternUnsatisfiable) {
                     continue; // skip this recipe; if nothing else makes `key` it surfaces as missing
@@ -640,9 +644,13 @@ public final class FastCraftingPlanner {
      */
     private static void emitBestCombinations(CraftGraph.Builder<AEKey> builder, Set<AEKey> seen, Deque<AEKey> queue,
                                          AEKey key, long outputAmount, List<CraftOutput<AEKey>> byproducts,
-                                         List<List<CraftInput<AEKey>>> slotOptions, IPatternDetails source) {
-        for (List<CraftInput<AEKey>> coreInputs
+                                         List<List<SlotChoice>> slotOptions, IPatternDetails source) {
+        for (List<SlotChoice> selectedSlots
                 : BoundedCombinations.bestFirst(slotOptions, (int) FUZZY_NONCYCLE_STEPS)) {
+            List<CraftInput<AEKey>> coreInputs = new ArrayList<>();
+            for (SlotChoice selected : selectedSlots) {
+                coreInputs.addAll(selected.inputs());
+            }
             // A container option (consume full, return empty) contributes its leftover as a byproduct of
             // THIS combination, so we copy the shared byproduct list and append per-chosen-option leftovers.
             List<CraftOutput<AEKey>> combo = byproducts;
@@ -664,10 +672,109 @@ public final class FastCraftingPlanner {
         }
     }
 
+    /** One concrete integer allocation of a fuzzy slot across its accepted substitutes. */
+    private record SlotChoice(List<CraftInput<AEKey>> inputs) {
+        private SlotChoice {
+            inputs = List.copyOf(inputs);
+        }
+    }
+
+    /**
+     * Expands a slot multiplier into bounded integer partitions across its concrete substitutes.
+     * AE2 may satisfy one slot with a mixture (for example two acacia, one birch and one oak plank),
+     * whereas treating every substitute as an all-or-nothing recipe incorrectly requires all units
+     * to come from one key. Pure allocations are retained and mixed allocations are ranked by how
+     * many firings the current network stock can immediately support.
+     */
+    private static List<SlotChoice> expandSlotChoices(
+            List<CraftInput<AEKey>> options,
+            long multiplier,
+            Map<AEKey, Long> availability) {
+        long units = Math.max(1, multiplier);
+        if (options.size() == 1) {
+            return List.of(new SlotChoice(List.of(scaleInput(options.get(0), units))));
+        }
+
+        int limit = (int) FUZZY_NONCYCLE_STEPS;
+        List<long[]> allocations = new ArrayList<>(limit);
+
+        // Always retain every pure route that fits the budget.
+        for (int i = 0; i < options.size() && allocations.size() < limit; i++) {
+            long[] counts = new long[options.size()];
+            counts[i] = units;
+            allocations.add(counts);
+        }
+
+        // Then add mixed partitions, best substitute first. Enumeration is capped, so even very
+        // large multipliers or tags cannot make graph construction unbounded.
+        enumerateMixedAllocations(options.size(), 0, units, new long[options.size()], allocations, limit);
+
+        List<SlotChoice> choices = new ArrayList<>(allocations.size());
+        for (long[] allocation : allocations) {
+            List<CraftInput<AEKey>> inputs = new ArrayList<>();
+            for (int i = 0; i < allocation.length; i++) {
+                if (allocation[i] > 0) {
+                    inputs.add(scaleInput(options.get(i), allocation[i]));
+                }
+            }
+            choices.add(new SlotChoice(inputs));
+        }
+        choices.sort(Comparator.comparingLong(
+                (SlotChoice choice) -> immediatelySupportedFirings(choice, availability)).reversed());
+        return choices;
+    }
+
+    private static void enumerateMixedAllocations(
+            int optionCount,
+            int index,
+            long remaining,
+            long[] counts,
+            List<long[]> out,
+            int limit) {
+        if (out.size() >= limit) {
+            return;
+        }
+        if (index == optionCount - 1) {
+            counts[index] = remaining;
+            int nonZero = 0;
+            for (long count : counts) {
+                if (count > 0) nonZero++;
+            }
+            if (nonZero > 1) {
+                out.add(Arrays.copyOf(counts, counts.length));
+            }
+            return;
+        }
+        for (long count = remaining; count >= 0 && out.size() < limit; count--) {
+            counts[index] = count;
+            enumerateMixedAllocations(optionCount, index + 1, remaining - count, counts, out, limit);
+            if (count == 0) break; // avoid long underflow
+        }
+        counts[index] = 0;
+    }
+
+    private static CraftInput<AEKey> scaleInput(CraftInput<AEKey> input, long units) {
+        return new CraftInput<>(
+                input.key(), Sat.mul(input.amount(), units), input.returned(), input.uses(), input.remainder());
+    }
+
+    private static long immediatelySupportedFirings(
+            SlotChoice choice,
+            Map<AEKey, Long> availability) {
+        long supported = Sat.SAT;
+        for (CraftInput<AEKey> input : choice.inputs()) {
+            supported = Math.min(supported,
+                    input.firingsFrom(availability.getOrDefault(input.key(), 0L)));
+        }
+        return supported;
+    }
+
     private static CraftingPlan toAe2Plan(AEKey output, long amount, CraftPlan<AEKey> plan,
                                           boolean multiplePaths, boolean simulation,
                                           Map<AEKey, DurabilityChain<AEKey>> durability,
-                                          Set<AEKey> emittable) {
+                                          Set<AEKey> emittable,
+                                          ChildCraftingSimulationState snapshot,
+                                          @Nullable ReservedStockCraftingRequester reservedStock) {
         // Several CraftPatterns may share one IPatternDetails (fuzzy combos / multi-output nodes), so
         // accumulate firing counts per real pattern.
         Map<IPatternDetails, Long> patternTimes = new HashMap<>();
@@ -676,7 +783,12 @@ public final class FastCraftingPlanner {
         }
 
         KeyCounter usedItems = new KeyCounter();
+        KeyCounter emittedItems = new KeyCounter();
         for (Map.Entry<AEKey, Long> e : plan.usedStock().entrySet()) {
+            if (emittable.contains(e.getKey())) {
+                emittedItems.add(e.getKey(), e.getValue());
+                continue;
+            }
             DurabilityChain<AEKey> chain = durability.get(e.getKey());
             if (chain == null) {
                 usedItems.add(e.getKey(), e.getValue());
@@ -686,8 +798,13 @@ public final class FastCraftingPlanner {
             }
         }
 
+        // AE2 extracts fuzzy-slot stock before it decides how much of the remainder must be crafted.
+        // Preserve that observable behavior: charge any still-unused accepted stock up to the slot's
+        // aggregate demand, even when the compact planner found a more economical concrete mix.
+        chargeAvailableFuzzyStock(plan, usedItems, snapshot, reservedStock);
+
         KeyCounter missingItems = new KeyCounter();
-        KeyCounter emittedItems = new KeyCounter();
+        Set<AEKey> fuzzyIntermediateMissing = fuzzyIntermediateMissing(plan);
         for (Map.Entry<AEKey, Long> e : plan.missing().entrySet()) {
             if (emittable.contains(e.getKey())) {
                 emittedItems.add(e.getKey(), e.getValue()); // emitter supplies the shortfall on demand
@@ -695,7 +812,9 @@ public final class FastCraftingPlanner {
             }
             DurabilityChain<AEKey> chain = durability.get(e.getKey());
             if (chain == null) {
-                missingItems.add(e.getKey(), e.getValue());
+                if (!fuzzyIntermediateMissing.contains(e.getKey())) {
+                    missingItems.add(e.getKey(), e.getValue());
+                }
             } else {
                 // Missing uses become full tools to craft/supply: ceil(uses / n).
                 missingItems.add(chain.carrier(), Sat.ceilDiv(e.getValue(), chain.n()));
@@ -715,9 +834,72 @@ public final class FastCraftingPlanner {
                 patternTimes);
     }
 
+    private static Set<AEKey> fuzzyIntermediateMissing(CraftPlan<AEKey> plan) {
+        Set<AEKey> craftedOutputs = new HashSet<>();
+        Set<IPatternDetails> sources = java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<>());
+        for (CraftPattern<AEKey> pattern : plan.firings().keySet()) {
+            if (plan.firings().getOrDefault(pattern, 0L) > 0) {
+                craftedOutputs.add(pattern.output());
+                sources.add((IPatternDetails) pattern.source());
+            }
+        }
+
+        Set<AEKey> suppressed = new HashSet<>();
+        for (IPatternDetails source : sources) {
+            for (IPatternDetails.IInput slot : source.getInputs()) {
+                GenericStack[] possible = slot.getPossibleInputs();
+                if (possible.length <= 1) continue;
+                boolean routedThroughCraftableAlternative = Arrays.stream(possible)
+                        .anyMatch(option -> craftedOutputs.contains(option.what()));
+                if (routedThroughCraftableAlternative) {
+                    for (GenericStack option : possible) {
+                        suppressed.add(option.what());
+                    }
+                }
+            }
+        }
+        return suppressed;
+    }
+
+    private static void chargeAvailableFuzzyStock(
+            CraftPlan<AEKey> plan,
+            KeyCounter usedItems,
+            ChildCraftingSimulationState snapshot,
+            @Nullable ReservedStockCraftingRequester reservedStock) {
+        Map<IPatternDetails, Long> sourceFirings = new HashMap<>();
+        for (var entry : plan.firings().entrySet()) {
+            sourceFirings.merge((IPatternDetails) entry.getKey().source(), entry.getValue(), Sat::add);
+        }
+        for (var sourceEntry : sourceFirings.entrySet()) {
+            long times = sourceEntry.getValue();
+            for (IPatternDetails.IInput slot : sourceEntry.getKey().getInputs()) {
+                GenericStack[] possible = slot.getPossibleInputs();
+                if (possible.length <= 1) continue;
+                long remainingUnits = Sat.mul(times, Math.max(1, slot.getMultiplier()));
+                for (GenericStack option : possible) {
+                    long unitAmount = Math.max(1, option.amount());
+                    remainingUnits = Math.max(0, remainingUnits - usedItems.get(option.what()) / unitAmount);
+                }
+                for (GenericStack option : possible) {
+                    if (remainingUnits <= 0) break;
+                    long unitAmount = Math.max(1, option.amount());
+                    long alreadyUsed = usedItems.get(option.what());
+                    long availableStock = usableStock(snapshot, option.what(), reservedStock);
+                    long unusedStock = Math.max(0, availableStock - alreadyUsed);
+                    long extraUnits = Math.min(remainingUnits, unusedStock / unitAmount);
+                    if (extraUnits > 0) {
+                        usedItems.add(option.what(), Sat.mul(extraUnits, unitAmount));
+                        remainingUnits -= extraUnits;
+                    }
+                }
+            }
+        }
+    }
+
     /**
      * Reproduces AE2's byte total: {@code addStackBytes} per requested node
-     * ({@code items / amountPerByte * 8}), plus one byte per pattern firing, plus {@code 8 * nodeCount}.
+     * ({@code items / amountPerByte * 8}), plus one byte per pattern firing, one byte per returned
+     * container firing, and {@code 8 * nodeCount}.
      */
     private static long computeBytes(CraftPlan<AEKey> plan, Map<AEKey, DurabilityChain<AEKey>> durability) {
         double bytes = 0;
@@ -731,7 +913,35 @@ public final class FastCraftingPlanner {
         for (long times : plan.firings().values()) {
             bytes += times;
         }
-        bytes += 8.0 * plan.grossDemand().size();
+        for (Map.Entry<CraftPattern<AEKey>, Long> entry : plan.firings().entrySet()) {
+            long times = entry.getValue();
+            for (CraftInput<AEKey> input : entry.getKey().inputs()) {
+                if (input.returned() || input.remainder() != null || durability.containsKey(input.key())) {
+                    bytes += (double) Sat.mul(times, input.amount());
+                }
+            }
+        }
+        long nodeCount = plan.grossDemand().size() - fuzzyNodeReduction(plan);
+        bytes += 8.0 * Math.max(0, nodeCount);
         return (long) Math.ceil(bytes);
+    }
+
+    private static long fuzzyNodeReduction(CraftPlan<AEKey> plan) {
+        long reduction = 0;
+        Set<IPatternDetails> visited = java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<>());
+        for (CraftPattern<AEKey> pattern : plan.firings().keySet()) {
+            IPatternDetails source = (IPatternDetails) pattern.source();
+            if (!visited.add(source)) continue;
+            for (IPatternDetails.IInput slot : source.getInputs()) {
+                Set<AEKey> present = new HashSet<>();
+                for (GenericStack possible : slot.getPossibleInputs()) {
+                    if (plan.grossDemand().containsKey(possible.what())) {
+                        present.add(possible.what());
+                    }
+                }
+                reduction += Math.max(0, present.size() - 1L);
+            }
+        }
+        return reduction;
     }
 }
