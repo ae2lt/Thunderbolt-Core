@@ -55,6 +55,7 @@ public final class TimeWheelCraftingCpuPool
     private int sharedCoProcessors;
     private long remainingStorage;
     private boolean cpuListChanged;
+    private boolean fastPlanningEnabled = true;
 
     public TimeWheelCraftingCpuPool(TimeWheelCraftingCpuPoolHost host) {
         this(host, 0L, 0);
@@ -330,6 +331,15 @@ public final class TimeWheelCraftingCpuPool
 
     public boolean hasInfiniteStorage() {
         return totalStorage == Long.MAX_VALUE;
+    }
+
+    @Override
+    public boolean isFastPlanningEnabled() {
+        return fastPlanningEnabled;
+    }
+
+    public void setFastPlanningEnabled(boolean fastPlanningEnabled) {
+        this.fastPlanningEnabled = fastPlanningEnabled;
     }
 
     @Override
