@@ -158,6 +158,7 @@ public final class FastCraftingPlanner {
         // Snapshot inventory the same way AE2 does: a child view that ignores the requested output
         // (existing output stock is never consumed; the full amount is always crafted).
         ChildCraftingSimulationState snapshot = new ChildCraftingSimulationState(networkInv);
+        ChildCraftingSimulationState reusableSeedSnapshot = new ChildCraftingSimulationState(networkInv);
         snapshot.ignore(output);
 
         CraftGraph.Builder<AEKey> builder = CraftGraph.builder();
@@ -165,7 +166,7 @@ public final class FastCraftingPlanner {
         Map<AEKey, DurabilityChain<AEKey>> durability = new HashMap<>();
         Map<AEKey, Set<IPatternDetails>> patternSources = new HashMap<>();
         Set<AEKey> emittable = new HashSet<>();
-        if (!buildGraph(craftingService, snapshot, level, output, builder, multiplePaths,
+        if (!buildGraph(craftingService, snapshot, reusableSeedSnapshot, level, output, builder, multiplePaths,
                 durability, patternSources, emittable, reservedStock)) {
             // Rare hard declines only: e.g. a key used both as a durability carrier (priced in uses)
             // and as a plain whole-item input — two unit systems on one pool. AE2's exact simulator
@@ -211,6 +212,7 @@ public final class FastCraftingPlanner {
     /** BFS the reachable recipe graph; returns false to decline the fast path. */
     private static boolean buildGraph(ICraftingService craftingService,
                                       ChildCraftingSimulationState snapshot,
+                                      ChildCraftingSimulationState reusableSeedSnapshot,
                                       Level level,
                                       AEKey root,
                                       CraftGraph.Builder<AEKey> builder,
@@ -229,6 +231,7 @@ public final class FastCraftingPlanner {
         // submission. Keep the largest snapshot per key so multiple patterns from the same host do
         // not duplicate one physical seed in the planning graph.
         Map<AEKey, Long> reusableSeedStock = new HashMap<>();
+        Map<AEKey, Long> selfSeedNetworkStock = new HashMap<>();
         // Unit-system bookkeeping. A durability chain prices its links in USES (carrier pool); every
         // other node is priced in whole ITEMS. The same physical stock must never be counted under
         // both systems (or under two incompatible chains), so we track:
@@ -317,6 +320,21 @@ public final class FastCraftingPlanner {
                         if (updated > previous) {
                             builder.stock(entry.getKey(), updated - previous);
                             reusableSeedStock.put(entry.getKey(), updated);
+                        }
+                    }
+                    // AE2 intentionally ignores pre-existing stock of the requested output. When a
+                    // contracted gain loop uses that same key as its catalyst, take a second,
+                    // non-ignored snapshot strictly for the seed. CraftPlannerV2 reserves it before
+                    // output demand and never lets this firing's increment bootstrap the catalyst.
+                    long selfSeedRequired = seeded.totalReusableSeedRequirements()
+                            .getOrDefault(key, 0L);
+                    if (selfSeedRequired > 0) {
+                        long available = Math.min(selfSeedRequired,
+                                usableStock(reusableSeedSnapshot, key, reservedStock));
+                        long previous = selfSeedNetworkStock.getOrDefault(key, 0L);
+                        if (available > previous) {
+                            builder.stock(key, available - previous);
+                            selfSeedNetworkStock.put(key, available);
                         }
                     }
                 }

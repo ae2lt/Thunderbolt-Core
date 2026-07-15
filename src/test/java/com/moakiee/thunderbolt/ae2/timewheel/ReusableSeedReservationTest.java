@@ -6,30 +6,10 @@ import org.junit.jupiter.api.Test;
 
 class ReusableSeedReservationTest {
     @Test
-    void dispatchedLoopSeedRemainsProtectedUntilItReturns() {
-        long credit = ReusableSeedReservation.afterDispatch(0, 1, 500, false);
-
-        assertEquals(500, credit);
-        assertEquals(0, ReusableSeedReservation.availableToOrdinaryTask(500, 1_000, credit));
-
-        credit = ReusableSeedReservation.afterReturn(credit, 1_000);
-        assertEquals(0, credit);
-        assertEquals(500, ReusableSeedReservation.availableToOrdinaryTask(1_500, 1_000, credit));
-    }
-
-    @Test
-    void loopTaskMayUseTheWholePoolWhileOrdinaryTaskOnlySeesSurplus() {
-        assertEquals(1_500,
-                ReusableSeedReservation.availableToOrdinaryTask(1_500, 0, 0));
-        assertEquals(500,
-                ReusableSeedReservation.availableToOrdinaryTask(1_500, 1_000, 0));
-    }
-
-    @Test
-    void sharedSingleSeedBatchCreditsOnlyThePhysicalSeedOnce() {
-        assertEquals(1,
-                ReusableSeedReservation.afterDispatch(0, 1, 1_000, true));
-        assertEquals(1_000,
-                ReusableSeedReservation.afterDispatch(0, 1, 1_000, false));
+    void dedicatedTaskSubtractsOnlyItsOwnPositivePoolFromTheAggregate() {
+        assertEquals(2, ReusableSeedReservation.reservedForTask(2, 1, false));
+        assertEquals(1, ReusableSeedReservation.reservedForTask(2, 1, true));
+        assertEquals(1, ReusableSeedReservation.reservedForTask(1, -1, true));
+        assertEquals(0, ReusableSeedReservation.reservedForTask(1, 1, true));
     }
 }

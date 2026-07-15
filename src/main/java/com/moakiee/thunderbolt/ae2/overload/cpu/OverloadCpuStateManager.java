@@ -97,11 +97,24 @@ public final class OverloadCpuStateManager {
                                                      List<GenericStack> actualOutputs,
                                                      @Nullable AEKey finalOutputKey,
                                                      long pushedCopies) {
+        registerExpectedOutputs(logic, craftingId, patternReference, patternDetails,
+                actualOutputs, finalOutputKey, pushedCopies, Map.of());
+    }
+
+    public synchronized void registerExpectedOutputs(Object logic,
+                                                     UUID craftingId,
+                                                     OverloadPatternReference patternReference,
+                                                     OverloadPatternDetails patternDetails,
+                                                     List<GenericStack> actualOutputs,
+                                                     @Nullable AEKey finalOutputKey,
+                                                     long pushedCopies,
+                                                     Map<Integer, OverloadReusableSeedMetadata> reusableSeeds) {
         Objects.requireNonNull(logic, "logic");
         Objects.requireNonNull(craftingId, "craftingId");
         Objects.requireNonNull(patternReference, "patternReference");
         Objects.requireNonNull(patternDetails, "patternDetails");
         Objects.requireNonNull(actualOutputs, "actualOutputs");
+        Objects.requireNonNull(reusableSeeds, "reusableSeeds");
         if (pushedCopies <= 0) {
             throw new IllegalArgumentException("pushedCopies must be > 0");
         }
@@ -111,7 +124,8 @@ public final class OverloadCpuStateManager {
                 patternDetails,
                 actualOutputs,
                 finalOutputKey,
-                pushedCopies);
+                pushedCopies,
+                reusableSeeds);
     }
 
     /**
@@ -214,6 +228,13 @@ public final class OverloadCpuStateManager {
         Objects.requireNonNull(itemId, "itemId");
         var state = states.get(logic);
         return state != null ? state.getRemainingForItem(itemId) : 0;
+    }
+
+    public synchronized boolean hasExactPending(Object logic, AEKey incoming) {
+        Objects.requireNonNull(logic, "logic");
+        Objects.requireNonNull(incoming, "incoming");
+        var state = states.get(logic);
+        return state != null && state.hasExactPending(incoming);
     }
 
     public synchronized List<PendingOverloadOutput> snapshotPending(CraftingCpuLogic logic) {

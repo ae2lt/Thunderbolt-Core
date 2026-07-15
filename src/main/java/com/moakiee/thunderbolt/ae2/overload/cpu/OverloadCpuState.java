@@ -46,6 +46,9 @@ public final class OverloadCpuState {
     private static final String TAG_REMAINING = "RemainingAmount";
     private static final String TAG_ROUTES_TO_REQUESTER = "RoutesToRequester";
     private static final String TAG_REGISTERED_ORDER = "RegisteredOrder";
+    private static final String TAG_REUSABLE_SEED_GROUP = "ReusableSeedGroup";
+    private static final String TAG_SHARED_REUSABLE_SEED_POOL = "SharedReusableSeedPool";
+    private static final String TAG_REMAINING_REUSABLE_SEED = "RemainingReusableSeed";
 
     private final OverloadCpuOwner owner;
     private final Map<PendingOverloadOutputKey, PendingOverloadOutput> pendingByKey = new LinkedHashMap<>();
@@ -73,6 +76,16 @@ public final class OverloadCpuState {
                                         List<GenericStack> actualOutputs,
                                         @Nullable AEKey finalOutputKey,
                                         long pushedCopies) {
+        registerExpectedOutputs(patternReference, patternDetails, actualOutputs, finalOutputKey,
+                pushedCopies, Map.of());
+    }
+
+    public void registerExpectedOutputs(OverloadPatternReference patternReference,
+                                        OverloadPatternDetails patternDetails,
+                                        List<GenericStack> actualOutputs,
+                                        @Nullable AEKey finalOutputKey,
+                                        long pushedCopies,
+                                        Map<Integer, OverloadReusableSeedMetadata> reusableSeeds) {
         Objects.requireNonNull(patternReference, "patternReference");
         Objects.requireNonNull(patternDetails, "patternDetails");
         Objects.requireNonNull(actualOutputs, "actualOutputs");
@@ -96,27 +109,56 @@ public final class OverloadCpuState {
 
             var itemId = itemIdOf(output);
             var exactExpectedKey = actual.what();
-            var amount = output.amountPerCraft() * pushedCopies;
-            var key = new PendingOverloadOutputKey(owner.craftingId(), patternReference.patternIdentity(),
-                    output.slotIndex());
-            var existing = pendingByKey.get(key);
-            if (existing != null) {
-                existing.addExpected(amount);
-                continue;
-            }
-
-            var pending = new PendingOverloadOutput(
-                    key,
-                    owner,
+            var amount = multiplySaturated(output.amountPerCraft(), pushedCopies);
+            var reusableSeed = reusableSeeds.get(output.slotIndex());
+            registerExpectedOutput(
                     patternReference,
+                    output.slotIndex(),
                     itemId,
                     exactExpectedKey,
                     amount,
                     routesToRequester(output, finalOutputKey),
-                    nextSequence++);
-            pendingByKey.put(key, pending);
-            pendingByItemId.computeIfAbsent(itemId, ignored -> new LinkedHashSet<>()).add(key);
+                    reusableSeed);
         }
+    }
+
+    /** Low-level registration after slot matching has already been resolved. */
+    void registerExpectedOutput(
+            OverloadPatternReference patternReference,
+            int outputSlotIndex,
+            ResourceLocation itemId,
+            AEKey exactExpectedKey,
+            long amount,
+            boolean routesToRequester,
+            @Nullable OverloadReusableSeedMetadata reusableSeed) {
+        Objects.requireNonNull(patternReference, "patternReference");
+        Objects.requireNonNull(itemId, "itemId");
+        Objects.requireNonNull(exactExpectedKey, "exactExpectedKey");
+        if (outputSlotIndex < 0) throw new IllegalArgumentException("outputSlotIndex must be >= 0");
+        if (amount <= 0) throw new IllegalArgumentException("amount must be > 0");
+
+        var key = new PendingOverloadOutputKey(
+                owner.craftingId(), patternReference.patternIdentity(), outputSlotIndex);
+        var existing = pendingByKey.get(key);
+        if (existing != null) {
+            existing.addExpected(amount, reusableSeed);
+            return;
+        }
+
+        var pending = new PendingOverloadOutput(
+                key,
+                owner,
+                patternReference,
+                itemId,
+                exactExpectedKey,
+                amount,
+                routesToRequester,
+                nextSequence++,
+                reusableSeed != null ? reusableSeed.groupId() : null,
+                reusableSeed != null && reusableSeed.sharedPool(),
+                reusableSeed != null ? reusableSeed.amount() : 0L);
+        pendingByKey.put(key, pending);
+        pendingByItemId.computeIfAbsent(itemId, ignored -> new LinkedHashSet<>()).add(key);
     }
 
     public OverloadClaimResult claimByItemId(ResourceLocation itemId, long amount, boolean mutate) {
@@ -149,6 +191,7 @@ public final class OverloadCpuState {
                 continue;
             }
 
+            long reusableSeedAmount = pending.claimReusableSeed(claimable, mutate);
             if (mutate) {
                 pending.claim(claimable);
                 if (pending.isSatisfied()) {
@@ -160,7 +203,10 @@ public final class OverloadCpuState {
                     pending.key(),
                     claimable,
                     pending.routesToRequester(),
-                    pending.exactExpectedKey()));
+                    pending.exactExpectedKey(),
+                    reusableSeedAmount,
+                    pending.reusableSeedGroupId(),
+                    pending.sharedReusableSeedPool()));
             remaining -= claimable;
         }
 
@@ -179,10 +225,21 @@ public final class OverloadCpuState {
         for (var key : keys) {
             var pending = pendingByKey.get(key);
             if (pending != null) {
-                total += pending.remainingAmount();
+                total = addSaturated(total, pending.remainingAmount());
             }
         }
         return total;
+    }
+
+    public boolean hasExactPending(AEKey incoming) {
+        if (incoming == null) return false;
+        for (var pending : pendingByKey.values()) {
+            if (pending.remainingAmount() > 0
+                    && pending.exactExpectedKey().equals(incoming)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     public void clear() {
@@ -206,6 +263,13 @@ public final class OverloadCpuState {
             pendingTag.putLong(TAG_REMAINING, pending.remainingAmount());
             pendingTag.putBoolean(TAG_ROUTES_TO_REQUESTER, pending.routesToRequester());
             pendingTag.putLong(TAG_REGISTERED_ORDER, pending.registeredOrder());
+            if (pending.reusableSeedGroupId() != null) {
+                pendingTag.putUUID(TAG_REUSABLE_SEED_GROUP, pending.reusableSeedGroupId());
+                pendingTag.putBoolean(
+                        TAG_SHARED_REUSABLE_SEED_POOL, pending.sharedReusableSeedPool());
+                pendingTag.putLong(
+                        TAG_REMAINING_REUSABLE_SEED, pending.remainingReusableSeedAmount());
+            }
             pendingList.add(pendingTag);
         }
         tag.put(TAG_PENDING, pendingList);
@@ -239,7 +303,11 @@ public final class OverloadCpuState {
                     loadExactExpectedKey(pendingTag, registries),
                     pendingTag.getLong(TAG_REMAINING),
                     pendingTag.getBoolean(TAG_ROUTES_TO_REQUESTER),
-                    pendingTag.getLong(TAG_REGISTERED_ORDER));
+                    pendingTag.getLong(TAG_REGISTERED_ORDER),
+                    pendingTag.hasUUID(TAG_REUSABLE_SEED_GROUP)
+                            ? pendingTag.getUUID(TAG_REUSABLE_SEED_GROUP) : null,
+                    pendingTag.getBoolean(TAG_SHARED_REUSABLE_SEED_POOL),
+                    pendingTag.getLong(TAG_REMAINING_REUSABLE_SEED));
             state.pendingByKey.put(key, pending);
             state.pendingByItemId.computeIfAbsent(pending.itemId(), ignored -> new LinkedHashSet<>()).add(key);
             state.nextSequence = Math.max(state.nextSequence, pending.registeredOrder() + 1);
@@ -293,5 +361,14 @@ public final class OverloadCpuState {
                 output.matchMode(),
                 outputKey.equals(finalOutputKey),
                 outputKey.dropSecondary().equals(finalOutputKey.dropSecondary()));
+    }
+
+    private static long multiplySaturated(long left, long right) {
+        if (left <= 0 || right <= 0) return 0L;
+        return left > Long.MAX_VALUE / right ? Long.MAX_VALUE : left * right;
+    }
+
+    private static long addSaturated(long left, long right) {
+        return left > Long.MAX_VALUE - right ? Long.MAX_VALUE : left + right;
     }
 }

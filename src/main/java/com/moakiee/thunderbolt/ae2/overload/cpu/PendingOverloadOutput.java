@@ -1,6 +1,8 @@
 package com.moakiee.thunderbolt.ae2.overload.cpu;
 
 import java.util.Objects;
+import java.util.UUID;
+import org.jetbrains.annotations.Nullable;
 
 import net.minecraft.resources.ResourceLocation;
 
@@ -20,7 +22,11 @@ public final class PendingOverloadOutput {
     private final AEKey exactExpectedKey;
     private final boolean routesToRequester;
     private final long registeredOrder;
+    @Nullable
+    private UUID reusableSeedGroupId;
+    private boolean sharedReusableSeedPool;
     private long remainingAmount;
+    private long remainingReusableSeedAmount;
 
     public PendingOverloadOutput(
             PendingOverloadOutputKey key,
@@ -31,6 +37,23 @@ public final class PendingOverloadOutput {
             long remainingAmount,
             boolean routesToRequester,
             long registeredOrder
+    ) {
+        this(key, owner, patternReference, itemId, exactExpectedKey, remainingAmount,
+                routesToRequester, registeredOrder, null, false, 0L);
+    }
+
+    public PendingOverloadOutput(
+            PendingOverloadOutputKey key,
+            OverloadCpuOwner owner,
+            OverloadPatternReference patternReference,
+            ResourceLocation itemId,
+            AEKey exactExpectedKey,
+            long remainingAmount,
+            boolean routesToRequester,
+            long registeredOrder,
+            @Nullable UUID reusableSeedGroupId,
+            boolean sharedReusableSeedPool,
+            long remainingReusableSeedAmount
     ) {
         this.key = Objects.requireNonNull(key, "key");
         this.owner = Objects.requireNonNull(owner, "owner");
@@ -43,6 +66,17 @@ public final class PendingOverloadOutput {
         this.remainingAmount = remainingAmount;
         this.routesToRequester = routesToRequester;
         this.registeredOrder = registeredOrder;
+        if (remainingReusableSeedAmount < 0 || remainingReusableSeedAmount > remainingAmount) {
+            throw new IllegalArgumentException("reusable seed amount is outside pending output");
+        }
+        if (remainingReusableSeedAmount > 0) {
+            this.reusableSeedGroupId = Objects.requireNonNull(
+                    reusableSeedGroupId, "reusableSeedGroupId");
+        } else {
+            this.reusableSeedGroupId = reusableSeedGroupId;
+        }
+        this.sharedReusableSeedPool = sharedReusableSeedPool;
+        this.remainingReusableSeedAmount = remainingReusableSeedAmount;
     }
 
     public PendingOverloadOutputKey key() {
@@ -81,11 +115,33 @@ public final class PendingOverloadOutput {
         return registeredOrder;
     }
 
+    public long remainingReusableSeedAmount() { return remainingReusableSeedAmount; }
+    public @Nullable UUID reusableSeedGroupId() { return reusableSeedGroupId; }
+    public boolean sharedReusableSeedPool() { return sharedReusableSeedPool; }
+
     public void addExpected(long amount) {
+        addExpected(amount, null);
+    }
+
+    public void addExpected(long amount, @Nullable OverloadReusableSeedMetadata reusableSeed) {
         if (amount <= 0) {
             throw new IllegalArgumentException("amount must be > 0");
         }
-        remainingAmount += amount;
+        if (reusableSeed != null) {
+            if (reusableSeed.amount() > amount) {
+                throw new IllegalArgumentException("reusable seed exceeds added output");
+            }
+            if (reusableSeedGroupId == null) {
+                reusableSeedGroupId = reusableSeed.groupId();
+                sharedReusableSeedPool = reusableSeed.sharedPool();
+            } else if (!reusableSeedGroupId.equals(reusableSeed.groupId())
+                    || sharedReusableSeedPool != reusableSeed.sharedPool()) {
+                throw new IllegalArgumentException("overload seed output changed ledger owner");
+            }
+            remainingReusableSeedAmount = addSaturated(
+                    remainingReusableSeedAmount, reusableSeed.amount());
+        }
+        remainingAmount = addSaturated(remainingAmount, amount);
     }
 
     public long claim(long requestedAmount) {
@@ -98,7 +154,17 @@ public final class PendingOverloadOutput {
         return claimed;
     }
 
+    public long claimReusableSeed(long claimedOutput, boolean mutate) {
+        long claimed = Math.min(Math.max(0L, claimedOutput), remainingReusableSeedAmount);
+        if (mutate) remainingReusableSeedAmount -= claimed;
+        return claimed;
+    }
+
     public boolean isSatisfied() {
         return remainingAmount <= 0;
+    }
+
+    private static long addSaturated(long left, long right) {
+        return left > Long.MAX_VALUE - right ? Long.MAX_VALUE : left + right;
     }
 }

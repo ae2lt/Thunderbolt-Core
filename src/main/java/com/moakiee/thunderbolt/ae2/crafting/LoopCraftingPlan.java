@@ -4,6 +4,8 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
+import java.util.UUID;
 
 import appeng.api.crafting.IPatternDetails;
 import appeng.api.networking.crafting.ICraftingPlan;
@@ -84,12 +86,67 @@ public record LoopCraftingPlan(
         return true;
     }
 
+    /** Reusable-seed requirements kept separate by contracted cycle. */
+    public Map<UUID, Map<AEKey, Long>> reusableSeedGroups() {
+        var groups = new LinkedHashMap<UUID, Map<AEKey, Long>>();
+        for (var details : delegate.patternTimes().keySet()) {
+            if (!(details instanceof ReusableSeedPattern seeded)) continue;
+            groups.merge(
+                    seeded.reusableSeedGroupId(),
+                    positiveCopy(seeded.totalReusableSeedRequirements()),
+                    LoopCraftingPlan::mergePositiveCopies);
+        }
+        return Map.copyOf(groups);
+    }
+
+    /** Strongly-connected state keys kept separate for each contracted cycle. */
+    public Map<UUID, Set<AEKey>> reusableSeedCycleKeys() {
+        var groups = new LinkedHashMap<UUID, Set<AEKey>>();
+        for (var details : delegate.patternTimes().keySet()) {
+            if (!(details instanceof ReusableSeedPattern seeded)) continue;
+            groups.merge(
+                    seeded.reusableSeedGroupId(),
+                    Set.copyOf(seeded.reusableSeedCycleKeys()),
+                    (left, right) -> {
+                        var merged = new java.util.LinkedHashSet<AEKey>(left);
+                        merged.addAll(right);
+                        return Set.copyOf(merged);
+                    });
+        }
+        return Map.copyOf(groups);
+    }
+
+    /** Groups that must not borrow the protected phase state of another loop macro. */
+    public Set<UUID> dedicatedReusableSeedGroups() {
+        var groups = new java.util.LinkedHashSet<UUID>();
+        for (var details : delegate.patternTimes().keySet()) {
+            if (details instanceof ReusableSeedPattern seeded
+                    && !seeded.hasSingleSeedInputPerMember()) {
+                groups.add(seeded.reusableSeedGroupId());
+            }
+        }
+        return Set.copyOf(groups);
+    }
+
     private static void mergePositiveSum(Map<AEKey, Long> target, Map<AEKey, Long> source) {
         for (var entry : source.entrySet()) {
             if (entry.getKey() != null && positive(entry.getValue()) > 0) {
                 target.merge(entry.getKey(), entry.getValue(), LoopCraftingPlan::saturatingAdd);
             }
         }
+    }
+
+    private static Map<AEKey, Long> positiveCopy(Map<AEKey, Long> source) {
+        var result = new LinkedHashMap<AEKey, Long>();
+        mergePositiveSum(result, source);
+        return Map.copyOf(result);
+    }
+
+    private static Map<AEKey, Long> mergePositiveCopies(
+            Map<AEKey, Long> left, Map<AEKey, Long> right) {
+        var result = new LinkedHashMap<AEKey, Long>(left);
+        mergePositiveSum(result, right);
+        return Map.copyOf(result);
     }
 
     private static long positive(Long value) {

@@ -67,8 +67,11 @@ import com.moakiee.thunderbolt.ae2.mixin.ElapsedTimeTrackerAccessor;
 import com.moakiee.thunderbolt.ae2.overload.cpu.OverloadClaimResult;
 import com.moakiee.thunderbolt.ae2.overload.cpu.OverloadCpuStateManager;
 import com.moakiee.thunderbolt.ae2.overload.cpu.OverloadPatternReference;
+import com.moakiee.thunderbolt.ae2.overload.cpu.OverloadReusableSeedMetadata;
+import com.moakiee.thunderbolt.ae2.overload.model.MatchMode;
 import com.moakiee.thunderbolt.ae2.overload.pattern.OverloadedProviderOnlyPatternDetails;
 import com.moakiee.thunderbolt.ae2.crafting.PatternFiringExpander;
+import com.moakiee.thunderbolt.ae2.crafting.ExecuteLoopPattern;
 import com.moakiee.thunderbolt.ae2.crafting.LoopCraftingPlan;
 
 public final class Ae2LtTimeWheelCraftingCpuLogic {
@@ -81,7 +84,7 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
     private static final String TAG_JOB = "job";
     private static final String TAG_OVERLOAD_STATE = "ae2ltOverloadState";
     private static final String TAG_SEED_RETURN_QUOTA = "reusableSeedReturnQuota";
-    private static final String TAG_SEED_IN_FLIGHT = "reusableSeedInFlight";
+    private static final String TAG_SEED_RETURN_QUOTA_FINALIZED = "reusableSeedReturnQuotaFinalized";
 
     private static final String NBT_LINK = "link";
     private static final String NBT_PLAYER_ID = "playerId";
@@ -93,6 +96,8 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
     private static final String NBT_SUSPENDED = "suspended";
     private static final String NBT_SOFT_CANCELLING = "softCancelling";
     private static final String NBT_CRAFTING_PROGRESS = "#craftingProgress";
+    private static final String NBT_INPUT_SEED = "#inputSeed";
+    private static final String NBT_OUTPUT_SEED = "#outputSeed";
 
     private final TimeWheelCraftingCPU cpu;
     private final ListCraftingInventory inventory = new ListCraftingInventory(this::postChange);
@@ -117,7 +122,7 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
     // cleared on every job lifecycle transition below.
     private final Map<IPatternDetails, Double> patternPowerCache = new IdentityHashMap<>();
     private final KeyCounter seedReturnQuota = new KeyCounter();
-    private final KeyCounter seedInFlightCredit = new KeyCounter();
+    private final LoopSeedLedgerBook loopSeedLedgers = new LoopSeedLedgerBook();
 
     @Nullable
     private TimeWheelJob job;
@@ -133,6 +138,7 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
     private boolean queueRebuildNeeded = true;
     private boolean cantStoreItems;
     private boolean batchingStatusChanges;
+    private boolean seedReturnQuotaFinalized;
 
     public Ae2LtTimeWheelCraftingCpuLogic(TimeWheelCraftingCPU cpu) {
         this.cpu = cpu;
@@ -195,7 +201,10 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
         for (var entry : seedRequirements) {
             seedReturnQuota.add(entry.getKey(), entry.getLongValue());
         }
-        seedInFlightCredit.clear();
+        seedReturnQuotaFinalized = false;
+        loopSeedLedgers.initialize(
+                loopPlan != null ? loopPlan.reusableSeedGroups() : Map.of(),
+                loopPlan != null ? loopPlan.dedicatedReusableSeedGroups() : Set.of());
         patternPowerCache.clear();
         markWaitingKeysChanged();
         cpu.updateOutput(plan.finalOutput());
@@ -342,6 +351,19 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
         if (activeJob == null) {
             return BatchExecutor.BatchRunResult.EMPTY;
         }
+        // Overload outputs must be registered per dispatched pattern so returned variants can be
+        // split between the requester and the CPU seed pool. BatchExecutor bypasses that
+        // registration path, therefore overload patterns intentionally stay on pushOnePattern.
+        if (CraftingPatternDelegates.forProviderLookup(details)
+                instanceof OverloadedProviderOnlyPatternDetails) {
+            nonBatchTasksThisTick.add(details);
+            return BatchExecutor.BatchRunResult.EMPTY;
+        }
+        if (details instanceof ExecuteLoopPattern loop
+                && loop.requiresActualSeedKeyTracking()) {
+            nonBatchTasksThisTick.add(details);
+            return BatchExecutor.BatchRunResult.EMPTY;
+        }
         if (nonBatchTasksThisTick.contains(details)) {
             return BatchExecutor.BatchRunResult.EMPTY;
         }
@@ -361,8 +383,11 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
                 },
                 reservedSeedStock(details));
         if (result.dispatchedCopies() > 0) {
-            recordSeedDispatch(details, result.dispatchedCopies(),
-                    details instanceof com.moakiee.thunderbolt.ae2.batch.SharedBatchInputPattern);
+            boolean sharedSeedBatch = (details instanceof ExecuteLoopPattern loop
+                            ? loop.delegate() : details)
+                    instanceof com.moakiee.thunderbolt.ae2.batch.SharedBatchInputPattern;
+            recordLoopPatternDispatch(
+                    details, result.dispatchedCopies(), sharedSeedBatch);
         }
         if (!result.shouldRetryBatchThisTick()) {
             nonBatchTasksThisTick.add(details);
@@ -395,6 +420,9 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
         }
 
         boolean pushed = false;
+        var actualLoopSeedInput = details instanceof ExecuteLoopPattern loop
+                && loop.requiresActualSeedKeyTracking()
+                ? loop.actualInputSeed(craftingContainer) : null;
         try {
             var patternPower = patternPowerFor(details, craftingContainer);
             for (var resolvedProvider : providersForSinglePush(craftingService, details)) {
@@ -416,7 +444,7 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
                 craftingContainer = null;
                 energyService.extractAEPower(patternPower, Actionable.MODULATE, PowerMultiplier.CONFIG);
                 recordPushedPattern(activeJob, details, expectedOutputs, expectedContainerItems, 1L);
-                recordSeedDispatch(details, 1L, false);
+                recordLoopPatternDispatch(details, 1L, false, actualLoopSeedInput);
 
                 consumeTaskCopies(activeJob, details, 1L);
                 return DispatchOutcome.PUSHED;
@@ -449,11 +477,16 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
                                      int maxCopies,
                                      CraftingService craftingService,
                                      IEnergyService energyService) {
-        if (details instanceof OverloadedProviderOnlyPatternDetails) {
+        if (CraftingPatternDelegates.forProviderLookup(details)
+                instanceof OverloadedProviderOnlyPatternDetails) {
             return null;
         }
         if (task.value <= 0 || maxCopies <= 0) {
             return new BulkPush(0, 1);
+        }
+        if (details instanceof ExecuteLoopPattern loop
+                && loop.requiresActualSeedKeyTracking()) {
+            return null;
         }
         // Skip the (SIMULATE + MODULATE) extraction entirely if nothing can accept a push right
         // now. Busy providers typically free up within a tick, so retry on the next one (same
@@ -525,7 +558,7 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
         if (dispatched > 0) {
             var jobView = scratchBatchJobView.bind(activeJob, details);
             ParallelBatchCpuHelper.registerExpectedOutputs(jobView, details, result, dispatched);
-            recordSeedDispatch(details, dispatched, false);
+            recordLoopPatternDispatch(details, dispatched, false);
             consumeTaskCopies(activeJob, details, dispatched);
             cpu.markDirty();
             // Energy-capped visits back off on the energy cadence; otherwise re-poll immediately
@@ -559,52 +592,88 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
             return 0;
         }
 
-        long strictMatched = activeJob.waitingFor.extract(what, amount, Actionable.SIMULATE);
-        long acceptedStrict = Math.min(amount, strictMatched);
         long returned = 0;
-        if (acceptedStrict > 0) {
-            long accepted = acceptStrictWaitingItem(activeJob, what, acceptedStrict, type);
-            returned += accepted;
-            if (type == Actionable.MODULATE && accepted > 0) {
-                releaseSeedCredit(what, accepted);
+        long remaining = amount;
+        long simulatedExactOverload = 0L;
+        if (OverloadCpuStateManager.INSTANCE.hasExactPending(this, what)) {
+            var overload = acceptOverloadWaitingItem(activeJob, what, remaining, type);
+            returned += overload.accepted();
+            remaining -= overload.claimed();
+            if (type == Actionable.SIMULATE) simulatedExactOverload = overload.claimed();
+            if (job != activeJob || remaining <= 0) {
+                if (type == Actionable.MODULATE && job == activeJob) {
+                    finishSuccessfulIfReady(activeJob);
+                }
+                return returned;
             }
         }
 
-        long overloadRemainder = Math.max(0L, amount - strictMatched);
-        if (overloadRemainder <= 0 || !OverloadCpuStateManager.INSTANCE.hasAnyPending(this)) {
+        // In SIMULATE the overload claim above cannot mutate AE2's exact waitingFor entry. Probe
+        // against the original offer, then remove the already-simulated overload prefix. Probing
+        // only `remaining` before subtracting would under-count ordinary strict demand and could
+        // claim the same overload entry again below.
+        long strictProbeAmount = OverloadInsertAccounting.strictProbeAmount(
+                remaining, simulatedExactOverload);
+        long strictMatched = activeJob.waitingFor.extract(
+                what, strictProbeAmount, Actionable.SIMULATE);
+        strictMatched = OverloadInsertAccounting.strictMatchAfterExactOverload(
+                remaining, strictMatched, simulatedExactOverload);
+        long acceptedStrict = Math.min(remaining, strictMatched);
+        if (acceptedStrict > 0) {
+            long accepted = acceptStrictWaitingItem(
+                    activeJob, what, acceptedStrict, type);
+            returned += accepted;
+        }
+        remaining -= strictMatched;
+
+        if (remaining <= 0
+                || !OverloadInsertAccounting.mayClaimOverloadRemainder(simulatedExactOverload)
+                || !OverloadCpuStateManager.INSTANCE.hasAnyPending(this)) {
             if (type == Actionable.MODULATE) finishSuccessfulIfReady(activeJob);
             return returned;
         }
 
-        var claims = OverloadCpuStateManager.INSTANCE.claim(this, what, overloadRemainder, type);
+        var overload = acceptOverloadWaitingItem(activeJob, what, remaining, type);
+        returned += overload.accepted();
+        if (type == Actionable.MODULATE && job == activeJob) finishSuccessfulIfReady(activeJob);
+        return returned;
+    }
+
+    private OverloadInsert acceptOverloadWaitingItem(
+            TimeWheelJob activeJob, AEKey what, long amount, Actionable type) {
+        if (amount <= 0) return OverloadInsert.EMPTY;
+        var claims = OverloadCpuStateManager.INSTANCE.claim(this, what, amount, type);
         if (!claims.claimedAnything()) {
-            if (type == Actionable.MODULATE) finishSuccessfulIfReady(activeJob);
-            return returned;
+            return OverloadInsert.EMPTY;
         }
 
+        long accepted = 0L;
         if (type == Actionable.MODULATE) {
             deductClaimedWaitingFor(activeJob, claims);
-            releaseSeedCredit(what, claims.claimedAmount());
+            rekeyOverloadReusableSeeds(what, claims);
             if (activeJob.softCancelling) {
                 long claimed = claims.claimedAmount();
                 decrementItems(activeJob.timeTracker, claimed, what.getType());
                 inventory.insert(what, claimed, Actionable.MODULATE);
-                returned += claimed;
+                accepted += claimed;
                 if (activeJob.waitingKeys.isEmpty()
                         && !OverloadCpuStateManager.INSTANCE.hasAnyPending(this)) {
                     finishSoftCancelIfReady(activeJob);
                 }
             } else {
-                returned += applyInventoryClaims(activeJob, what, claims);
-                returned += applyRequesterClaims(activeJob, what, claims);
-                finishSuccessfulIfReady(activeJob);
+                accepted += applyInventoryClaims(activeJob, what, claims);
+                accepted += applyRequesterClaims(activeJob, what, claims);
             }
             cpu.markDirty();
         } else {
-            returned += claims.claimedAmount();
+            accepted += claims.claimedAmount();
         }
 
-        return returned;
+        return new OverloadInsert(claims.claimedAmount(), accepted);
+    }
+
+    private record OverloadInsert(long claimed, long accepted) {
+        private static final OverloadInsert EMPTY = new OverloadInsert(0L, 0L);
     }
 
     private long acceptStrictWaitingItem(TimeWheelJob activeJob, AEKey what, long amount, Actionable type) {
@@ -638,7 +707,8 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
 
     private long acceptFinalOutputWithReusableSeed(
             TimeWheelJob activeJob, AEKey what, long amount, Actionable type) {
-        long seedQuota = seedReturnQuota.get(what);
+        long seedQuota = Math.max(
+                seedReturnQuota.get(what), loopSeedLedgers.totalReserved(what));
         if (seedQuota <= 0) {
             long inserted = activeJob.link.insert(what, amount, type);
             if (type == Actionable.MODULATE && inserted > 0) {
@@ -704,7 +774,12 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
 
     private void finishSuccessfulIfReady(TimeWheelJob activeJob) {
         if (job != activeJob || activeJob.softCancelling) return;
-        if (activeJob.remainingAmount > 0 || !returnReusableSeedsToHost()) return;
+        if (activeJob.remainingAmount > 0
+                || !activeJob.tasks.isEmpty()
+                || !activeJob.waitingKeys.isEmpty()
+                || OverloadCpuStateManager.INSTANCE.hasAnyPending(this)) return;
+        finalizeSeedReturnQuota();
+        if (!returnReusableSeedsToHost()) return;
         finishJob(true);
         cpu.updateOutput(null);
     }
@@ -713,6 +788,7 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
         if (job != activeJob || !activeJob.softCancelling
                 || !activeJob.waitingKeys.isEmpty()
                 || OverloadCpuStateManager.INSTANCE.hasAnyPending(this)) return;
+        finalizeSeedReturnQuota();
         if (!returnReusableSeedsToHost()) return;
         finishJob(false);
         cpu.updateOutput(null);
@@ -755,6 +831,16 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
         return seedReturnQuota.isEmpty();
     }
 
+    private void finalizeSeedReturnQuota() {
+        if (seedReturnQuotaFinalized) return;
+        seedReturnQuota.clear();
+        for (var entry : loopSeedLedgers.positiveSnapshot().entrySet()) {
+            seedReturnQuota.add(entry.getKey(), entry.getValue());
+        }
+        seedReturnQuotaFinalized = true;
+        cpu.markDirty();
+    }
+
     private void discardHeldReusableSeeds() {
         for (var seed : seedReturnQuota) {
             inventory.extract(seed.getKey(), seed.getLongValue(), Actionable.MODULATE);
@@ -785,6 +871,8 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
                 success ? CraftingJobStatusPacket.Status.FINISHED : CraftingJobStatusPacket.Status.CANCELLED);
 
         this.job = null;
+        seedReturnQuotaFinalized = false;
+        clearLoopSeedState();
         patternPowerCache.clear();
         clearTaskWheel();
         storeItems();
@@ -800,7 +888,8 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
         }
         discardHeldReusableSeeds();
         seedReturnQuota.clear();
-        seedInFlightCredit.clear();
+        seedReturnQuotaFinalized = false;
+        clearLoopSeedState();
         cpu.updateOutput(null);
         finishJob(false);
     }
@@ -832,14 +921,16 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
             // return/drop only content that is still physically in the CPU.
             discardHeldReusableSeeds();
             seedReturnQuota.clear();
-            seedInFlightCredit.clear();
+            seedReturnQuotaFinalized = false;
+            clearLoopSeedState();
             finishJob(false);
         }
         this.pendingJobTag = null;
         this.pendingOverloadTag = null;
         OverloadCpuStateManager.INSTANCE.clear(this);
         seedReturnQuota.clear();
-        seedInFlightCredit.clear();
+        seedReturnQuotaFinalized = false;
+        clearLoopSeedState();
         clearTaskWheel();
         cpu.updateOutput(null);
         cantStoreItems = false;
@@ -888,7 +979,7 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
         this.inventory.list.removeZeros();
         if (this.inventory.list.isEmpty()) {
             seedReturnQuota.clear();
-            seedInFlightCredit.clear();
+            clearLoopSeedState();
         }
         cpu.markDirty();
     }
@@ -903,52 +994,89 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
         return result;
     }
 
-    /**
-     * Stock hidden from non-loop extraction. Seed-preserving loop members bypass this reservation,
-     * while every other task sees only the amount above the minimum reserve not already in flight.
-     */
+    /** Positive ledger entries are hidden unless this loop task declares the key as inputSeed. */
     private Map<AEKey, Long> reservedSeedStock(IPatternDetails details) {
-        if (details instanceof ISeedPreservingCraftingTask || seedReturnQuota.isEmpty()) {
-            return Map.of();
+        if (!loopSeedLedgers.hasReservations()) return Map.of();
+        LoopSeedLedgerBook.PoolId ownPool = null;
+        java.util.function.Predicate<AEKey> allowedSeedInput = ignored -> false;
+        if (details instanceof ExecuteLoopPattern loopPattern) {
+            ownPool = LoopSeedLedgerBook.poolFor(
+                    loopPattern.reusableSeedGroupId(),
+                    loopPattern.hasSingleSeedInputPerMember());
+            allowedSeedInput = loopPattern::isInputSeedKey;
         }
-        var result = new HashMap<AEKey, Long>();
-        for (var seed : seedReturnQuota) {
-            long reserve = ReusableSeedReservation.reservedInInventory(
-                    seed.getLongValue(), seedInFlightCredit.get(seed.getKey()));
-            if (reserve > 0) result.put(seed.getKey(), reserve);
-        }
-        return result.isEmpty() ? Map.of() : Map.copyOf(result);
+        return loopSeedLedgers.reservationView(ownPool, allowedSeedInput);
     }
 
     private appeng.crafting.inv.ICraftingInventory reservedCraftingInventory(
             IPatternDetails details) {
-        var reserved = reservedSeedStock(details);
-        return reserved.isEmpty() ? inventory : new ReservedCraftingInventory(inventory, reserved);
+        return !loopSeedLedgers.hasReservations()
+                ? inventory
+                : new ReservedCraftingInventory(inventory, reservedSeedStock(details));
     }
 
-    private void recordSeedDispatch(IPatternDetails details, long copies, boolean sharedBatch) {
-        if (!(details instanceof ISeedPreservingCraftingTask preserving) || copies <= 0) return;
-        boolean changed = false;
-        for (var entry : preserving.seedCreditPerCopy().entrySet()) {
-            if (entry.getKey() == null || entry.getValue() == null || entry.getValue() <= 0) continue;
-            long current = seedInFlightCredit.get(entry.getKey());
-            long updated = ReusableSeedReservation.afterDispatch(
-                    current, entry.getValue(), copies, sharedBatch);
-            if (updated <= current) continue;
-            if (current > 0) seedInFlightCredit.remove(entry.getKey(), current);
-            seedInFlightCredit.add(entry.getKey(), updated);
-            changed = true;
+    private void recordLoopPatternDispatch(
+            IPatternDetails details,
+            long copies,
+            boolean sharedBatch) {
+        recordLoopPatternDispatch(details, copies, sharedBatch, null);
+    }
+
+    private void recordLoopPatternDispatch(
+            IPatternDetails details,
+            long copies,
+            boolean sharedBatch,
+            @Nullable KeyCounter actualInputSeed) {
+        if (!(details instanceof ExecuteLoopPattern loopPattern)
+                || copies <= 0) {
+            return;
         }
-        if (changed) cpu.markDirty();
+        long scale = sharedBatch ? 1L : copies;
+        var pool = LoopSeedLedgerBook.poolFor(
+                loopPattern.reusableSeedGroupId(),
+                loopPattern.hasSingleSeedInputPerMember());
+        if (actualInputSeed != null) {
+            loopSeedLedgers.recordDispatch(
+                    pool, actualInputSeed, 1L, loopPattern.outputSeed(), scale);
+        } else {
+            loopSeedLedgers.recordDispatch(
+                    pool, loopPattern.inputSeed(), loopPattern.outputSeed(), scale);
+        }
+        cpu.markDirty();
     }
 
-    private void releaseSeedCredit(AEKey returned, long amount) {
-        if (returned == null || amount <= 0) return;
-        long current = seedInFlightCredit.get(returned);
-        long updated = ReusableSeedReservation.afterReturn(current, amount);
-        if (updated == current) return;
-        seedInFlightCredit.remove(returned, current - updated);
-        cpu.markDirty();
+    private void clearLoopSeedState() {
+        loopSeedLedgers.clear();
+    }
+
+    private void readLoopSeedState(CompoundTag data, HolderLookup.Provider registries) {
+        loopSeedLedgers.readFromNBT(data, registries);
+    }
+
+    private void writeLoopSeedState(CompoundTag data, HolderLookup.Provider registries) {
+        loopSeedLedgers.writeToNBT(data, registries);
+    }
+
+    private static KeyCounter readCounter(
+            ListTag tags, HolderLookup.Provider registries) {
+        var result = new KeyCounter();
+        for (int i = 0; i < tags.size(); i++) {
+            var stack = GenericStack.readTag(registries, tags.getCompound(i));
+            if (stack != null && stack.amount() > 0) result.add(stack.what(), stack.amount());
+        }
+        return result;
+    }
+
+    private static ListTag writeCounter(
+            KeyCounter counter, HolderLookup.Provider registries) {
+        var result = new ListTag();
+        for (var entry : counter) {
+            if (entry.getLongValue() > 0) {
+                result.add(GenericStack.writeTag(
+                        registries, new GenericStack(entry.getKey(), entry.getLongValue())));
+            }
+        }
+        return result;
     }
 
     private static KeyCounter copyCounter(KeyCounter source) {
@@ -973,7 +1101,8 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
         this.pendingOverloadTag = null;
         OverloadCpuStateManager.INSTANCE.clear(this);
         seedReturnQuota.clear();
-        seedInFlightCredit.clear();
+        seedReturnQuotaFinalized = data.getBoolean(TAG_SEED_RETURN_QUOTA_FINALIZED);
+        clearLoopSeedState();
         if (data.contains(TAG_SEED_RETURN_QUOTA, Tag.TAG_LIST)) {
             var seeds = data.getList(TAG_SEED_RETURN_QUOTA, Tag.TAG_COMPOUND);
             for (int i = 0; i < seeds.size(); i++) {
@@ -981,15 +1110,7 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
                 if (stack != null && stack.amount() > 0) seedReturnQuota.add(stack.what(), stack.amount());
             }
         }
-        if (data.contains(TAG_SEED_IN_FLIGHT, Tag.TAG_LIST)) {
-            var seeds = data.getList(TAG_SEED_IN_FLIGHT, Tag.TAG_COMPOUND);
-            for (int i = 0; i < seeds.size(); i++) {
-                var stack = GenericStack.readTag(registries, seeds.getCompound(i));
-                if (stack != null && stack.amount() > 0) {
-                    seedInFlightCredit.add(stack.what(), stack.amount());
-                }
-            }
-        }
+        readLoopSeedState(data, registries);
         clearTaskWheel();
 
         if (data.contains(TAG_JOB, Tag.TAG_COMPOUND)) {
@@ -1025,16 +1146,12 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
         } else {
             data.remove(TAG_SEED_RETURN_QUOTA);
         }
-        if (!seedInFlightCredit.isEmpty()) {
-            var seeds = new ListTag();
-            for (var entry : seedInFlightCredit) {
-                seeds.add(GenericStack.writeTag(registries,
-                        new GenericStack(entry.getKey(), entry.getLongValue())));
-            }
-            data.put(TAG_SEED_IN_FLIGHT, seeds);
+        if (seedReturnQuotaFinalized) {
+            data.putBoolean(TAG_SEED_RETURN_QUOTA_FINALIZED, true);
         } else {
-            data.remove(TAG_SEED_IN_FLIGHT);
+            data.remove(TAG_SEED_RETURN_QUOTA_FINALIZED);
         }
+        writeLoopSeedState(data, registries);
         if (this.job != null) {
             data.put(TAG_JOB, this.job.writeToNBT(registries));
             var overloadTag = OverloadCpuStateManager.INSTANCE.writeToTag(this, registries);
@@ -1264,13 +1381,12 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
     private record ResolvedProvider(ICraftingProvider provider, IPatternDetails pattern) { }
 
     private boolean hasAmbiguousOverloadOutput(IPatternDetails details) {
-        if (!(details instanceof OverloadedProviderOnlyPatternDetails overloadDetails)) {
+        if (!(CraftingPatternDelegates.forProviderLookup(details)
+                instanceof OverloadedProviderOnlyPatternDetails overloadDetails)) {
             return false;
         }
 
-        var reference = new OverloadPatternReference(
-                overloadDetails.overloadPatternIdentity(),
-                overloadDetails.overloadPatternDetailsView().sourcePattern());
+        var reference = overloadPatternReference(details, overloadDetails);
         return OverloadCpuStateManager.INSTANCE.hasAmbiguousOutputRegistration(
                 this,
                 reference,
@@ -1301,13 +1417,12 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
     private void registerOverloadExpectedOutputs(TimeWheelJob activeJob,
                                                  IPatternDetails details,
                                                  long copies) {
-        if (!(details instanceof OverloadedProviderOnlyPatternDetails overloadDetails) || copies <= 0) {
+        if (!(CraftingPatternDelegates.forProviderLookup(details)
+                instanceof OverloadedProviderOnlyPatternDetails overloadDetails) || copies <= 0) {
             return;
         }
 
-        var reference = new OverloadPatternReference(
-                overloadDetails.overloadPatternIdentity(),
-                overloadDetails.overloadPatternDetailsView().sourcePattern());
+        var reference = overloadPatternReference(details, overloadDetails);
         var finalOutputKey = activeJob.finalOutput != null ? activeJob.finalOutput.what() : null;
         OverloadCpuStateManager.INSTANCE.registerExpectedOutputs(
                 this,
@@ -1316,7 +1431,56 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
                 overloadDetails.overloadPatternDetailsView(),
                 details.getOutputs(),
                 finalOutputKey,
-                copies);
+                copies,
+                reusableSeedOverloadOutputs(details, overloadDetails, copies));
+    }
+
+    private OverloadPatternReference overloadPatternReference(
+            IPatternDetails details,
+            OverloadedProviderOnlyPatternDetails overloadDetails) {
+        var identity = overloadDetails.overloadPatternIdentity();
+        if (details instanceof ExecuteLoopPattern loop) {
+            identity += "#loop-seed:" + loop.reusableSeedGroupId();
+        }
+        return new OverloadPatternReference(
+                identity, overloadDetails.overloadPatternDetailsView().sourcePattern());
+    }
+
+    private Map<Integer, OverloadReusableSeedMetadata> reusableSeedOverloadOutputs(
+            IPatternDetails details,
+            OverloadedProviderOnlyPatternDetails overloadDetails,
+            long copies) {
+        if (!(details instanceof ExecuteLoopPattern loop) || copies <= 0) return Map.of();
+        var remainingSeeds = loop.outputSeed();
+        if (remainingSeeds.isEmpty()) return Map.of();
+        var actualOutputs = details.getOutputs();
+        var result = new HashMap<Integer, OverloadReusableSeedMetadata>();
+        for (var output : overloadDetails.overloadPatternDetailsView().outputs()) {
+            if (output.matchMode() != MatchMode.ID_ONLY) continue;
+            int slot = output.slotIndex();
+            if (slot < 0 || slot >= actualOutputs.size()) continue;
+            var expected = actualOutputs.get(slot).what();
+            long seedAmount = Math.min(
+                    remainingSeeds.get(expected),
+                    multiplySaturated(output.amountPerCraft(), copies));
+            if (seedAmount <= 0) continue;
+            result.put(slot, new OverloadReusableSeedMetadata(
+                    loop.reusableSeedGroupId(),
+                    loop.hasSingleSeedInputPerMember(),
+                    seedAmount));
+            remainingSeeds.remove(expected, seedAmount);
+        }
+        return result.isEmpty() ? Map.of() : Map.copyOf(result);
+    }
+
+    private void rekeyOverloadReusableSeeds(AEKey incoming, OverloadClaimResult claims) {
+        for (var claim : claims.claims()) {
+            if (claim.reusableSeedAmount() <= 0 || claim.reusableSeedGroupId() == null) continue;
+            var pool = LoopSeedLedgerBook.poolFor(
+                    claim.reusableSeedGroupId(), claim.sharedReusableSeedPool());
+            loopSeedLedgers.rekey(
+                    pool, claim.exactExpectedKey(), incoming, claim.reusableSeedAmount());
+        }
     }
 
     private long applyInventoryClaims(TimeWheelJob activeJob, AEKey incoming, OverloadClaimResult claims) {
@@ -1922,7 +2086,10 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
                         ? expander.expandPatternFirings(entry.getValue())
                         : Map.of(entry.getKey(), entry.getValue());
                 for (var concrete : expanded.entrySet()) {
-                    tasks.computeIfAbsent(concrete.getKey(), ignored -> new TaskProgress()).value += concrete.getValue();
+                    var task = tasks.computeIfAbsent(
+                            concrete.getKey(), ignored -> new TaskProgress());
+                    task.value = com.moakiee.thunderbolt.core.planner.Sat.add(
+                            task.value, concrete.getValue());
                     addPendingOutputs(concrete.getKey(), concrete.getValue());
                     for (var output : concrete.getKey().getOutputs()) {
                     var amount = multiplySaturated(
@@ -1978,10 +2145,20 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
                 if (pattern == null) {
                     continue;
                 }
-                var details = PatternDetailsHelper.decodePattern(pattern, level);
+                IPatternDetails details = PatternDetailsHelper.decodePattern(pattern, level);
                 var remaining = item.getLong(NBT_CRAFTING_PROGRESS);
                 if (details != null && remaining > 0) {
-                    tasks.computeIfAbsent(details, ignored -> new TaskProgress()).value += remaining;
+                    var inputSeed = readCounter(
+                            item.getList(NBT_INPUT_SEED, Tag.TAG_COMPOUND), registries);
+                    var outputSeed = readCounter(
+                            item.getList(NBT_OUTPUT_SEED, Tag.TAG_COMPOUND), registries);
+                    if ((!inputSeed.isEmpty() || !outputSeed.isEmpty())
+                            && details instanceof ISeedPreservingCraftingTask) {
+                        details = new ExecuteLoopPattern(details, inputSeed, outputSeed);
+                    }
+                    var task = tasks.computeIfAbsent(details, ignored -> new TaskProgress());
+                    task.value = com.moakiee.thunderbolt.core.planner.Sat.add(
+                            task.value, remaining);
                 }
             }
         }
@@ -2079,6 +2256,16 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
                         : entry.getKey().getDefinition();
                 var item = definition.toTag(registries);
                 item.putLong(NBT_CRAFTING_PROGRESS, entry.getValue().value);
+                if (entry.getKey() instanceof ExecuteLoopPattern loopPattern) {
+                    var inputSeed = loopPattern.inputSeed();
+                    var outputSeed = loopPattern.outputSeed();
+                    if (!inputSeed.isEmpty()) {
+                        item.put(NBT_INPUT_SEED, writeCounter(inputSeed, registries));
+                    }
+                    if (!outputSeed.isEmpty()) {
+                        item.put(NBT_OUTPUT_SEED, writeCounter(outputSeed, registries));
+                    }
+                }
                 list.add(item);
             }
             data.put(NBT_TASKS, list);

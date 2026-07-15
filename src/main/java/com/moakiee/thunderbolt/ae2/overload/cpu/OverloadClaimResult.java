@@ -28,7 +28,7 @@ public record OverloadClaimResult(
         long total = 0;
         for (var claim : claims) {
             if (claim.routesToRequester()) {
-                total += claim.claimedAmount();
+                total += claim.claimedAmount() - claim.reusableSeedAmount();
             }
         }
         return total;

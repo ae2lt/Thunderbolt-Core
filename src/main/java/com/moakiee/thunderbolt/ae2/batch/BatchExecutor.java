@@ -19,6 +19,7 @@ import appeng.me.service.CraftingService;
 import com.moakiee.thunderbolt.ae2.api.crafting.IBatchCraftingProvider;
 import com.moakiee.thunderbolt.ae2.api.crafting.BatchDispatchMode;
 import com.moakiee.thunderbolt.ae2.api.crafting.CraftingPatternDelegates;
+import com.moakiee.thunderbolt.ae2.crafting.ExecuteLoopPattern;
 
 public final class BatchExecutor {
     private BatchExecutor() {
@@ -90,10 +91,12 @@ public final class BatchExecutor {
             }
 
             var details = task.details();
-            if (skipRule.test(details)) {
+            var executionDetails = details instanceof ExecuteLoopPattern loop
+                    ? loop.delegate() : details;
+            if (skipRule.test(executionDetails)) {
                 continue;
             }
-            if (!batchEligibleRule.test(details)) {
+            if (!batchEligibleRule.test(executionDetails)) {
                 continue;
             }
 
@@ -103,12 +106,12 @@ public final class BatchExecutor {
             for (var provider : cs.getProviders(providerPattern)) {
                 if (!(provider instanceof IBatchCraftingProvider batch)) continue;
                 sawBatchProvider = true;
-                if (details instanceof SharedBatchInputPattern
+                if (executionDetails instanceof SharedBatchInputPattern
                         && !batch.supportsSingleSeedBatch()) continue;
                 if (perTaskBatched != null && perTaskBatched.containsKey(provider)) continue;
-                int capacity = batch.getBatchCapacity(details);
+                int capacity = batch.getBatchCapacity(executionDetails);
                 if (capacity <= 0) continue;
-                var dispatchMode = batch.getBatchDispatchMode(details);
+                var dispatchMode = batch.getBatchDispatchMode(executionDetails);
                 if (dispatchMode == null) {
                     dispatchMode = BatchDispatchMode.NORMAL;
                 }
@@ -119,7 +122,7 @@ public final class BatchExecutor {
             }
             if (eligible == null) continue;
 
-            if (details instanceof SharedBatchInputPattern && eligible.size() > 1) {
+            if (executionDetails instanceof SharedBatchInputPattern && eligible.size() > 1) {
                 // One reusable seed cannot be in multiple executing providers simultaneously.
                 eligible.sort(java.util.Comparator
                         .comparing((EligibleProvider provider) -> provider.mode() != BatchDispatchMode.UNBOUNDED)
@@ -221,7 +224,7 @@ public final class BatchExecutor {
 
                 int subLeftover;
                 try {
-                    subLeftover = batch.pushBatch(details, oneCopy, slice);
+                    subLeftover = batch.pushBatch(executionDetails, oneCopy, slice);
                 } catch (Throwable t) {
                     appeng.core.AELog.warn("[ae2lt] IBatchCraftingProvider %s threw during pushBatch; treating as full leftover. %s",
                             batch, t);

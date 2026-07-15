@@ -11,6 +11,7 @@ import appeng.api.crafting.IPatternDetails;
 import appeng.api.stacks.AEKey;
 import appeng.api.stacks.KeyCounter;
 import appeng.crafting.inv.ListCraftingInventory;
+import com.moakiee.thunderbolt.ae2.crafting.ExecuteLoopPattern;
 
 public final class ParallelBatchCpuHelper {
     private ParallelBatchCpuHelper() {
@@ -32,8 +33,10 @@ public final class ParallelBatchCpuHelper {
         var units = new long[slots];
         var available = new long[slots];
         var shared = new boolean[slots];
-        var sharedPattern = allowSharedInputs && details instanceof SharedBatchInputPattern pattern
-                ? pattern : null;
+        var executionDetails = details instanceof ExecuteLoopPattern loop
+                ? loop.delegate() : details;
+        var sharedPattern = allowSharedInputs
+                && executionDetails instanceof SharedBatchInputPattern pattern ? pattern : null;
         var reserved = reservedStock != null ? reservedStock : Map.<AEKey, Long>of();
 
         for (int slot = 0; slot < slots; slot++) {
@@ -143,7 +146,10 @@ public final class ParallelBatchCpuHelper {
     private static void registerExpectedOutputs(BatchJobView job, IPatternDetails details,
                                                 AEKey[] chosenKeys, boolean[] shared, int dispatched) {
         if (dispatched <= 0) return;
-        var sharedPattern = details instanceof SharedBatchInputPattern pattern ? pattern : null;
+        var executionDetails = details instanceof ExecuteLoopPattern loop
+                ? loop.delegate() : details;
+        var sharedPattern = executionDetails instanceof SharedBatchInputPattern pattern
+                ? pattern : null;
         var sharedOutputsLeft = new HashMap<AEKey, Long>();
         for (var output : details.getOutputs()) {
             long sharedAmount = 0L;
