@@ -1,7 +1,13 @@
 package com.moakiee.thunderbolt;
 
 import com.mojang.logging.LogUtils;
+import com.moakiee.thunderbolt.ae2.cell.IndexedCellStorageRegistry;
+import com.moakiee.thunderbolt.ae2.cell.IndexedStorageCellHandler;
+import appeng.api.storage.StorageCells;
 import net.neoforged.bus.api.IEventBus;
+import net.neoforged.fml.event.lifecycle.FMLCommonSetupEvent;
+import net.neoforged.neoforge.common.NeoForge;
+import net.neoforged.neoforge.event.server.ServerStartingEvent;
 import net.neoforged.fml.common.Mod;
 import org.slf4j.Logger;
 
@@ -19,7 +25,17 @@ public final class ThunderboltCore {
     public static final Logger LOGGER = LogUtils.getLogger();
 
     public ThunderboltCore(IEventBus modEventBus) {
+        modEventBus.addListener(this::onCommonSetup);
+        NeoForge.EVENT_BUS.addListener(this::onServerStarting);
         LOGGER.info("[Thunderbolt Core] initialized; fast-path autocrafting planner active={}",
                 CoreConfig.FAST_PATH_ENABLED);
+    }
+
+    private void onServerStarting(ServerStartingEvent event) {
+        IndexedCellStorageRegistry.get(event.getServer());
+    }
+
+    private void onCommonSetup(FMLCommonSetupEvent event) {
+        event.enqueueWork(() -> StorageCells.addCellHandler(IndexedStorageCellHandler.INSTANCE));
     }
 }
