@@ -163,9 +163,10 @@ public final class FastCraftingPlanner {
         CraftGraph.Builder<AEKey> builder = CraftGraph.builder();
         boolean[] multiplePaths = {false};
         Map<AEKey, DurabilityChain<AEKey>> durability = new HashMap<>();
+        Map<AEKey, Set<IPatternDetails>> patternSources = new HashMap<>();
         Set<AEKey> emittable = new HashSet<>();
         if (!buildGraph(craftingService, snapshot, level, output, builder, multiplePaths,
-                durability, emittable, reservedStock)) {
+                durability, patternSources, emittable, reservedStock)) {
             // Rare hard declines only: e.g. a key used both as a durability carrier (priced in uses)
             // and as a plain whole-item input — two unit systems on one pool. AE2's exact simulator
             // handles those correctly, and correctness beats speed for the odd setup that hits this.
@@ -178,8 +179,8 @@ public final class FastCraftingPlanner {
         // Emittable shortfalls are supplied by emitters, not crafted, so they don't make a plan
         // infeasible — only a non-emittable shortfall does.
         if (plan.feasible() || noNonEmittableMissing(plan, emittable)) {
-            return FastAttempt.handled(toAe2Plan(output, amount, plan, multi, false, durability, emittable,
-                    snapshot, reservedStock));
+            return FastAttempt.handled(toAe2Plan(output, amount, plan, multi, false, durability,
+                    patternSources, emittable, snapshot, reservedStock));
         }
         // Infeasible at this amount. Best-effort policy (Policy A): we never fall back to AE2's
         // exhaustive simulator for performance — that is the slow path this engine exists to avoid.
@@ -190,8 +191,8 @@ public final class FastCraftingPlanner {
         if (!simulate) {
             return FastAttempt.handled(null); // this amount can't be made within our bounded search
         }
-        return FastAttempt.handled(toAe2Plan(output, amount, plan, multi, true, durability, emittable,
-                snapshot, reservedStock)); // partial + missing
+        return FastAttempt.handled(toAe2Plan(output, amount, plan, multi, true, durability,
+                patternSources, emittable, snapshot, reservedStock)); // partial + missing
     }
 
     private static boolean noNonEmittableMissing(CraftPlan<AEKey> plan, Set<AEKey> emittable) {
@@ -215,6 +216,7 @@ public final class FastCraftingPlanner {
                                       CraftGraph.Builder<AEKey> builder,
                                       boolean[] multiplePaths,
                                       Map<AEKey, DurabilityChain<AEKey>> durability,
+                                      Map<AEKey, Set<IPatternDetails>> patternSources,
                                       Set<AEKey> emittable,
                                       @Nullable ReservedStockCraftingRequester reservedStock) {
         Set<AEKey> seen = new HashSet<>();
@@ -290,6 +292,9 @@ public final class FastCraftingPlanner {
                 if (primaryStack == null || !key.equals(primaryStack.what())) {
                     continue;
                 }
+                patternSources.computeIfAbsent(key,
+                        ignored -> java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<>()))
+                        .add(details);
                 List<GenericStack> outputs = details.getOutputs();
                 GenericStack primary = null;
                 List<CraftOutput<AEKey>> byproducts = new ArrayList<>(Math.max(0, outputs.size() - 1));
@@ -507,19 +512,18 @@ public final class FastCraftingPlanner {
         if (possible.length == 0 || !(possible[0].what() instanceof AEItemKey template)) {
             return ChainLookup.NONE;
         }
-        // Unbreakable / non-degrading tool: getRemainingKey hands the very same key back. It's a pure
-        // catalyst, so let the plain-input path model it as a `returned` input (one seed serves the
-        // whole batch). Detecting it here also skips fullestAnchor's fuzzy stock scan — pure waste for
-        // a tool that never forms a chain.
-        if (template.equals(in.getRemainingKey(template))) {
-            return ChainLookup.NONE;
-        }
         Item item = template.getItem();
         AEItemKey full = fullestAnchor(in, craftingService, snapshot, level, template, item);
+        AEKey remaining = in.getRemainingKey(full);
+        // Classify the resolved craftable/stock anchor, not the declared template. AE2 permits a
+        // pattern to accidentally encode a damaged output for a damageable input; in that case the
+        // pristine declared template may appear unchanged while the fuzzy craftable variant starts a
+        // real degradation chain. Returning before fullestAnchor would miss that pattern entirely.
+        if (full.equals(remaining)) {
+            return ChainLookup.NONE; // true unbreakable / non-degrading catalyst
+        }
         // One degradation step under THIS slot's rule (null = consumed outright / leaves the item).
-        AEKey step = in.getRemainingKey(full) instanceof AEItemKey next && next.getItem() == item
-                ? next
-                : null;
+        AEKey step = remaining instanceof AEItemKey next && next.getItem() == item ? next : null;
 
         // Merge index: is this slot's start key already a link of some built chain?
         DurabilityChain<AEKey> owner = linkOwner.get(full);
@@ -772,6 +776,7 @@ public final class FastCraftingPlanner {
     private static CraftingPlan toAe2Plan(AEKey output, long amount, CraftPlan<AEKey> plan,
                                           boolean multiplePaths, boolean simulation,
                                           Map<AEKey, DurabilityChain<AEKey>> durability,
+                                          Map<AEKey, Set<IPatternDetails>> patternSources,
                                           Set<AEKey> emittable,
                                           ChildCraftingSimulationState snapshot,
                                           @Nullable ReservedStockCraftingRequester reservedStock) {
@@ -821,7 +826,7 @@ public final class FastCraftingPlanner {
             }
         }
 
-        long bytes = computeBytes(plan, durability);
+        long bytes = computeBytes(plan, durability, patternSources);
 
         return new CraftingPlan(
                 new GenericStack(output, amount),
@@ -901,14 +906,16 @@ public final class FastCraftingPlanner {
      * ({@code items / amountPerByte * 8}), plus one byte per pattern firing, one byte per returned
      * container firing, and {@code 8 * nodeCount}.
      */
-    private static long computeBytes(CraftPlan<AEKey> plan, Map<AEKey, DurabilityChain<AEKey>> durability) {
+    private static long computeBytes(CraftPlan<AEKey> plan,
+                                     Map<AEKey, DurabilityChain<AEKey>> durability,
+                                     Map<AEKey, Set<IPatternDetails>> patternSources) {
         double bytes = 0;
         for (Map.Entry<AEKey, Long> e : plan.grossDemand().entrySet()) {
             int amountPerByte = Math.max(1, e.getKey().getType().getAmountPerByte());
-            DurabilityChain<AEKey> chain = durability.get(e.getKey());
-            // Carrier demand is in uses; AE2 bytes count tools, so collapse uses -> tools (ceil/n).
-            long amt = chain == null ? e.getValue() : Sat.ceilDiv(e.getValue(), chain.n());
-            bytes += (double) amt / amountPerByte * 8.0;
+            // AE2 charges a node request for every requested input unit. A durability carrier is
+            // represented in use-units in the graph, which is exactly the number of requests made by
+            // the parent process; do not collapse it to the number of physical tools crafted here.
+            bytes += (double) e.getValue() / amountPerByte * 8.0;
         }
         for (long times : plan.firings().values()) {
             bytes += times;
@@ -922,8 +929,39 @@ public final class FastCraftingPlanner {
             }
         }
         long nodeCount = plan.grossDemand().size() - fuzzyNodeReduction(plan);
+        nodeCount = Sat.add(nodeCount, unusedAlternativeNodeCount(plan, patternSources));
         bytes += 8.0 * Math.max(0, nodeCount);
         return (long) Math.ceil(bytes);
+    }
+
+    /**
+     * AE2 creates every sibling {@code CraftingTreeProcess} when a craftable node is expanded, so the
+     * input nodes of an unused alternative still occupy eight bytes each. The compact planner keeps
+     * only demanded keys in {@code grossDemand}; restore those sibling nodes without defeating AE2's
+     * lazy behavior for nodes satisfied entirely from stock (which have no selected source at all).
+     */
+    private static long unusedAlternativeNodeCount(
+            CraftPlan<AEKey> plan,
+            Map<AEKey, Set<IPatternDetails>> patternSources) {
+        Map<AEKey, Set<IPatternDetails>> selectedByOutput = new HashMap<>();
+        for (Map.Entry<CraftPattern<AEKey>, Long> entry : plan.firings().entrySet()) {
+            if (entry.getValue() <= 0) continue;
+            CraftPattern<AEKey> pattern = entry.getKey();
+            selectedByOutput.computeIfAbsent(pattern.output(),
+                    ignored -> java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<>()))
+                    .add((IPatternDetails) pattern.source());
+        }
+
+        long extra = 0;
+        for (Map.Entry<AEKey, Set<IPatternDetails>> entry : selectedByOutput.entrySet()) {
+            Set<IPatternDetails> selected = entry.getValue();
+            for (IPatternDetails source : patternSources.getOrDefault(entry.getKey(), Set.of())) {
+                if (!selected.contains(source)) {
+                    extra = Sat.add(extra, source.getInputs().length);
+                }
+            }
+        }
+        return extra;
     }
 
     private static long fuzzyNodeReduction(CraftPlan<AEKey> plan) {
