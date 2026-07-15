@@ -1,5 +1,8 @@
 package com.moakiee.thunderbolt.ae2.mixin;
 
+import java.util.IdentityHashMap;
+import java.util.Map;
+
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Shadow;
 import org.spongepowered.asm.mixin.Unique;
@@ -20,6 +23,7 @@ import com.moakiee.thunderbolt.ae2.crafting.FastCraftingControl;
 import com.moakiee.thunderbolt.ae2.crafting.FastCraftingPlanner;
 import com.moakiee.thunderbolt.ae2.crafting.FastPlanningWatchdog;
 import com.moakiee.thunderbolt.ae2.crafting.LoopCraftingPlan;
+import com.moakiee.thunderbolt.core.planner.ReusableStockUsageKey;
 
 /**
  * Installs the linear-time autocrafting fast path inside AE2's per-amount attempt
@@ -59,6 +63,10 @@ public abstract class CraftingCalculationMixin implements FastCraftingControl {
     @Unique
     private boolean ae2lt$fastPlanningEnabled = CoreConfig.FAST_PATH_ENABLED;
 
+    @Unique
+    private final Map<CraftingPlan, Map<ReusableStockUsageKey<AEKey>, Long>>
+            thunderbolt$reusableStockByAttempt = new IdentityHashMap<>();
+
     @Override
     public void ae2lt$setFastPlanningEnabled(boolean enabled) {
         this.ae2lt$fastPlanningEnabled = enabled;
@@ -71,7 +79,13 @@ public abstract class CraftingCalculationMixin implements FastCraftingControl {
 
     @Inject(method = "run", at = @At("RETURN"), cancellable = true, remap = false)
     private void thunderbolt$wrapLoopPlan(CallbackInfoReturnable<ICraftingPlan> cir) {
-        cir.setReturnValue(LoopCraftingPlan.wrapIfNeeded(cir.getReturnValue()));
+        var result = cir.getReturnValue();
+        Map<ReusableStockUsageKey<AEKey>, Long> usedReusableStock = null;
+        if (result instanceof CraftingPlan craftingPlan) {
+            usedReusableStock = thunderbolt$reusableStockByAttempt.get(craftingPlan);
+        }
+        cir.setReturnValue(LoopCraftingPlan.wrapIfNeeded(result, usedReusableStock));
+        thunderbolt$reusableStockByAttempt.clear();
     }
 
     @Inject(method = "runCraftAttempt", at = @At("HEAD"), cancellable = true, remap = false)
@@ -97,6 +111,10 @@ public abstract class CraftingCalculationMixin implements FastCraftingControl {
                 // Reproduce the side effect of the real method body we are skipping, so that
                 // CraftingCalculation#isSimulation() reflects the attempt that produced this plan.
                 this.simulate = simulate;
+                if (attempt.plan() != null) {
+                    thunderbolt$reusableStockByAttempt.put(
+                            attempt.plan(), attempt.usedReusableStock());
+                }
                 cir.setReturnValue(attempt.plan());
             }
         } catch (Throwable t) {

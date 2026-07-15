@@ -219,6 +219,18 @@ public final class OverloadCpuStateManager {
         return result;
     }
 
+    /** Commits a previously simulated and requester-limited claim. */
+    public synchronized OverloadClaimResult commitPreview(
+            Object logic, OverloadClaimResult preview) {
+        Objects.requireNonNull(logic, "logic");
+        Objects.requireNonNull(preview, "preview");
+        var state = states.get(logic);
+        if (state == null || !preview.claimedAnything()) return OverloadClaimResult.EMPTY;
+        var committed = state.commitPreview(preview);
+        if (state.isEmpty()) states.remove(logic);
+        return committed;
+    }
+
     public synchronized long getRemainingForItem(CraftingCpuLogic logic, ResourceLocation itemId) {
         return getRemainingForItem((Object) logic, itemId);
     }

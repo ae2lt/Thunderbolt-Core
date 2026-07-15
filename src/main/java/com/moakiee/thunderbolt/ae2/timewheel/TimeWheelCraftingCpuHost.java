@@ -2,6 +2,8 @@ package com.moakiee.thunderbolt.ae2.timewheel;
 
 import appeng.api.config.Actionable;
 import appeng.api.stacks.AEKey;
+import appeng.api.stacks.KeyCounter;
+import java.util.function.Predicate;
 
 import org.jetbrains.annotations.Nullable;
 
@@ -28,6 +30,25 @@ public interface TimeWheelCraftingCpuHost {
     /** Extracts reusable seeds from host-owned storage before ME-network extraction. */
     default long extractReusableSeed(AEKey key, long amount, Actionable mode) {
         return 0L;
+    }
+
+    /**
+     * Extracts concrete variants for one planned seed key. Hosts that support fuzzy/private variants
+     * override this method; exact-only hosts retain the legacy behavior automatically.
+     */
+    default KeyCounter extractReusableSeedVariants(
+            AEKey planned,
+            long amount,
+            Predicate<AEKey> acceptsVariant,
+            Actionable mode) {
+        var result = new KeyCounter();
+        if (planned == null || amount <= 0 || acceptsVariant == null
+                || !acceptsVariant.test(planned)) {
+            return result;
+        }
+        long extracted = extractReusableSeed(planned, amount, mode);
+        if (extracted > 0) result.add(planned, extracted);
+        return result;
     }
 
     /** Inserts returned reusable seeds into host-owned storage before normal ME insertion. */

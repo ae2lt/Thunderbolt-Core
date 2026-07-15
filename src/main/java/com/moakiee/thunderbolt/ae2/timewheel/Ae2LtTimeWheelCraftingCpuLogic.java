@@ -164,21 +164,33 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
         var loopPlan = plan instanceof LoopCraftingPlan loop ? loop : null;
         var seedRequirements = loopPlan != null
                 ? copyToCounter(loopPlan.totalReusableSeeds()) : new KeyCounter();
-        var hostSeedAllocation = loopPlan != null
-                ? copyToCounter(loopPlan.hostReusableSeeds()) : new KeyCounter();
+        var hostSeedAllocations = loopPlan != null
+                ? loopPlan.hostReusableSeedAllocations() : List.<LoopCraftingPlan.HostReusableSeedAllocation>of();
         var adjustedUsedItems = copyCounter(plan.usedItems());
         var hostSeeds = new KeyCounter();
+        var hostSeedVariants = new ArrayList<SeedVariantAllocation>();
         boolean hostShortfall = false;
-        for (var entry : hostSeedAllocation) {
-            long requested = entry.getLongValue();
-            long extracted = cpu.getHost().extractReusableSeed(
-                    entry.getKey(), requested, Actionable.MODULATE);
-            if (extracted > 0) {
-                inventory.insert(entry.getKey(), extracted, Actionable.MODULATE);
-                hostSeeds.add(entry.getKey(), extracted);
+        for (var allocation : hostSeedAllocations) {
+            long requested = allocation.amount();
+            var extractedVariants = cpu.getHost().extractReusableSeedVariants(
+                    allocation.plannedKey(),
+                    requested,
+                    actual -> loopPlan != null
+                            && loopPlan.acceptsReusableSeedVariant(allocation, actual),
+                    Actionable.MODULATE);
+            long extracted = 0L;
+            for (var actual : extractedVariants) {
+                long accepted = Math.min(actual.getLongValue(), requested - extracted);
+                if (accepted <= 0) continue;
+                inventory.insert(actual.getKey(), accepted, Actionable.MODULATE);
+                hostSeeds.add(actual.getKey(), accepted);
+                hostSeedVariants.add(new SeedVariantAllocation(
+                        allocation.plannedKey(), actual.getKey(), accepted,
+                        allocation.reusableSeedGroupId(), allocation.sharedPool()));
+                extracted = addSaturated(extracted, accepted);
             }
             if (extracted < requested) {
-                adjustedUsedItems.add(entry.getKey(), requested - extracted);
+                adjustedUsedItems.add(allocation.plannedKey(), requested - extracted);
                 hostShortfall = true;
             }
         }
@@ -205,6 +217,11 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
         loopSeedLedgers.initialize(
                 loopPlan != null ? loopPlan.reusableSeedGroups() : Map.of(),
                 loopPlan != null ? loopPlan.dedicatedReusableSeedGroups() : Set.of());
+        for (var variant : hostSeedVariants) {
+            loopSeedLedgers.rekeyAvailable(
+                    LoopSeedLedgerBook.poolFor(variant.groupId(), variant.sharedPool()),
+                    variant.planned(), variant.actual(), variant.amount());
+        }
         patternPowerCache.clear();
         markWaitingKeysChanged();
         cpu.updateOutput(plan.finalOutput());
@@ -642,10 +659,22 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
     private OverloadInsert acceptOverloadWaitingItem(
             TimeWheelJob activeJob, AEKey what, long amount, Actionable type) {
         if (amount <= 0) return OverloadInsert.EMPTY;
-        var claims = OverloadCpuStateManager.INSTANCE.claim(this, what, amount, type);
-        if (!claims.claimedAnything()) {
+        var preview = OverloadCpuStateManager.INSTANCE.claim(
+                this, what, amount, Actionable.SIMULATE);
+        if (!preview.claimedAnything()) {
             return OverloadInsert.EMPTY;
         }
+
+        long requesterAccepted = preview.claimedForRequester();
+        if (!activeJob.softCancelling && requesterAccepted > 0) {
+            requesterAccepted = activeJob.link.insert(
+                    what, requesterAccepted, type);
+        }
+        var claims = preview.limitRequester(requesterAccepted);
+        if (type == Actionable.MODULATE) {
+            claims = OverloadCpuStateManager.INSTANCE.commitPreview(this, claims);
+        }
+        if (!claims.claimedAnything()) return OverloadInsert.EMPTY;
 
         long accepted = 0L;
         if (type == Actionable.MODULATE) {
@@ -674,6 +703,10 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
 
     private record OverloadInsert(long claimed, long accepted) {
         private static final OverloadInsert EMPTY = new OverloadInsert(0L, 0L);
+    }
+
+    private record SeedVariantAllocation(
+            AEKey planned, AEKey actual, long amount, UUID groupId, boolean sharedPool) {
     }
 
     private long acceptStrictWaitingItem(TimeWheelJob activeJob, AEKey what, long amount, Actionable type) {
@@ -1502,7 +1535,6 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
         }
 
         decrementItems(activeJob.timeTracker, claimed, incoming.getType());
-        long inserted = activeJob.link.insert(incoming, claimed, Actionable.MODULATE);
         postChange(incoming);
 
         activeJob.remainingAmount = Math.max(0L, activeJob.remainingAmount - claimed);
@@ -1511,7 +1543,7 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
         } else {
             cpu.updateOutput(null);
         }
-        return inserted;
+        return claimed;
     }
 
     private void consumeTaskCopies(TimeWheelJob activeJob, IPatternDetails details, long copies) {

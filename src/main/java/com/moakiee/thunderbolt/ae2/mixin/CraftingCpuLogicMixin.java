@@ -85,17 +85,29 @@ public abstract class CraftingCpuLogicMixin {
             return;
         }
 
-        var claims = OverloadCpuStateManager.INSTANCE.claim(logic, what, remainder, type);
-        if (!claims.claimedAnything()) {
+        var preview = OverloadCpuStateManager.INSTANCE.claim(
+                logic, what, remainder, Actionable.SIMULATE);
+        if (!preview.claimedAnything()) {
             return;
         }
 
+        var job = ((CraftingCpuLogicAccessor) logic).getJob();
+        if (job == null) return;
+        var link = ((ExecutingCraftingJobAccessor) job).getLink();
+        long requesterAccepted = preview.claimedForRequester();
+        if (requesterAccepted > 0) {
+            requesterAccepted = link != null
+                    ? link.insert(what, requesterAccepted, type) : 0L;
+        }
+        var claims = preview.limitRequester(requesterAccepted);
+        if (type == Actionable.MODULATE) {
+            claims = OverloadCpuStateManager.INSTANCE.commitPreview(logic, claims);
+        }
+        if (!claims.claimedAnything()) return;
+
         long supplementalReturn = 0;
         if (type == Actionable.MODULATE) {
-            var job = ((CraftingCpuLogicAccessor) logic).getJob();
-            if (job != null) {
-                ae2lt$deductClaimedWaitingFor(job, claims);
-            }
+            ae2lt$deductClaimedWaitingFor(job, claims);
             supplementalReturn += ae2lt$applyInventoryClaims(what, claims);
             supplementalReturn += ae2lt$applyRequesterClaims(what, claims);
             cluster.markDirty();
@@ -217,8 +229,6 @@ public abstract class CraftingCpuLogicMixin {
         ((ElapsedTimeTrackerAccessor) jobAccessor.getTimeTracker()).invokeDecrementItems(
                 claimed,
                 incoming.getType());
-        var link = jobAccessor.getLink();
-        long inserted = link != null ? link.insert(incoming, claimed, Actionable.MODULATE) : 0;
         logicAccessor.invokePostChange(incoming);
 
         long remaining = Math.max(0L, jobAccessor.getRemainingAmount() - claimed);
@@ -234,7 +244,7 @@ public abstract class CraftingCpuLogicMixin {
             }
         }
 
-        return inserted;
+        return claimed;
     }
 
     @Unique

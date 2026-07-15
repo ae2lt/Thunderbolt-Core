@@ -168,10 +168,25 @@ public abstract class AdvCraftingCpuLogicMixin {
             return;
         }
 
-        var claims = OverloadCpuStateManager.INSTANCE.claim(this, what, remainder, type);
-        if (!claims.claimedAnything()) {
+        var preview = OverloadCpuStateManager.INSTANCE.claim(
+                this, what, remainder, Actionable.SIMULATE);
+        if (!preview.claimedAnything()) {
             return;
         }
+
+        var job = ae2lt$getJob();
+        if (job == null) return;
+        CraftingLink link = ae2lt$getJobLink(job);
+        long requesterAccepted = preview.claimedForRequester();
+        if (requesterAccepted > 0) {
+            requesterAccepted = link != null
+                    ? link.insert(what, requesterAccepted, type) : 0L;
+        }
+        var claims = preview.limitRequester(requesterAccepted);
+        if (type == Actionable.MODULATE) {
+            claims = OverloadCpuStateManager.INSTANCE.commitPreview(this, claims);
+        }
+        if (!claims.claimedAnything()) return;
 
         if (type == Actionable.MODULATE) {
             ae2lt$deductClaimedWaitingFor(claims);
@@ -297,8 +312,6 @@ public abstract class AdvCraftingCpuLogicMixin {
         }
 
         ae2lt$decrementJobItems(job, claimed, incoming.getType());
-        CraftingLink link = ae2lt$getJobLink(job);
-        long inserted = link != null ? link.insert(incoming, claimed, Actionable.MODULATE) : 0;
         ae2lt$invokePostChange(incoming);
 
         long remaining = Math.max(0L, ae2lt$getJobRemainingAmount(job) - claimed);
@@ -317,7 +330,7 @@ public abstract class AdvCraftingCpuLogicMixin {
             }
         }
 
-        return inserted;
+        return claimed;
     }
 
     @Unique

@@ -92,6 +92,9 @@ public final class CraftPlannerV2<K> {
     private final Map<K, Long> bpPool = new HashMap<>();      // byproduct / surplus supply
     private final Map<K, Long> stockLeft = new HashMap<>();   // remaining inventory snapshot
     private final Map<K, Long> usedStock = new HashMap<>();   // drawn from inventory
+    private final Map<ReusableStockKey<K>, Long> reusableStockLeft = new HashMap<>();
+    private final Map<ReusableStockKey<K>, Long> reusablePool = new HashMap<>();
+    private final Map<ReusableStockUsageKey<K>, Long> usedReusableStock = new HashMap<>();
     private final Map<K, Long> missing = new HashMap<>();     // unmet at raw leaves
     private final Map<K, Long> grossDemand = new HashMap<>(); // pre-extraction request totals (bytes)
     private final Map<CraftPattern<K>, Long> firings = new IdentityHashMap<>();
@@ -119,7 +122,7 @@ public final class CraftPlannerV2<K> {
 
     public static <K> CraftPlan<K> plan(CraftGraph<K> graph, K target, long amount, int visitCap) {
         if (amount <= 0) {
-            return new CraftPlan<>(true, true, Map.of(), Map.of(), Map.of(), Map.of(), 0, false);
+            return new CraftPlan<>(true, true, Map.of(), Map.of(), Map.of(), Map.of(), Map.of(), 0, false);
         }
         CycleAnalysis<K> cycleAnalysis = CycleAnalysis.analyze(graph, target);
         CraftPlannerV2<K> firstPlanner = new CraftPlannerV2<>(graph, visitCap);
@@ -145,7 +148,7 @@ public final class CraftPlannerV2<K> {
 
     private CraftPlan<K> run(K target, long amount, List<K> priorityRoots) {
         if (amount <= 0) {
-            return new CraftPlan<>(true, true, Map.of(), Map.of(), Map.of(), Map.of(), 0, false);
+            return new CraftPlan<>(true, true, Map.of(), Map.of(), Map.of(), Map.of(), Map.of(), 0, false);
         }
 
         identifyPositiveFeedbackByproducts(target);
@@ -182,11 +185,13 @@ public final class CraftPlannerV2<K> {
         for (K x : items) {
             stockLeft.put(x, graph.stock(x));
         }
+        reusableStockLeft.putAll(graph.reusableStock());
         obtain(target, amount);
         boolean feasible = missing.isEmpty();
         CraftPlan<K> fallback = new CraftPlan<>(true, feasible,
                 new IdentityHashMap<>(firings),
                 new HashMap<>(usedStock),
+                new HashMap<>(usedReusableStock),
                 new HashMap<>(missing),
                 new HashMap<>(grossDemand),
                 processed,
@@ -253,8 +258,9 @@ public final class CraftPlannerV2<K> {
 
         enforceDirectFeedbackBootstrap(plan, firedByOutput, used, missing);
 
-        return new CraftPlan<>(plan.supported(), missing.isEmpty(), plan.firings(), used, missing,
-                plan.grossDemand(), plan.itemsProcessed(), plan.budgetExhausted());
+        return new CraftPlan<>(plan.supported(), missing.isEmpty(), plan.firings(), used,
+                plan.usedReusableStock(), missing, plan.grossDemand(), plan.itemsProcessed(),
+                plan.budgetExhausted());
     }
 
     /**
@@ -631,7 +637,11 @@ public final class CraftPlannerV2<K> {
         long bound = Sat.SAT;
         for (CraftInput<K> in : p.inputs()) {
             long c;
-            if (isSelfReturnedSeed(p, in)) {
+            if (in.reusableStockSource() != null) {
+                c = Sat.add(
+                        graph.reusableStock(in.reusableStockSource().storageScope(), in.key()),
+                        cap.getOrDefault(in.key(), 0L));
+            } else if (isSelfReturnedSeed(p, in)) {
                 c = graph.stock(in.key());
                 for (CraftPattern<K> alternative : patternsByOutput.getOrDefault(in.key(), List.of())) {
                     if (alternative == p || hasSelfReturnedSeed(alternative)) continue;
@@ -702,7 +712,7 @@ public final class CraftPlannerV2<K> {
         }
 
         boolean feasible = miss.isEmpty();
-        return new CraftPlan<>(true, feasible, fired, used, miss, gross, done, false);
+        return new CraftPlan<>(true, feasible, fired, used, Map.of(), miss, gross, done, false);
     }
 
     /** Split {@code d} of {@code x} across recipes by current remaining capacity (dynamic balance). */
@@ -848,7 +858,9 @@ public final class CraftPlannerV2<K> {
         for (CraftInput<K> in : r.inputs()) {
             long amt = in.unitsFor(times); // closed form per flavour
             long unmet;
-            if (isSelfReturnedSeed(r, in)) {
+            if (in.reusableStockSource() != null) {
+                unmet = obtainReusableSeed(r, in, amt);
+            } else if (isSelfReturnedSeed(r, in)) {
                 long obtained = drawReservedSelfSeed(in.key(), amt);
                 if (obtained < amt) {
                     obtained = Sat.add(obtained, drawPools(in.key(), amt - obtained));
@@ -873,7 +885,14 @@ public final class CraftPlannerV2<K> {
                 // tool is degraded (consumed) by these firings, so nothing goes back.
                 long returned = amt - unmet;
                 if (returned > 0) {
-                    bump(bpPool, in.key(), returned);
+                    if (in.reusableStockSource() != null) {
+                        bump(reusablePool,
+                                new ReusableStockKey<>(
+                                        in.reusableStockSource().poolScope(), in.key()),
+                                returned);
+                    } else {
+                        bump(bpPool, in.key(), returned);
+                    }
                 }
             }
             if (search && missingTotal > entryMissing) {
@@ -892,6 +911,51 @@ public final class CraftPlannerV2<K> {
             }
         }
         return inputUnmet;
+    }
+
+    /**
+     * Draws a reusable seed only through its logical loop pool. A pool first reuses its own returned
+     * state, then borrows from the shared physical host inventory, and finally falls back to normal
+     * network stock/crafting. Ordinary recipes can never see either private layer.
+     */
+    private long obtainReusableSeed(CraftPattern<K> pattern, CraftInput<K> input, long amount) {
+        var source = input.reusableStockSource();
+        if (source == null || amount <= 0) return Math.max(0L, amount);
+
+        var poolKey = new ReusableStockKey<K>(source.poolScope(), input.key());
+        long fromPool = Math.min(amount, get(reusablePool, poolKey));
+        if (fromPool > 0) {
+            put(reusablePool, poolKey, get(reusablePool, poolKey) - fromPool);
+        }
+
+        long obtained = fromPool;
+        long remaining = amount - obtained;
+        if (remaining > 0) {
+            var storageKey = new ReusableStockKey<K>(source.storageScope(), input.key());
+            long borrowed = Math.min(remaining, get(reusableStockLeft, storageKey));
+            if (borrowed > 0) {
+                put(reusableStockLeft, storageKey, get(reusableStockLeft, storageKey) - borrowed);
+                var usageKey = new ReusableStockUsageKey<K>(
+                        source.storageScope(), source.poolScope(), input.key());
+                put(usedReusableStock, usageKey,
+                        Sat.add(get(usedReusableStock, usageKey), borrowed));
+                obtained = Sat.add(obtained, borrowed);
+                remaining -= borrowed;
+            }
+        }
+
+        if (remaining <= 0) return 0L;
+        if (isSelfReturnedSeed(pattern, input)) {
+            long unmet = craftSelfSeedFromAlternative(input.key(), remaining, pattern);
+            return unmet;
+        }
+
+        depth++;
+        try {
+            return obtain(input.key(), remaining);
+        } finally {
+            depth--;
+        }
     }
 
     private static <K> boolean isSelfReturnedSeed(CraftPattern<K> pattern, CraftInput<K> input) {
@@ -930,7 +994,7 @@ public final class CraftPlannerV2<K> {
         long required = 0L;
         for (CraftPattern<K> pattern : patternsByOutput.getOrDefault(key, List.of())) {
             for (CraftInput<K> input : pattern.inputs()) {
-                if (isSelfReturnedSeed(pattern, input)) {
+                if (isSelfReturnedSeed(pattern, input) && input.reusableStockSource() == null) {
                     required = Math.max(required, input.amount());
                 }
             }
@@ -982,12 +1046,12 @@ public final class CraftPlannerV2<K> {
 
     // ---- trail-logged mutation helpers -----------------------------------------------------------
 
-    private long get(Map<K, Long> m, K k) {
+    private static <T> long get(Map<T, Long> m, T k) {
         Long v = m.get(k);
         return v == null ? 0L : v;
     }
 
-    private void put(Map<K, Long> m, K k, long newVal) {
+    private <T> void put(Map<T, Long> m, T k, long newVal) {
         Long old = m.get(k);
         trail.push(() -> {
             if (old == null) {
@@ -1003,7 +1067,7 @@ public final class CraftPlannerV2<K> {
         }
     }
 
-    private void bump(Map<K, Long> m, K k, long delta) {
+    private <T> void bump(Map<T, Long> m, T k, long delta) {
         if (delta == 0) {
             return;
         }

@@ -38,6 +38,7 @@ import com.moakiee.thunderbolt.core.planner.CraftOutput;
 import com.moakiee.thunderbolt.core.planner.CraftPattern;
 import com.moakiee.thunderbolt.core.planner.CraftPlan;
 import com.moakiee.thunderbolt.core.planner.CraftPlannerV2;
+import com.moakiee.thunderbolt.core.planner.ReusableStockUsageKey;
 import com.moakiee.thunderbolt.core.planner.DurabilityChain;
 import com.moakiee.thunderbolt.core.planner.Sat;
 import com.moakiee.thunderbolt.ae2.timewheel.ReusableSeedPattern;
@@ -122,13 +123,25 @@ public final class FastCraftingPlanner {
     }
 
     /** Outcome of an attempt: either declined (run AE2) or handled (use {@link #plan}, may be null). */
-    public record FastAttempt(boolean handled, @Nullable CraftingPlan plan) {
+    public record FastAttempt(
+            boolean handled,
+            @Nullable CraftingPlan plan,
+            Map<ReusableStockUsageKey<AEKey>, Long> usedReusableStock) {
+        public FastAttempt {
+            usedReusableStock = Map.copyOf(usedReusableStock);
+        }
+
         static FastAttempt decline() {
-            return new FastAttempt(false, null);
+            return new FastAttempt(false, null, Map.of());
         }
 
         static FastAttempt handled(@Nullable CraftingPlan plan) {
-            return new FastAttempt(true, plan);
+            return new FastAttempt(true, plan, Map.of());
+        }
+
+        static FastAttempt handled(
+                CraftingPlan plan, Map<ReusableStockUsageKey<AEKey>, Long> usedReusableStock) {
+            return new FastAttempt(true, plan, usedReusableStock);
         }
     }
 
@@ -180,8 +193,10 @@ public final class FastCraftingPlanner {
         // Emittable shortfalls are supplied by emitters, not crafted, so they don't make a plan
         // infeasible — only a non-emittable shortfall does.
         if (plan.feasible() || noNonEmittableMissing(plan, emittable)) {
-            return FastAttempt.handled(toAe2Plan(output, amount, plan, multi, false, durability,
-                    patternSources, emittable, snapshot, reservedStock));
+            return FastAttempt.handled(
+                    toAe2Plan(output, amount, plan, multi, false, durability,
+                            patternSources, emittable, snapshot, reservedStock),
+                    plan.usedReusableStock());
         }
         // Infeasible at this amount. Best-effort policy (Policy A): we never fall back to AE2's
         // exhaustive simulator for performance — that is the slow path this engine exists to avoid.
@@ -192,8 +207,10 @@ public final class FastCraftingPlanner {
         if (!simulate) {
             return FastAttempt.handled(null); // this amount can't be made within our bounded search
         }
-        return FastAttempt.handled(toAe2Plan(output, amount, plan, multi, true, durability,
-                patternSources, emittable, snapshot, reservedStock)); // partial + missing
+        return FastAttempt.handled(
+                toAe2Plan(output, amount, plan, multi, true, durability,
+                        patternSources, emittable, snapshot, reservedStock),
+                plan.usedReusableStock()); // partial + missing
     }
 
     private static boolean noNonEmittableMissing(CraftPlan<AEKey> plan, Set<AEKey> emittable) {
@@ -226,11 +243,6 @@ public final class FastCraftingPlanner {
         // Memoized "how much is already in the network" per key (SIMULATE probe), used to rank fuzzy
         // substitutes most-available-first so the bounded keep-best-32 picks the cheapest routes.
         Map<AEKey, Long> availability = new HashMap<>();
-        // Host-owned reusable seeds are not ordinary ME inventory. They are exposed only by a
-        // contracted pattern that uses them, then atomically substituted by the owning CPU at job
-        // submission. Keep the largest snapshot per key so multiple patterns from the same host do
-        // not duplicate one physical seed in the planning graph.
-        Map<AEKey, Long> reusableSeedStock = new HashMap<>();
         Map<AEKey, Long> selfSeedNetworkStock = new HashMap<>();
         // Unit-system bookkeeping. A durability chain prices its links in USES (carrier pool); every
         // other node is priced in whole ITEMS. The same physical stock must never be counted under
@@ -313,14 +325,11 @@ public final class FastCraftingPlanner {
                 }
 
                 if (details instanceof ReusableSeedPattern seeded) {
+                    var source = seeded.reusableStockSource();
                     for (var entry : seeded.availableReusableSeedSnapshot().entrySet()) {
                         if (entry.getKey() == null || entry.getValue() == null || entry.getValue() <= 0) continue;
-                        long previous = reusableSeedStock.getOrDefault(entry.getKey(), 0L);
-                        long updated = Math.max(previous, entry.getValue());
-                        if (updated > previous) {
-                            builder.stock(entry.getKey(), updated - previous);
-                            reusableSeedStock.put(entry.getKey(), updated);
-                        }
+                        builder.reusableStock(
+                                source.storageScope(), entry.getKey(), entry.getValue());
                     }
                     // AE2 intentionally ignores pre-existing stock of the requested output. When a
                     // contracted gain loop uses that same key as its catalyst, take a second,
@@ -388,7 +397,14 @@ public final class FastCraftingPlanner {
                         } else if (remaining.equals(inputKey)) {
                             // Returned unchanged: a true catalyst / non-degrading container. One seed
                             // serves the whole batch (AE2's limitQty), modelled as a returned input.
-                            opts.add(CraftInput.returned(inputKey, template.amount()));
+                            if (details instanceof ReusableSeedPattern seeded
+                                    && seeded.totalReusableSeedRequirements()
+                                            .getOrDefault(inputKey, 0L) > 0) {
+                                opts.add(CraftInput.returnedFrom(
+                                        inputKey, template.amount(), seeded.reusableStockSource()));
+                            } else {
+                                opts.add(CraftInput.returned(inputKey, template.amount()));
+                            }
                         } else if (sameItem(inputKey, remaining)) {
                             // Same item, lower durability, but durabilityChain declined it (chain longer
                             // than the cyclic budget). Report missing rather than decline: drop the option.
@@ -777,7 +793,8 @@ public final class FastCraftingPlanner {
 
     private static CraftInput<AEKey> scaleInput(CraftInput<AEKey> input, long units) {
         return new CraftInput<>(
-                input.key(), Sat.mul(input.amount(), units), input.returned(), input.uses(), input.remainder());
+                input.key(), Sat.mul(input.amount(), units), input.returned(), input.uses(),
+                input.remainder(), input.reusableStockSource());
     }
 
     private static long immediatelySupportedFirings(

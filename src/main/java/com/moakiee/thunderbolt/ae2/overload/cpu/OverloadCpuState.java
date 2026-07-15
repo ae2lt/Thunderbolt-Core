@@ -214,6 +214,35 @@ public final class OverloadCpuState {
         return claimedAmount > 0 ? new OverloadClaimResult(claimedAmount, claims) : OverloadClaimResult.EMPTY;
     }
 
+    /** Commits an already-limited preview without consuming any unaccepted requester tail. */
+    public OverloadClaimResult commitPreview(OverloadClaimResult preview) {
+        Objects.requireNonNull(preview, "preview");
+        if (!preview.claimedAnything()) return OverloadClaimResult.EMPTY;
+
+        long total = 0L;
+        var committed = new ArrayList<PendingOverloadClaim>(preview.claims().size());
+        for (var requested : preview.claims()) {
+            var pending = pendingByKey.get(requested.key());
+            if (pending == null) continue;
+            long amount = Math.min(requested.claimedAmount(), pending.remainingAmount());
+            if (amount <= 0) continue;
+            long reusable = pending.claimReusableSeed(
+                    Math.min(amount, requested.reusableSeedAmount()), true);
+            pending.claim(amount);
+            committed.add(new PendingOverloadClaim(
+                    pending.key(),
+                    amount,
+                    pending.routesToRequester(),
+                    pending.exactExpectedKey(),
+                    reusable,
+                    pending.reusableSeedGroupId(),
+                    pending.sharedReusableSeedPool()));
+            total = addSaturated(total, amount);
+            if (pending.isSatisfied()) removeSatisfied(pending);
+        }
+        return total > 0 ? new OverloadClaimResult(total, committed) : OverloadClaimResult.EMPTY;
+    }
+
     public long getRemainingForItem(ResourceLocation itemId) {
         Objects.requireNonNull(itemId, "itemId");
         var keys = pendingByItemId.get(itemId);

@@ -4,6 +4,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.UUID;
 
@@ -17,6 +18,7 @@ import appeng.crafting.CraftingPlan;
 import com.moakiee.thunderbolt.ae2.timewheel.TimeWheelCraftingCpuPoolHost;
 import com.moakiee.thunderbolt.ae2.timewheel.ReusableSeedPattern;
 import com.moakiee.thunderbolt.ae2.timewheel.TimeWheelPoolRestrictedPattern;
+import com.moakiee.thunderbolt.core.planner.ReusableStockUsageKey;
 
 /**
  * A closed-loop plan produced from an AE2 {@link CraftingPlan} and restricted to one compatible
@@ -26,7 +28,8 @@ public record LoopCraftingPlan(
         CraftingPlan delegate,
         List<TimeWheelPoolRestrictedPattern> restrictions,
         Map<AEKey, Long> totalReusableSeeds,
-        Map<AEKey, Long> hostReusableSeeds) implements ICraftingPlan {
+        Map<AEKey, Long> hostReusableSeeds,
+        List<HostReusableSeedAllocation> hostReusableSeedAllocations) implements ICraftingPlan {
 
     public LoopCraftingPlan {
         if (delegate == null) {
@@ -35,6 +38,7 @@ public record LoopCraftingPlan(
         restrictions = List.copyOf(restrictions);
         totalReusableSeeds = Map.copyOf(totalReusableSeeds);
         hostReusableSeeds = Map.copyOf(hostReusableSeeds);
+        hostReusableSeedAllocations = List.copyOf(hostReusableSeedAllocations);
         if (restrictions.isEmpty()) {
             throw new IllegalArgumentException("loop plan must have at least one restriction");
         }
@@ -42,30 +46,53 @@ public record LoopCraftingPlan(
 
     /** Wraps an AE2 plan only when it contains a time-wheel-restricted pattern. */
     public static ICraftingPlan wrapIfNeeded(ICraftingPlan plan) {
+        return wrapIfNeeded(plan, null);
+    }
+
+    /** Wraps a fast plan and carries the exact host-private stock actually borrowed by the planner. */
+    public static ICraftingPlan wrapIfNeeded(
+            ICraftingPlan plan,
+            Map<ReusableStockUsageKey<AEKey>, Long> usedReusableStock) {
         if (!(plan instanceof CraftingPlan craftingPlan)) {
             return plan;
         }
         var restrictions = new ArrayList<TimeWheelPoolRestrictedPattern>();
-        var totalSeeds = new LinkedHashMap<AEKey, Long>();
-        var availableSeedSnapshot = new LinkedHashMap<AEKey, Long>();
+        var reusablePatterns = new ArrayList<ReusableSeedPattern>();
         for (var details : craftingPlan.patternTimes().keySet()) {
             if (details instanceof TimeWheelPoolRestrictedPattern restricted) {
                 restrictions.add(restricted);
             }
             if (details instanceof ReusableSeedPattern seeded) {
-                mergePositiveSum(totalSeeds, seeded.totalReusableSeedRequirements());
-                for (var entry : seeded.availableReusableSeedSnapshot().entrySet()) {
-                    if (entry.getKey() != null && positive(entry.getValue()) > 0) {
-                        availableSeedSnapshot.merge(entry.getKey(), entry.getValue(), Math::max);
+                reusablePatterns.add(seeded);
+            }
+        }
+        var totalSeeds = aggregateTotalSeeds(reusablePatterns);
+        var hostSeeds = new LinkedHashMap<AEKey, Long>();
+        var hostAllocations = new ArrayList<HostReusableSeedAllocation>();
+        if (usedReusableStock != null) {
+            for (var entry : usedReusableStock.entrySet()) {
+                if (entry.getKey() != null && entry.getValue() != null && entry.getValue() > 0) {
+                    var owner = reusableStockOwner(reusablePatterns, entry.getKey());
+                    if (owner == null) {
+                        throw new IllegalStateException(
+                                "private reusable-stock usage has no owning loop pattern");
                     }
+                    hostSeeds.merge(
+                            entry.getKey().key(), entry.getValue(), LoopCraftingPlan::saturatingAdd);
+                    hostAllocations.add(new HostReusableSeedAllocation(
+                            entry.getKey().storageScope(),
+                            entry.getKey().poolScope(),
+                            entry.getKey().key(),
+                            entry.getValue(),
+                            owner.reusableSeedGroupId(),
+                            owner.hasSingleSeedInputPerMember()));
                 }
             }
         }
-        var hostSeeds = new LinkedHashMap<AEKey, Long>();
-        for (var entry : totalSeeds.entrySet()) {
-            long amount = Math.min(entry.getValue(), availableSeedSnapshot.getOrDefault(entry.getKey(), 0L));
-            if (amount > 0) {
-                hostSeeds.put(entry.getKey(), amount);
+        for (var entry : hostSeeds.entrySet()) {
+            if (entry.getValue() > totalSeeds.getOrDefault(entry.getKey(), 0L)) {
+                throw new IllegalStateException(
+                        "private reusable-stock usage exceeds the loop seed requirement");
             }
         }
         return restrictions.isEmpty()
@@ -74,7 +101,8 @@ public record LoopCraftingPlan(
                         craftingPlan,
                         restrictions,
                         totalSeeds,
-                        hostSeeds);
+                        hostSeeds,
+                        hostAllocations);
     }
 
     public boolean canRunOn(TimeWheelCraftingCpuPoolHost host) {
@@ -86,6 +114,36 @@ public record LoopCraftingPlan(
         return true;
     }
 
+    public boolean acceptsReusableSeedVariant(AEKey planned, AEKey actual) {
+        if (planned == null || actual == null) return false;
+        for (var details : delegate.patternTimes().keySet()) {
+            if (details instanceof ReusableSeedPattern seeded
+                    && seeded.totalReusableSeedRequirements().getOrDefault(planned, 0L) > 0
+                    && seeded.acceptsReusableSeedVariant(planned, actual)) {
+                return true;
+            }
+        }
+        return planned.equals(actual);
+    }
+
+    /** Variant matching narrowed to the exact logical pool that borrowed this host seed. */
+    public boolean acceptsReusableSeedVariant(
+            HostReusableSeedAllocation allocation, AEKey actual) {
+        if (allocation == null || actual == null) return false;
+        for (var details : delegate.patternTimes().keySet()) {
+            if (!(details instanceof ReusableSeedPattern seeded)) continue;
+            var source = seeded.reusableStockSource();
+            if (allocation.storageScope().equals(source.storageScope())
+                    && allocation.poolScope().equals(source.poolScope())
+                    && seeded.totalReusableSeedRequirements()
+                            .getOrDefault(allocation.plannedKey(), 0L) > 0
+                    && seeded.acceptsReusableSeedVariant(allocation.plannedKey(), actual)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     /** Reusable-seed requirements kept separate by contracted cycle. */
     public Map<UUID, Map<AEKey, Long>> reusableSeedGroups() {
         var groups = new LinkedHashMap<UUID, Map<AEKey, Long>>();
@@ -94,7 +152,7 @@ public record LoopCraftingPlan(
             groups.merge(
                     seeded.reusableSeedGroupId(),
                     positiveCopy(seeded.totalReusableSeedRequirements()),
-                    LoopCraftingPlan::mergePositiveCopies);
+                    LoopCraftingPlan::mergePositiveMaxCopies);
         }
         return Map.copyOf(groups);
     }
@@ -142,11 +200,66 @@ public record LoopCraftingPlan(
         return Map.copyOf(result);
     }
 
-    private static Map<AEKey, Long> mergePositiveCopies(
+    private static Map<AEKey, Long> mergePositiveMaxCopies(
             Map<AEKey, Long> left, Map<AEKey, Long> right) {
         var result = new LinkedHashMap<AEKey, Long>(left);
-        mergePositiveSum(result, right);
+        for (var entry : right.entrySet()) {
+            if (entry.getKey() != null && positive(entry.getValue()) > 0) {
+                result.merge(entry.getKey(), entry.getValue(), Math::max);
+            }
+        }
         return Map.copyOf(result);
+    }
+
+    private static Map<AEKey, Long> aggregateTotalSeeds(
+            List<ReusableSeedPattern> patterns) {
+        var sharedByStorage = new LinkedHashMap<Object, Map<AEKey, Long>>();
+        var total = new LinkedHashMap<AEKey, Long>();
+        for (var seeded : patterns) {
+            var requirements = positiveCopy(seeded.totalReusableSeedRequirements());
+            if (seeded.hasSingleSeedInputPerMember()) {
+                sharedByStorage.merge(
+                        seeded.reusableSeedStorageScope(), requirements,
+                        LoopCraftingPlan::mergePositiveMaxCopies);
+            } else {
+                mergePositiveSum(total, requirements);
+            }
+        }
+        for (var shared : sharedByStorage.values()) {
+            mergePositiveSum(total, shared);
+        }
+        return Map.copyOf(total);
+    }
+
+    private static ReusableSeedPattern reusableStockOwner(
+            List<ReusableSeedPattern> patterns,
+            ReusableStockUsageKey<AEKey> usage) {
+        for (var seeded : patterns) {
+            var source = seeded.reusableStockSource();
+            if (usage.storageScope().equals(source.storageScope())
+                    && usage.poolScope().equals(source.poolScope())
+                    && seeded.totalReusableSeedRequirements()
+                            .getOrDefault(usage.key(), 0L) > 0) {
+                return seeded;
+            }
+        }
+        return null;
+    }
+
+    public record HostReusableSeedAllocation(
+            Object storageScope,
+            Object poolScope,
+            AEKey plannedKey,
+            long amount,
+            UUID reusableSeedGroupId,
+            boolean sharedPool) {
+        public HostReusableSeedAllocation {
+            Objects.requireNonNull(storageScope, "storageScope");
+            Objects.requireNonNull(poolScope, "poolScope");
+            Objects.requireNonNull(plannedKey, "plannedKey");
+            Objects.requireNonNull(reusableSeedGroupId, "reusableSeedGroupId");
+            if (amount <= 0) throw new IllegalArgumentException("amount must be > 0");
+        }
     }
 
     private static long positive(Long value) {
@@ -179,12 +292,7 @@ public record LoopCraftingPlan(
 
     @Override
     public KeyCounter usedItems() {
-        var result = copyCounter(delegate.usedItems());
-        for (var entry : hostReusableSeeds.entrySet()) {
-            long planned = result.get(entry.getKey());
-            result.remove(entry.getKey(), Math.min(planned, entry.getValue()));
-        }
-        return result;
+        return delegate.usedItems();
     }
 
     @Override
@@ -202,11 +310,4 @@ public record LoopCraftingPlan(
         return delegate.patternTimes();
     }
 
-    private static KeyCounter copyCounter(KeyCounter source) {
-        var result = new KeyCounter();
-        for (var entry : source) {
-            result.add(entry.getKey(), entry.getLongValue());
-        }
-        return result;
-    }
 }

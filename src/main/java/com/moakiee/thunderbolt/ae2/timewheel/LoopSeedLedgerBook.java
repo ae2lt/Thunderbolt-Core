@@ -4,6 +4,7 @@ import appeng.api.stacks.AEKey;
 import appeng.api.stacks.GenericStack;
 import appeng.api.stacks.KeyCounter;
 import com.moakiee.thunderbolt.core.planner.Sat;
+import java.math.BigInteger;
 import java.util.AbstractMap;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -39,7 +40,7 @@ final class LoopSeedLedgerBook {
     static final PoolId SHARED_POOL = new PoolId(null);
 
     private final Map<PoolId, Map<AEKey, Long>> ledgers = new HashMap<>();
-    private final KeyCounter totalReserved = new KeyCounter();
+    private final Map<AEKey, BigInteger> totalReserved = new HashMap<>();
 
     void initialize(
             Map<UUID, Map<AEKey, Long>> groups,
@@ -47,15 +48,23 @@ final class LoopSeedLedgerBook {
         clear();
         if (groups == null || groups.isEmpty()) return;
         var dedicated = dedicatedGroups != null ? dedicatedGroups : Set.<UUID>of();
+        var sharedMaximum = new HashMap<AEKey, Long>();
         for (var group : groups.entrySet()) {
             if (group.getKey() == null || group.getValue() == null) continue;
             var pool = dedicated.contains(group.getKey())
                     ? PoolId.dedicated(group.getKey()) : SHARED_POOL;
             for (var seed : group.getValue().entrySet()) {
                 if (seed.getKey() != null && seed.getValue() != null && seed.getValue() > 0) {
-                    adjust(pool, seed.getKey(), seed.getValue());
+                    if (pool.isShared()) {
+                        sharedMaximum.merge(seed.getKey(), seed.getValue(), Math::max);
+                    } else {
+                        adjust(pool, seed.getKey(), seed.getValue());
+                    }
                 }
             }
+        }
+        for (var seed : sharedMaximum.entrySet()) {
+            adjust(SHARED_POOL, seed.getKey(), seed.getValue());
         }
     }
 
@@ -78,7 +87,7 @@ final class LoopSeedLedgerBook {
             @Override
             public Long get(Object key) {
                 if (!(key instanceof AEKey aeKey)) return null;
-                long reserved = totalReserved.get(aeKey);
+                long reserved = totalReserved(aeKey);
                 if (reserved <= 0) return null;
                 reserved = ReusableSeedReservation.reservedForTask(
                         reserved,
@@ -95,8 +104,8 @@ final class LoopSeedLedgerBook {
             @Override
             public boolean isEmpty() {
                 if (totalReserved.isEmpty()) return true;
-                for (var entry : totalReserved) {
-                    if (get(entry.getKey()) != null) return false;
+                for (var key : totalReserved.keySet()) {
+                    if (get(key) != null) return false;
                 }
                 return true;
             }
@@ -104,10 +113,10 @@ final class LoopSeedLedgerBook {
             @Override
             public Set<Entry<AEKey, Long>> entrySet() {
                 var entries = new LinkedHashSet<Entry<AEKey, Long>>();
-                for (var entry : totalReserved) {
-                    var value = get(entry.getKey());
+                for (var key : totalReserved.keySet()) {
+                    var value = get(key);
                     if (value != null) {
-                        entries.add(Map.entry(entry.getKey(), value));
+                        entries.add(Map.entry(key, value));
                     }
                 }
                 return Set.copyOf(entries);
@@ -159,6 +168,28 @@ final class LoopSeedLedgerBook {
                 || expected.equals(actual)) return;
         adjust(pool, expected, -amount);
         adjust(pool, actual, amount);
+    }
+
+    /** Rekeys positive initial reservations across pools after a host returns concrete fuzzy variants. */
+    void rekeyAvailable(AEKey expected, AEKey actual, long amount) {
+        if (expected == null || actual == null || expected.equals(actual) || amount <= 0) return;
+        long remaining = amount;
+        for (var pool : List.copyOf(ledgers.keySet())) {
+            long available = Math.max(0L, balance(pool, expected));
+            long moved = Math.min(remaining, available);
+            if (moved <= 0) continue;
+            rekeyAvailable(pool, expected, actual, moved);
+            remaining -= moved;
+            if (remaining <= 0) break;
+        }
+    }
+
+    /** Rekeys only the logical pool that physically borrowed this host seed. */
+    void rekeyAvailable(PoolId pool, AEKey expected, AEKey actual, long amount) {
+        if (pool == null || expected == null || actual == null
+                || expected.equals(actual) || amount <= 0) return;
+        long moved = Math.min(amount, Math.max(0L, balance(pool, expected)));
+        if (moved > 0) rekey(pool, expected, actual, moved);
     }
 
     void clear() {
@@ -240,14 +271,18 @@ final class LoopSeedLedgerBook {
     }
 
     long totalReserved(AEKey key) {
-        return totalReserved.get(key);
+        var value = totalReserved.get(key);
+        if (value == null || value.signum() <= 0) return 0L;
+        return value.compareTo(BigInteger.valueOf(Long.MAX_VALUE)) >= 0
+                ? Long.MAX_VALUE : value.longValue();
     }
 
     Map<AEKey, Long> positiveSnapshot() {
         var result = new HashMap<AEKey, Long>();
-        for (var entry : totalReserved) {
-            if (entry.getLongValue() > 0) {
-                result.put(entry.getKey(), entry.getLongValue());
+        for (var key : totalReserved.keySet()) {
+            long amount = totalReserved(key);
+            if (amount > 0) {
+                result.put(key, amount);
             }
         }
         return Map.copyOf(result);
@@ -278,11 +313,14 @@ final class LoopSeedLedgerBook {
 
         long oldPositive = Math.max(0L, oldValue);
         long newPositive = Math.max(0L, newValue);
+        var exact = totalReserved.getOrDefault(key, BigInteger.ZERO);
         if (newPositive > oldPositive) {
-            totalReserved.add(key, newPositive - oldPositive);
+            exact = exact.add(BigInteger.valueOf(newPositive - oldPositive));
         } else if (oldPositive > newPositive) {
-            totalReserved.remove(key, oldPositive - newPositive);
+            exact = exact.subtract(BigInteger.valueOf(oldPositive - newPositive));
         }
+        if (exact.signum() <= 0) totalReserved.remove(key);
+        else totalReserved.put(key, exact);
     }
 
     private static void writePool(CompoundTag tag, PoolId pool) {

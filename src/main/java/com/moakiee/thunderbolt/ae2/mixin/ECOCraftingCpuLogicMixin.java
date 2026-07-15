@@ -144,10 +144,25 @@ public abstract class ECOCraftingCpuLogicMixin {
             return;
         }
 
-        var claims = OverloadCpuStateManager.INSTANCE.claim(this, what, remainder, type);
-        if (!claims.claimedAnything()) {
+        var preview = OverloadCpuStateManager.INSTANCE.claim(
+                this, what, remainder, Actionable.SIMULATE);
+        if (!preview.claimedAnything()) {
             return;
         }
+
+        var job = ae2lt$getJob();
+        if (job == null) return;
+        CraftingLink link = ((ExecutingCraftingJobAccessor) job).getLink();
+        long requesterAccepted = preview.claimedForRequester();
+        if (requesterAccepted > 0) {
+            requesterAccepted = link != null
+                    ? link.insert(what, requesterAccepted, type) : 0L;
+        }
+        var claims = preview.limitRequester(requesterAccepted);
+        if (type == Actionable.MODULATE) {
+            claims = OverloadCpuStateManager.INSTANCE.commitPreview(this, claims);
+        }
+        if (!claims.claimedAnything()) return;
 
         if (type == Actionable.MODULATE) {
             ae2lt$deductClaimedWaitingFor(claims);
@@ -275,8 +290,6 @@ public abstract class ECOCraftingCpuLogicMixin {
 
         ae2lt$decrementJobItems(job, claimed, incoming.getType());
         var jobAccessor = (ExecutingCraftingJobAccessor) job;
-        CraftingLink link = jobAccessor.getLink();
-        long inserted = link != null ? link.insert(incoming, claimed, Actionable.MODULATE) : 0;
         ae2lt$invokePostChange(incoming);
 
         long remaining = Math.max(0L, jobAccessor.getRemainingAmount() - claimed);
@@ -288,7 +301,7 @@ public abstract class ECOCraftingCpuLogicMixin {
         // ECO has no updateOutput hook (Crafting Monitor unsupported), so
         // partial-progress final-output stack is intentionally not pushed.
 
-        return inserted;
+        return claimed;
     }
 
     @Unique

@@ -151,6 +151,83 @@ class CraftPlannerV2Test {
         assertEquals(400L, missingOne.grossDemand().get("material"));
     }
 
+    @Test
+    void hostReusableStockCannotLeakIntoOrdinarySiblingDemand() {
+        var source = new ReusableStockSource("host", "shared-loop-pool");
+        CraftGraph<String> graph = CraftGraph.<String>builder()
+                .pattern("result", 1, List.of(
+                        CraftInput.of("loop-output", 1), CraftInput.of("ordinary-output", 1)))
+                .pattern("loop-output", 1, List.of(CraftInput.returnedFrom("seed", 1, source)))
+                .pattern("ordinary-output", 1, List.of(CraftInput.of("seed", 1)))
+                .reusableStock("host", "seed", 1)
+                .build();
+
+        CraftPlan<String> plan = CraftPlannerV2.plan(graph, "result", 1);
+
+        assertFalse(plan.feasible(), "private seed must not satisfy an ordinary recipe");
+        assertEquals(1L, plan.missing().get("seed"));
+        assertEquals(1L, plan.usedReusableStock().get(
+                new ReusableStockUsageKey<>("host", "shared-loop-pool", "seed")));
+        assertNull(plan.usedStock().get("seed"));
+    }
+
+    @Test
+    void sharedLoopPoolReusesOnePhysicalHostSeedAcrossPatterns() {
+        var source = new ReusableStockSource("host", "shared-loop-pool");
+        CraftGraph<String> graph = CraftGraph.<String>builder()
+                .pattern("result", 1, List.of(CraftInput.of("left", 1), CraftInput.of("right", 1)))
+                .pattern("left", 1, List.of(CraftInput.returnedFrom("seed", 1, source)))
+                .pattern("right", 1, List.of(CraftInput.returnedFrom("seed", 1, source)))
+                .reusableStock("host", "seed", 1)
+                .build();
+
+        CraftPlan<String> plan = CraftPlannerV2.plan(graph, "result", 1);
+
+        assertTrue(plan.feasible());
+        assertEquals(1L, plan.usedReusableStock().get(
+                new ReusableStockUsageKey<>("host", "shared-loop-pool", "seed")));
+        assertTrue(plan.missing().isEmpty());
+    }
+
+    @Test
+    void dedicatedLoopPoolsCompeteForTheSamePhysicalHostSeed() {
+        var leftPool = new ReusableStockSource("host", "left-loop");
+        var rightPool = new ReusableStockSource("host", "right-loop");
+        CraftGraph<String> graph = CraftGraph.<String>builder()
+                .pattern("result", 1, List.of(CraftInput.of("left", 1), CraftInput.of("right", 1)))
+                .pattern("left", 1, List.of(CraftInput.returnedFrom("seed", 1, leftPool)))
+                .pattern("right", 1, List.of(CraftInput.returnedFrom("seed", 1, rightPool)))
+                .reusableStock("host", "seed", 1)
+                .build();
+
+        CraftPlan<String> plan = CraftPlannerV2.plan(graph, "result", 1);
+
+        assertFalse(plan.feasible(), "dedicated pools must not borrow each other's phase state");
+        assertEquals(1L, plan.missing().get("seed"));
+        assertEquals(1L, plan.usedReusableStock().values().stream()
+                .mapToLong(Long::longValue).sum());
+    }
+
+    @Test
+    void dedicatedHostBorrowRetainsItsLogicalPoolIdentity() {
+        var leftPool = new ReusableStockSource("host", "left-loop");
+        var rightPool = new ReusableStockSource("host", "right-loop");
+        CraftGraph<String> graph = CraftGraph.<String>builder()
+                .pattern("result", 1, List.of(CraftInput.of("left", 1), CraftInput.of("right", 1)))
+                .pattern("left", 1, List.of(CraftInput.returnedFrom("seed", 1, leftPool)))
+                .pattern("right", 1, List.of(CraftInput.returnedFrom("seed", 1, rightPool)))
+                .reusableStock("host", "seed", 2)
+                .build();
+
+        CraftPlan<String> plan = CraftPlannerV2.plan(graph, "result", 1);
+
+        assertTrue(plan.feasible());
+        assertEquals(1L, plan.usedReusableStock().get(
+                new ReusableStockUsageKey<>("host", "left-loop", "seed")));
+        assertEquals(1L, plan.usedReusableStock().get(
+                new ReusableStockUsageKey<>("host", "right-loop", "seed")));
+    }
+
     /**
      * Durability tool {@code 1·tool(4) + 1·B → 1·C + tool(3)}: the degradation chain is solved once
      * and reduced to the closed form {@code tools = ceil(times / uses)} — 100 crafts need ceil(100/4)
