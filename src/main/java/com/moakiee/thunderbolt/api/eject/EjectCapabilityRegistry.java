@@ -163,6 +163,11 @@ public final class EjectCapabilityRegistry {
 
     public static List<DimensionPos> unregisterAll(BlockEntity host, boolean persist) {
         var hostLevel = host.getLevel();
+        // Server and client share these statics on an integrated server. Never
+        // let a client-side lifecycle callback remove server registrations.
+        if (hostLevel != null && hostLevel.isClientSide()) {
+            return List.of();
+        }
         ResourceKey<Level> hostDimension = hostLevel != null ? hostLevel.dimension() : null;
         BlockPos hostPos = host.getBlockPos();
         var removed = new ArrayList<DimensionPos>();
@@ -222,9 +227,12 @@ public final class EjectCapabilityRegistry {
             BlockPos hostPos) {
         var referencedHost = entry.getHost();
         if (referencedHost == host) return true;
-        return referencedHost == null
-                && hostDimension != null
-                && entry.hostDimension().equals(hostDimension)
-                && entry.hostPos().equals(hostPos);
+        // Reloading a chunk replaces its block-entity instance. Match its stable
+        // location even while the old weak reference has not yet been cleared.
+        if (hostDimension != null) {
+            return entry.hostDimension().equals(hostDimension)
+                    && entry.hostPos().equals(hostPos);
+        }
+        return false;
     }
 }
