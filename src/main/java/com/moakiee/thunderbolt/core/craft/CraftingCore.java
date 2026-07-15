@@ -182,6 +182,16 @@ public final class CraftingCore implements Sweepable {
         }
     }
 
+    /**
+     * Detaches a persisted engine mirror without delivering or spawning its queued outputs. The
+     * authoritative copy can then be restored into a newly linked host.
+     */
+    public void suspend() {
+        registry.markInactive(this);
+        reset();
+        assemblyCache.clear();
+    }
+
     public void writeTo(CompoundTag tag, HolderLookup.Provider registries) {
         if (threadsInFlight <= 0) return;
 
@@ -212,6 +222,7 @@ public final class CraftingCore implements Sweepable {
     }
 
     public void readFrom(CompoundTag tag, HolderLookup.Provider registries) {
+        registry.markInactive(this);
         reset();
         if (!tag.contains(NBT_CELLS, Tag.TAG_LIST)) return;
 
