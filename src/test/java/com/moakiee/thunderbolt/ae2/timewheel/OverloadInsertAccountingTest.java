@@ -8,6 +8,16 @@ import org.junit.jupiter.api.Test;
 
 class OverloadInsertAccountingTest {
     @Test
+    void strictDemandBeyondTheMirroredExactPendingPrefixIsProtectedFirst() {
+        assertEquals(1L, OverloadInsertAccounting.strictPrefixBeforeExactOverload(
+                2L, 2L, 1L));
+        assertEquals(0L, OverloadInsertAccounting.strictPrefixBeforeExactOverload(
+                2L, 1L, 1L));
+        assertEquals(2L, OverloadInsertAccounting.strictPrefixBeforeExactOverload(
+                2L, Long.MAX_VALUE, 1L));
+    }
+
+    @Test
     void exactOverloadPrefixIsRemovedFromTheOverlappingStrictWaitingMatch() {
         long exactOverload = 5L;
         long remainingOffer = 15L;
@@ -45,4 +55,5 @@ class OverloadInsertAccountingTest {
         assertEquals(Long.MAX_VALUE,
                 OverloadInsertAccounting.strictProbeAmount(Long.MAX_VALUE - 2L, 5L));
     }
+
 }

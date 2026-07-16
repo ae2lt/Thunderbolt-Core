@@ -1,7 +1,12 @@
 package com.moakiee.thunderbolt.ae2.overload.cpu;
 
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Objects;
 import java.util.UUID;
+import java.util.function.Predicate;
 import org.jetbrains.annotations.Nullable;
 
 import net.minecraft.resources.ResourceLocation;
@@ -22,11 +27,9 @@ public final class PendingOverloadOutput {
     private final AEKey exactExpectedKey;
     private final boolean routesToRequester;
     private final long registeredOrder;
-    @Nullable
-    private UUID reusableSeedGroupId;
+    private final LinkedHashMap<UUID, Long> remainingConsumerCredits = new LinkedHashMap<>();
     private boolean sharedReusableSeedPool;
     private long remainingAmount;
-    private long remainingReusableSeedAmount;
 
     public PendingOverloadOutput(
             PendingOverloadOutputKey key,
@@ -55,6 +58,24 @@ public final class PendingOverloadOutput {
             boolean sharedReusableSeedPool,
             long remainingReusableSeedAmount
     ) {
+        this(key, owner, patternReference, itemId, exactExpectedKey, remainingAmount,
+                routesToRequester, registeredOrder,
+                legacyCredits(remainingReusableSeedAmount, reusableSeedGroupId),
+                sharedReusableSeedPool);
+    }
+
+    public PendingOverloadOutput(
+            PendingOverloadOutputKey key,
+            OverloadCpuOwner owner,
+            OverloadPatternReference patternReference,
+            ResourceLocation itemId,
+            AEKey exactExpectedKey,
+            long remainingAmount,
+            boolean routesToRequester,
+            long registeredOrder,
+            List<OverloadConsumerCredit> consumerCredits,
+            boolean sharedReusableSeedPool
+    ) {
         this.key = Objects.requireNonNull(key, "key");
         this.owner = Objects.requireNonNull(owner, "owner");
         this.patternReference = Objects.requireNonNull(patternReference, "patternReference");
@@ -66,17 +87,14 @@ public final class PendingOverloadOutput {
         this.remainingAmount = remainingAmount;
         this.routesToRequester = routesToRequester;
         this.registeredOrder = registeredOrder;
-        if (remainingReusableSeedAmount < 0 || remainingReusableSeedAmount > remainingAmount) {
-            throw new IllegalArgumentException("reusable seed amount is outside pending output");
+        var normalizedCredits = OverloadConsumerCredit.normalize(consumerCredits);
+        if (!OverloadConsumerCredit.fitsWithin(normalizedCredits, remainingAmount)) {
+            throw new IllegalArgumentException("consumer credits are outside pending output");
         }
-        if (remainingReusableSeedAmount > 0) {
-            this.reusableSeedGroupId = Objects.requireNonNull(
-                    reusableSeedGroupId, "reusableSeedGroupId");
-        } else {
-            this.reusableSeedGroupId = reusableSeedGroupId;
+        for (var credit : normalizedCredits) {
+            remainingConsumerCredits.put(credit.consumerId(), credit.amount());
         }
         this.sharedReusableSeedPool = sharedReusableSeedPool;
-        this.remainingReusableSeedAmount = remainingReusableSeedAmount;
     }
 
     public PendingOverloadOutputKey key() {
@@ -115,8 +133,25 @@ public final class PendingOverloadOutput {
         return registeredOrder;
     }
 
-    public long remainingReusableSeedAmount() { return remainingReusableSeedAmount; }
-    public @Nullable UUID reusableSeedGroupId() { return reusableSeedGroupId; }
+    public List<OverloadConsumerCredit> consumerCredits() {
+        return OverloadConsumerCredit.fromAmounts(remainingConsumerCredits);
+    }
+
+    public long remainingReusableSeedAmount() {
+        return OverloadConsumerCredit.total(consumerCredits());
+    }
+
+    /** Output units that are not owned by a reusable-seed consumer. */
+    public long remainingPublicAmount() {
+        return Math.max(0L, remainingAmount - remainingReusableSeedAmount());
+    }
+
+    /** Legacy single-owner view. Returns null when this output has multiple consumers. */
+    public @Nullable UUID reusableSeedGroupId() {
+        return remainingConsumerCredits.size() == 1
+                ? remainingConsumerCredits.keySet().iterator().next() : null;
+    }
+
     public boolean sharedReusableSeedPool() { return sharedReusableSeedPool; }
 
     public void addExpected(long amount) {
@@ -128,18 +163,30 @@ public final class PendingOverloadOutput {
             throw new IllegalArgumentException("amount must be > 0");
         }
         if (reusableSeed != null) {
-            if (reusableSeed.amount() > amount) {
-                throw new IllegalArgumentException("reusable seed exceeds added output");
+            if (!OverloadConsumerCredit.fitsWithin(reusableSeed.consumerCredits(), amount)) {
+                throw new IllegalArgumentException("consumer credits exceed added output");
             }
-            if (reusableSeedGroupId == null) {
-                reusableSeedGroupId = reusableSeed.groupId();
+            boolean hadConsumerCredits = !remainingConsumerCredits.isEmpty();
+            if (hadConsumerCredits
+                    && sharedReusableSeedPool != reusableSeed.sharedPool()) {
+                throw new IllegalArgumentException("overload output changed legacy pool semantics");
+            }
+            var updatedCredits = new LinkedHashMap<>(remainingConsumerCredits);
+            for (var credit : reusableSeed.consumerCredits()) {
+                updatedCredits.merge(
+                        credit.consumerId(), credit.amount(), OverloadConsumerCredit::addSaturated);
+            }
+            long updatedRemaining = addSaturated(remainingAmount, amount);
+            if (!OverloadConsumerCredit.fitsWithin(
+                    OverloadConsumerCredit.fromAmounts(updatedCredits), updatedRemaining)) {
+                throw new IllegalArgumentException(
+                        "consumer credits exceed saturated pending output capacity");
+            }
+            remainingConsumerCredits.clear();
+            remainingConsumerCredits.putAll(updatedCredits);
+            if (!hadConsumerCredits) {
                 sharedReusableSeedPool = reusableSeed.sharedPool();
-            } else if (!reusableSeedGroupId.equals(reusableSeed.groupId())
-                    || sharedReusableSeedPool != reusableSeed.sharedPool()) {
-                throw new IllegalArgumentException("overload seed output changed ledger owner");
             }
-            remainingReusableSeedAmount = addSaturated(
-                    remainingReusableSeedAmount, reusableSeed.amount());
         }
         remainingAmount = addSaturated(remainingAmount, amount);
     }
@@ -154,10 +201,73 @@ public final class PendingOverloadOutput {
         return claimed;
     }
 
+    public List<OverloadConsumerCredit> claimConsumerCredits(long claimedOutput, boolean mutate) {
+        return claimConsumerCredits(claimedOutput, mutate, ignored -> true);
+    }
+
+    /**
+     * Claims only credits whose consumer can accept the concrete returned variant. Disallowed
+     * credits remain pending; they must not be silently re-keyed to an unusable component state.
+     */
+    public List<OverloadConsumerCredit> claimConsumerCredits(
+            long claimedOutput, boolean mutate, Predicate<UUID> acceptsConsumer) {
+        long remaining = Math.max(0L, claimedOutput);
+        if (remaining == 0 || remainingConsumerCredits.isEmpty()) return List.of();
+        Objects.requireNonNull(acceptsConsumer, "acceptsConsumer");
+
+        var claimed = new ArrayList<OverloadConsumerCredit>();
+        var iterator = remainingConsumerCredits.entrySet().iterator();
+        while (iterator.hasNext() && remaining > 0) {
+            var entry = iterator.next();
+            if (!acceptsConsumer.test(entry.getKey())) continue;
+            long amount = Math.min(entry.getValue(), remaining);
+            if (amount <= 0) continue;
+            claimed.add(new OverloadConsumerCredit(entry.getKey(), amount));
+            remaining -= amount;
+            if (mutate) {
+                long left = entry.getValue() - amount;
+                if (left == 0) iterator.remove();
+                else entry.setValue(left);
+            }
+        }
+        return List.copyOf(claimed);
+    }
+
+    public long acceptedConsumerCreditAmount(Predicate<UUID> acceptsConsumer) {
+        Objects.requireNonNull(acceptsConsumer, "acceptsConsumer");
+        long total = 0L;
+        for (var entry : remainingConsumerCredits.entrySet()) {
+            if (acceptsConsumer.test(entry.getKey())) {
+                total = addSaturated(total, entry.getValue());
+            }
+        }
+        return total;
+    }
+
+    /** Claims the exact consumer allocation selected by an earlier simulation preview. */
+    public List<OverloadConsumerCredit> claimConsumerCredits(
+            Collection<OverloadConsumerCredit> requestedCredits, boolean mutate) {
+        var requested = OverloadConsumerCredit.normalize(requestedCredits);
+        if (requested.isEmpty() || remainingConsumerCredits.isEmpty()) return List.of();
+
+        var claimed = new ArrayList<OverloadConsumerCredit>(requested.size());
+        for (var request : requested) {
+            long available = remainingConsumerCredits.getOrDefault(request.consumerId(), 0L);
+            long amount = Math.min(available, request.amount());
+            if (amount <= 0) continue;
+            claimed.add(new OverloadConsumerCredit(request.consumerId(), amount));
+            if (mutate) {
+                long left = available - amount;
+                if (left == 0L) remainingConsumerCredits.remove(request.consumerId());
+                else remainingConsumerCredits.put(request.consumerId(), left);
+            }
+        }
+        return List.copyOf(claimed);
+    }
+
+    /** Legacy total-only claim API. */
     public long claimReusableSeed(long claimedOutput, boolean mutate) {
-        long claimed = Math.min(Math.max(0L, claimedOutput), remainingReusableSeedAmount);
-        if (mutate) remainingReusableSeedAmount -= claimed;
-        return claimed;
+        return OverloadConsumerCredit.total(claimConsumerCredits(claimedOutput, mutate));
     }
 
     public boolean isSatisfied() {
@@ -166,5 +276,15 @@ public final class PendingOverloadOutput {
 
     private static long addSaturated(long left, long right) {
         return left > Long.MAX_VALUE - right ? Long.MAX_VALUE : left + right;
+    }
+
+    private static List<OverloadConsumerCredit> legacyCredits(
+            long amount, @Nullable UUID consumerId) {
+        if (amount < 0) {
+            throw new IllegalArgumentException("remainingReusableSeedAmount must not be negative");
+        }
+        if (amount == 0) return List.of();
+        return List.of(new OverloadConsumerCredit(
+                Objects.requireNonNull(consumerId, "reusableSeedGroupId"), amount));
     }
 }

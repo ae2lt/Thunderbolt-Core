@@ -30,11 +30,13 @@ import appeng.crafting.CraftingLink;
 import appeng.crafting.execution.ExecutingCraftingJob;
 import appeng.crafting.inv.ListCraftingInventory;
 
+import com.moakiee.thunderbolt.ae2.api.crafting.CraftingPatternDelegates;
 import com.moakiee.thunderbolt.ae2.mixin.ElapsedTimeTrackerAccessor;
 import com.moakiee.thunderbolt.ae2.mixin.ExecutingCraftingJobAccessor;
 import com.moakiee.thunderbolt.ae2.util.MixinReflectionSupport;
 import com.moakiee.thunderbolt.ae2.overload.cpu.InsertContext;
 import com.moakiee.thunderbolt.ae2.overload.cpu.OverloadClaimResult;
+import com.moakiee.thunderbolt.ae2.overload.cpu.OverloadCpuInsertSupport;
 import com.moakiee.thunderbolt.ae2.overload.cpu.OverloadCpuStateManager;
 import com.moakiee.thunderbolt.ae2.overload.cpu.OverloadPatternReference;
 import com.moakiee.thunderbolt.ae2.overload.pattern.OverloadedProviderOnlyPatternDetails;
@@ -119,6 +121,8 @@ public abstract class ECOCraftingCpuLogicMixin {
                                                  Actionable mode, Operation<Long> original) {
         long strictMatched = original.call(waitingFor, what, amount, mode);
         if (AE2LT_ECO_AVAILABLE && mode == Actionable.SIMULATE && this.ae2lt$insertContext != null) {
+            strictMatched = OverloadCpuInsertSupport.nativeStrictMatch(
+                    this, what, strictMatched, waitingFor.list.get(what));
             this.ae2lt$insertContext.setStrictMatched(strictMatched);
         }
         return strictMatched;
@@ -131,7 +135,7 @@ public abstract class ECOCraftingCpuLogicMixin {
 
         var ctx = this.ae2lt$insertContext;
         this.ae2lt$insertContext = null;
-        if (ctx == null || ctx.getRequestedAmount() <= 0) {
+        if (ctx == null || what == null || ctx.getRequestedAmount() <= 0) {
             return;
         }
 
@@ -152,13 +156,17 @@ public abstract class ECOCraftingCpuLogicMixin {
 
         var job = ae2lt$getJob();
         if (job == null) return;
-        CraftingLink link = ((ExecutingCraftingJobAccessor) job).getLink();
-        long requesterAccepted = preview.claimedForRequester();
-        if (requesterAccepted > 0) {
+        var jobAccessor = (ExecutingCraftingJobAccessor) job;
+        CraftingLink link = jobAccessor.getLink();
+        long requesterLimit = Math.min(
+                preview.claimedForRequester(),
+                Math.max(0L, jobAccessor.getRemainingAmount()));
+        long requesterAccepted = requesterLimit;
+        if (requesterLimit > 0) {
             requesterAccepted = link != null
-                    ? link.insert(what, requesterAccepted, type) : 0L;
+                    ? link.insert(what, requesterLimit, type) : 0L;
         }
-        var claims = preview.limitRequester(requesterAccepted);
+        var claims = preview.partitionRequester(requesterLimit, requesterAccepted);
         if (type == Actionable.MODULATE) {
             claims = OverloadCpuStateManager.INSTANCE.commitPreview(this, claims);
         }
@@ -189,8 +197,23 @@ public abstract class ECOCraftingCpuLogicMixin {
             return original.call(provider, details, inputHolder);
         }
 
+        var providerDetails = CraftingPatternDelegates.forProviderLookup(details);
+        var overloadDetails = providerDetails instanceof OverloadedProviderOnlyPatternDetails overload
+                ? overload : null;
+        if (overloadDetails == null
+                && OverloadCpuInsertSupport.hasPendingCollisionWithOrdinaryPattern(this, details)) {
+            return false;
+        }
         OverloadPatternReference patternReference = null;
-        if (details instanceof OverloadedProviderOnlyPatternDetails overloadDetails) {
+        if (overloadDetails != null) {
+            var activeJob = ae2lt$getJob();
+            var waitingFor = activeJob != null
+                    ? ((ExecutingCraftingJobAccessor) activeJob).getWaitingFor() : null;
+            if (waitingFor == null
+                    || OverloadCpuInsertSupport.hasStrictCollisionWithOverloadPattern(
+                            this, details, overloadDetails, waitingFor.list)) {
+                return false;
+            }
             patternReference = new OverloadPatternReference(
                     overloadDetails.overloadPatternIdentity(),
                     overloadDetails.overloadPatternDetailsView().sourcePattern());
@@ -204,7 +227,7 @@ public abstract class ECOCraftingCpuLogicMixin {
 
         boolean pushed = original.call(provider, details, inputHolder);
         var job = ae2lt$getJob();
-        if (pushed && details instanceof OverloadedProviderOnlyPatternDetails overloadDetails && job != null) {
+        if (pushed && overloadDetails != null && job != null) {
             var jobAccessor = (ExecutingCraftingJobAccessor) job;
             GenericStack finalOutput = jobAccessor.getFinalOutput();
             AEKey finalOutputKey = finalOutput != null ? finalOutput.what() : null;

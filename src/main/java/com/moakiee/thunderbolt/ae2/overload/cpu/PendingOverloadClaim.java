@@ -1,5 +1,6 @@
 package com.moakiee.thunderbolt.ae2.overload.cpu;
 
+import java.util.List;
 import java.util.Objects;
 import java.util.UUID;
 import org.jetbrains.annotations.Nullable;
@@ -13,9 +14,9 @@ public record PendingOverloadClaim(
         PendingOverloadOutputKey key,
         long claimedAmount,
         boolean routesToRequester,
+        long requesterAmount,
         AEKey exactExpectedKey,
-        long reusableSeedAmount,
-        @Nullable UUID reusableSeedGroupId,
+        List<OverloadConsumerCredit> consumerCredits,
         boolean sharedReusableSeedPool
 ) {
     public PendingOverloadClaim {
@@ -24,11 +25,57 @@ public record PendingOverloadClaim(
         if (claimedAmount <= 0) {
             throw new IllegalArgumentException("claimedAmount must be > 0");
         }
-        if (reusableSeedAmount < 0 || reusableSeedAmount > claimedAmount) {
-            throw new IllegalArgumentException("reusableSeedAmount is outside the claim");
+        consumerCredits = OverloadConsumerCredit.normalize(consumerCredits);
+        if (!OverloadConsumerCredit.fitsWithin(consumerCredits, claimedAmount)) {
+            throw new IllegalArgumentException("consumer credits are outside the claim");
         }
-        if (reusableSeedAmount > 0) {
-            Objects.requireNonNull(reusableSeedGroupId, "reusableSeedGroupId");
+        long maximumRequester = claimedAmount - OverloadConsumerCredit.total(consumerCredits);
+        if (requesterAmount < 0 || requesterAmount > maximumRequester
+                || (!routesToRequester && requesterAmount != 0)) {
+            throw new IllegalArgumentException("requesterAmount is outside the claim");
         }
+    }
+
+    public PendingOverloadClaim(
+            PendingOverloadOutputKey key,
+            long claimedAmount,
+            boolean routesToRequester,
+            AEKey exactExpectedKey,
+            List<OverloadConsumerCredit> consumerCredits,
+            boolean sharedReusableSeedPool) {
+        this(key, claimedAmount, routesToRequester,
+                routesToRequester
+                        ? claimedAmount - OverloadConsumerCredit.total(consumerCredits) : 0L,
+                exactExpectedKey, consumerCredits, sharedReusableSeedPool);
+    }
+
+    /** Legacy single-owner constructor. */
+    public PendingOverloadClaim(
+            PendingOverloadOutputKey key,
+            long claimedAmount,
+            boolean routesToRequester,
+            AEKey exactExpectedKey,
+            long reusableSeedAmount,
+            @Nullable UUID reusableSeedGroupId,
+            boolean sharedReusableSeedPool) {
+        this(key, claimedAmount, routesToRequester, exactExpectedKey,
+                legacyCredits(reusableSeedAmount, reusableSeedGroupId), sharedReusableSeedPool);
+    }
+
+    public long reusableSeedAmount() {
+        return OverloadConsumerCredit.total(consumerCredits);
+    }
+
+    /** Legacy single-owner view. Returns null when this claim has multiple consumers. */
+    public @Nullable UUID reusableSeedGroupId() {
+        return consumerCredits.size() == 1 ? consumerCredits.getFirst().consumerId() : null;
+    }
+
+    private static List<OverloadConsumerCredit> legacyCredits(
+            long amount, @Nullable UUID consumerId) {
+        if (amount < 0) throw new IllegalArgumentException("reusableSeedAmount must not be negative");
+        if (amount == 0) return List.of();
+        return List.of(new OverloadConsumerCredit(
+                Objects.requireNonNull(consumerId, "reusableSeedGroupId"), amount));
     }
 }

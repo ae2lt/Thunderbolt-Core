@@ -5,6 +5,15 @@ final class OverloadInsertAccounting {
     private OverloadInsertAccounting() {
     }
 
+    /** Native exact demand beyond its mirrored ID_ONLY amount is genuine STRICT work. */
+    static long strictPrefixBeforeExactOverload(
+            long offered, long nativeExactWaiting, long exactOverloadWaiting) {
+        long strict = Math.max(
+                0L,
+                Math.max(0L, nativeExactWaiting) - Math.max(0L, exactOverloadWaiting));
+        return Math.min(Math.max(0L, offered), strict);
+    }
+
     /** Restores the original offered amount for the non-mutating waiting-list probe. */
     static long strictProbeAmount(long remaining, long simulatedExactOverload) {
         long normalizedRemaining = Math.max(0L, remaining);
@@ -28,4 +37,5 @@ final class OverloadInsertAccounting {
     static boolean mayClaimOverloadRemainder(long simulatedExactOverload) {
         return simulatedExactOverload <= 0L;
     }
+
 }

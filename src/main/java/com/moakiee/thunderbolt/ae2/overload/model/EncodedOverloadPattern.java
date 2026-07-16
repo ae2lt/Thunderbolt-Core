@@ -1,6 +1,8 @@
 package com.moakiee.thunderbolt.ae2.overload.model;
 
+import java.util.Collections;
 import java.util.Collection;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -91,7 +93,9 @@ public final class EncodedOverloadPattern {
                 throw new IllegalArgumentException("duplicate slot index: " + slot.slotIndex());
             }
         }
-        return Map.copyOf(sorted);
+        // Map.copyOf does not promise iteration order. Slot order is part of the stable overload
+        // identity used by pending CPU output state, so retain the TreeMap order explicitly.
+        return Collections.unmodifiableMap(new LinkedHashMap<>(sorted));
     }
 
     public static final class Builder {

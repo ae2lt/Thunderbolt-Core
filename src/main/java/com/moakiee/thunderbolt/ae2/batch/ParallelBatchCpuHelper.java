@@ -171,9 +171,9 @@ public final class ParallelBatchCpuHelper {
             AEKey remaining = input.getRemainingKey(consumed);
             if (remaining != null) {
                 long copies = shared != null && slot < shared.length && shared[slot] ? 1L : dispatched;
-                long perCopy = possibles[0].amount() > 0
-                        ? saturatingMultiply(possibles[0].amount(), input.getMultiplier())
-                        : input.getMultiplier();
+                // CraftingCpuHelper registers one remainder per completed template operation;
+                // the possible stack's physical amount only affects extraction, not return count.
+                long perCopy = input.getMultiplier();
                 long count = saturatingMultiply(perCopy, copies);
                 job.insertWaitingFor(remaining, count);
                 job.addContainerMaxItems(count, remaining.getType());

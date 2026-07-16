@@ -49,7 +49,8 @@ public final class OverloadPatternDetails implements OverloadedProviderOnlyPatte
 
     @Override
     public String overloadPatternIdentity() {
-        return sourcePattern.itemId() + "|inputs=" + encodedPattern.inputSlots().toString()
+        return sourcePattern.itemId() + "#" + sourcePattern.fingerprint()
+                + "|inputs=" + encodedPattern.inputSlots().toString()
                 + "|outputs=" + encodedPattern.outputSlots().toString();
     }
 

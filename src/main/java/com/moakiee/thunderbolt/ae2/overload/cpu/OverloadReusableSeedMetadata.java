@@ -1,15 +1,41 @@
 package com.moakiee.thunderbolt.ae2.overload.cpu;
 
-import java.util.Objects;
+import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 
-/** Reusable-seed ownership attached to one ID_ONLY overload output slot. */
+/** Consumer ownership attached to one ID_ONLY overload output slot. */
 public record OverloadReusableSeedMetadata(
-        UUID groupId,
-        boolean sharedPool,
-        long amount) {
+        List<OverloadConsumerCredit> consumerCredits,
+        boolean sharedPool) {
     public OverloadReusableSeedMetadata {
-        Objects.requireNonNull(groupId, "groupId");
-        if (amount <= 0) throw new IllegalArgumentException("amount must be positive");
+        consumerCredits = OverloadConsumerCredit.normalize(consumerCredits);
+        if (consumerCredits.isEmpty()) {
+            throw new IllegalArgumentException("consumerCredits must not be empty");
+        }
+    }
+
+    public OverloadReusableSeedMetadata(List<OverloadConsumerCredit> consumerCredits) {
+        this(consumerCredits, false);
+    }
+
+    public OverloadReusableSeedMetadata(Map<UUID, Long> consumerCredits) {
+        this(OverloadConsumerCredit.fromAmounts(consumerCredits), false);
+    }
+
+    /** Legacy single-owner constructor. The old group id is treated as the consumer id. */
+    public OverloadReusableSeedMetadata(UUID groupId, boolean sharedPool, long amount) {
+        this(List.of(new OverloadConsumerCredit(groupId, amount)), sharedPool);
+    }
+
+    public long amount() {
+        return OverloadConsumerCredit.total(consumerCredits);
+    }
+
+    /**
+     * Legacy single-owner view. Multi-consumer metadata intentionally has no single group id.
+     */
+    public UUID groupId() {
+        return consumerCredits.size() == 1 ? consumerCredits.getFirst().consumerId() : null;
     }
 }
