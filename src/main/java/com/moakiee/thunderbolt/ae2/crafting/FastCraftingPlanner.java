@@ -326,10 +326,23 @@ public final class FastCraftingPlanner {
 
                 if (details instanceof ReusableSeedPattern seeded) {
                     var source = seeded.reusableStockSource();
-                    for (var entry : seeded.availableReusableSeedSnapshot().entrySet()) {
+                    var physicalVariants = seeded.availableReusableSeedSnapshot();
+                    for (var entry : physicalVariants.entrySet()) {
                         if (entry.getKey() == null || entry.getValue() == null || entry.getValue() <= 0) continue;
                         builder.reusableStock(
                                 source.storageScope(), entry.getKey(), entry.getValue());
+                    }
+                    for (var requirement : seeded.totalReusableSeedRequirements().entrySet()) {
+                        if (requirement.getKey() == null || requirement.getValue() == null
+                                || requirement.getValue() <= 0) continue;
+                        var acceptedVariants = new ArrayList<AEKey>();
+                        for (var actual : physicalVariants.keySet()) {
+                            if (actual != null
+                                    && seeded.acceptsReusableSeedVariant(requirement.getKey(), actual)) {
+                                acceptedVariants.add(actual);
+                            }
+                        }
+                        builder.reusableStockRoute(source, requirement.getKey(), acceptedVariants);
                     }
                     // AE2 intentionally ignores pre-existing stock of the requested output. When a
                     // contracted gain loop uses that same key as its catalyst, take a second,

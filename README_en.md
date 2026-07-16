@@ -5,7 +5,7 @@ AE2 Lightning Tech.
 
 - Mod id: `thunderbolt`
 - Java namespace: `com.moakiee.thunderbolt`
-- Maven coordinate: `com.moakiee.thunderbolt:thunderbolt:1.0.0`
+- Maven coordinate: `com.moakiee.thunderbolt:thunderbolt:2.0.0`
 
 Build:
 

@@ -104,7 +104,7 @@ public final class EjectRegistrationSavedData extends SavedData {
         return tag;
     }
 
-    private static EjectRegistrationSavedData load(CompoundTag tag, HolderLookup.Provider registries) {
+    static EjectRegistrationSavedData load(CompoundTag tag, HolderLookup.Provider registries) {
         var data = new EjectRegistrationSavedData();
         data.legacyMigrationComplete = tag.getBoolean(TAG_LEGACY_MIGRATION_COMPLETE);
         if (!tag.contains(TAG_ENTRIES, Tag.TAG_LIST)) return data;

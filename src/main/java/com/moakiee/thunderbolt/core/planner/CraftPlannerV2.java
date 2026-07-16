@@ -4,6 +4,7 @@ import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Deque;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.IdentityHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -92,8 +93,14 @@ public final class CraftPlannerV2<K> {
     private final Map<K, Long> bpPool = new HashMap<>();      // byproduct / surplus supply
     private final Map<K, Long> stockLeft = new HashMap<>();   // remaining inventory snapshot
     private final Map<K, Long> usedStock = new HashMap<>();   // drawn from inventory
-    private final Map<ReusableStockKey<K>, Long> reusableStockLeft = new HashMap<>();
+    /** Route-private host borrows that may still be reassigned by the global variant matcher. */
+    private final Map<ReusableStockRouteKey<K>, Long> reusableBorrowedDemand = new HashMap<>();
+    /** Returned non-exact variants, reusable only by the route/consumer that owns them. */
+    private final Map<ReusableStockRouteKey<K>, Long> reusablePrivatePool = new HashMap<>();
+    /** Returned exact variants, safely reusable by every route in the logical shared pool. */
     private final Map<ReusableStockKey<K>, Long> reusablePool = new HashMap<>();
+    /** Exact host allocations already exposed as shared credit; these can no longer be rematched. */
+    private final Map<ReusableStockUsageKey<K>, Long> pinnedExactReusableStock = new HashMap<>();
     private final Map<ReusableStockUsageKey<K>, Long> usedReusableStock = new HashMap<>();
     private final Map<K, Long> missing = new HashMap<>();     // unmet at raw leaves
     private final Map<K, Long> grossDemand = new HashMap<>(); // pre-extraction request totals (bytes)
@@ -185,7 +192,6 @@ public final class CraftPlannerV2<K> {
         for (K x : items) {
             stockLeft.put(x, graph.stock(x));
         }
-        reusableStockLeft.putAll(graph.reusableStock());
         obtain(target, amount);
         boolean feasible = missing.isEmpty();
         CraftPlan<K> fallback = new CraftPlan<>(true, feasible,
@@ -639,7 +645,7 @@ public final class CraftPlannerV2<K> {
             long c;
             if (in.reusableStockSource() != null) {
                 c = Sat.add(
-                        graph.reusableStock(in.reusableStockSource().storageScope(), in.key()),
+                        graph.reusableStock(in.reusableStockSource(), in.key()),
                         cap.getOrDefault(in.key(), 0L));
             } else if (isSelfReturnedSeed(p, in)) {
                 c = graph.stock(in.key());
@@ -858,8 +864,10 @@ public final class CraftPlannerV2<K> {
         for (CraftInput<K> in : r.inputs()) {
             long amt = in.unitsFor(times); // closed form per flavour
             long unmet;
+            ReusableSeedAcquisition reusableAcquisition = null;
             if (in.reusableStockSource() != null) {
-                unmet = obtainReusableSeed(r, in, amt);
+                reusableAcquisition = obtainReusableSeed(r, in, amt);
+                unmet = reusableAcquisition.unmet();
             } else if (isSelfReturnedSeed(r, in)) {
                 long obtained = drawReservedSelfSeed(in.key(), amt);
                 if (obtained < amt) {
@@ -886,10 +894,17 @@ public final class CraftPlannerV2<K> {
                 long returned = amt - unmet;
                 if (returned > 0) {
                     if (in.reusableStockSource() != null) {
-                        bump(reusablePool,
-                                new ReusableStockKey<>(
-                                        in.reusableStockSource().poolScope(), in.key()),
-                                returned);
+                        var source = in.reusableStockSource();
+                        var route = new ReusableStockRouteKey<K>(source, in.key());
+                        if (reusableAcquisition.sharedReturnable() > 0) {
+                            bump(reusablePool,
+                                    new ReusableStockKey<>(source.poolScope(), in.key()),
+                                    reusableAcquisition.sharedReturnable());
+                        }
+                        if (reusableAcquisition.privateReturnable() > 0) {
+                            bump(reusablePrivatePool, route,
+                                    reusableAcquisition.privateReturnable());
+                        }
                     } else {
                         bump(bpPool, in.key(), returned);
                     }
@@ -918,44 +933,194 @@ public final class CraftPlannerV2<K> {
      * state, then borrows from the shared physical host inventory, and finally falls back to normal
      * network stock/crafting. Ordinary recipes can never see either private layer.
      */
-    private long obtainReusableSeed(CraftPattern<K> pattern, CraftInput<K> input, long amount) {
+    private ReusableSeedAcquisition obtainReusableSeed(
+            CraftPattern<K> pattern, CraftInput<K> input, long amount) {
         var source = input.reusableStockSource();
-        if (source == null || amount <= 0) return Math.max(0L, amount);
+        if (source == null || amount <= 0) {
+            return new ReusableSeedAcquisition(Math.max(0L, amount), 0L, 0L);
+        }
 
+        var route = new ReusableStockRouteKey<K>(source, input.key());
+        long fromPrivate = Math.min(amount, get(reusablePrivatePool, route));
+        if (fromPrivate > 0) {
+            put(reusablePrivatePool, route, get(reusablePrivatePool, route) - fromPrivate);
+        }
+
+        long remaining = amount - fromPrivate;
         var poolKey = new ReusableStockKey<K>(source.poolScope(), input.key());
-        long fromPool = Math.min(amount, get(reusablePool, poolKey));
+        long fromPool = Math.min(remaining, get(reusablePool, poolKey));
         if (fromPool > 0) {
             put(reusablePool, poolKey, get(reusablePool, poolKey) - fromPool);
         }
 
-        long obtained = fromPool;
-        long remaining = amount - obtained;
+        remaining -= fromPool;
+        long borrowedExact = 0L;
+        long borrowedPrivate = 0L;
         if (remaining > 0) {
-            var storageKey = new ReusableStockKey<K>(source.storageScope(), input.key());
-            long borrowed = Math.min(remaining, get(reusableStockLeft, storageKey));
-            if (borrowed > 0) {
-                put(reusableStockLeft, storageKey, get(reusableStockLeft, storageKey) - borrowed);
-                var usageKey = new ReusableStockUsageKey<K>(
-                        source.storageScope(), source.poolScope(), input.key());
-                put(usedReusableStock, usageKey,
-                        Sat.add(get(usedReusableStock, usageKey), borrowed));
-                obtained = Sat.add(obtained, borrowed);
-                remaining -= borrowed;
+            var borrowed = borrowReusableStock(source, input.key(), remaining);
+            if (borrowed.amount() > 0) {
+                borrowedExact = borrowed.pinnedExactAmount();
+                borrowedPrivate = borrowed.amount() - borrowedExact;
+                remaining -= borrowed.amount();
             }
         }
 
-        if (remaining <= 0) return 0L;
+        long externalExact = 0L;
+        long unmet = 0L;
+        if (remaining <= 0) {
+            return new ReusableSeedAcquisition(
+                    0L,
+                    Sat.add(fromPool, borrowedExact),
+                    Sat.add(fromPrivate, borrowedPrivate));
+        }
         if (isSelfReturnedSeed(pattern, input)) {
-            long unmet = craftSelfSeedFromAlternative(input.key(), remaining, pattern);
-            return unmet;
+            unmet = craftSelfSeedFromAlternative(input.key(), remaining, pattern);
+            if (unmet > 0) addMissing(input.key(), unmet);
+        } else {
+            depth++;
+            try {
+                unmet = obtain(input.key(), remaining);
+            } finally {
+                depth--;
+            }
+        }
+        externalExact = remaining - unmet;
+        return new ReusableSeedAcquisition(
+                unmet,
+                Sat.add(Sat.add(fromPool, borrowedExact), externalExact),
+                Sat.add(fromPrivate, borrowedPrivate));
+    }
+
+    /**
+     * Adds as much demand as the global physical-variant matching problem can satisfy. Every probe
+     * re-solves all still-private routes together, so an earlier fuzzy request may be reassigned when
+     * a later, more constrained request arrives. An exact allocation is removed from that rematchable
+     * set as soon as its returned catalyst is exposed as shared credit; future probes subtract the
+     * pinned physical units first. This keeps route matching order-independent without invalidating a
+     * shared credit that a later pattern may already have consumed.
+     */
+    private BorrowedReusableSeed borrowReusableStock(
+            ReusableStockSource source, K plannedKey, long requested) {
+        if (requested <= 0) return new BorrowedReusableSeed(0L, 0L);
+        var route = new ReusableStockRouteKey<K>(source, plannedKey);
+        long existing = get(reusableBorrowedDemand, route);
+
+        long low = 0L;
+        long high = requested;
+        if (!isReusableDemandFeasible(route, addNonNegative(existing, high))) {
+            while (low < high) {
+                long distance = high - low;
+                long middle = low + (distance >>> 1) + (distance & 1L);
+                if (isReusableDemandFeasible(route, addNonNegative(existing, middle))) {
+                    low = middle;
+                } else {
+                    high = middle - 1L;
+                }
+            }
+        } else {
+            low = high;
+        }
+        if (low <= 0) return new BorrowedReusableSeed(0L, 0L);
+
+        var demands = new HashMap<>(reusableBorrowedDemand);
+        demands.put(route, addNonNegative(existing, low));
+        var allocation = ReusableStockMatcher.allocate(
+                availableReusableStock(), demands,
+                candidate -> graph.reusableStockCandidates(candidate.source(), candidate.plannedKey()));
+        if (!allocation.feasible()) {
+            throw new IllegalStateException("feasible reusable-stock probe produced no allocation");
         }
 
-        depth++;
-        try {
-            return obtain(input.key(), remaining);
-        } finally {
-            depth--;
+        var matchedUsage = reusableUsage(allocation);
+        var exactUsage = new ReusableStockUsageKey<K>(
+                source.storageScope(), source.poolScope(), source.routingScope(),
+                plannedKey, plannedKey);
+        long pinnedExact = Math.min(low, get(matchedUsage, exactUsage));
+        if (pinnedExact > 0) {
+            put(pinnedExactReusableStock, exactUsage,
+                    Sat.add(get(pinnedExactReusableStock, exactUsage), pinnedExact));
         }
+        put(reusableBorrowedDemand, route, demands.get(route) - pinnedExact);
+
+        // Removing the just-pinned exact edge and the same amount of route demand preserves the
+        // feasible residual allocation. Re-solving keeps every still-private fuzzy assignment free
+        // to move while the exposed exact shared credit is permanently excluded from host supply.
+        allocation = ReusableStockMatcher.allocate(
+                availableReusableStock(), reusableBorrowedDemand,
+                candidate -> graph.reusableStockCandidates(candidate.source(), candidate.plannedKey()));
+        if (!allocation.feasible()) {
+            throw new IllegalStateException("pinning an exact reusable allocation broke residual matching");
+        }
+        matchedUsage = reusableUsage(allocation);
+        var desiredUsage = new HashMap<ReusableStockUsageKey<K>, Long>(pinnedExactReusableStock);
+        for (var entry : matchedUsage.entrySet()) {
+            desiredUsage.merge(entry.getKey(), entry.getValue(), CraftPlannerV2::addNonNegative);
+        }
+        replaceTracked(usedReusableStock, desiredUsage);
+        return new BorrowedReusableSeed(low, pinnedExact);
+    }
+
+    private Map<ReusableStockUsageKey<K>, Long> reusableUsage(
+            ReusableStockMatcher.Result<K> allocation) {
+        var desiredUsage = new HashMap<ReusableStockUsageKey<K>, Long>();
+        for (var entry : allocation.allocation().entrySet()) {
+            var allocationKey = entry.getKey();
+            var allocationRoute = allocationKey.route();
+            var allocationSource = allocationRoute.source();
+            var usage = new ReusableStockUsageKey<K>(
+                    allocationSource.storageScope(),
+                    allocationSource.poolScope(),
+                    allocationSource.routingScope(),
+                    allocationRoute.plannedKey(),
+                    allocationKey.actualKey());
+            desiredUsage.merge(usage, entry.getValue(), CraftPlannerV2::addNonNegative);
+        }
+        return desiredUsage;
+    }
+
+    /** Physical host snapshot with exact shared credits removed from future max-flow probes. */
+    private Map<ReusableStockKey<K>, Long> availableReusableStock() {
+        var available = new HashMap<ReusableStockKey<K>, Long>(graph.reusableStock());
+        for (var pinned : pinnedExactReusableStock.entrySet()) {
+            var physical = new ReusableStockKey<K>(
+                    pinned.getKey().storageScope(), pinned.getKey().actualKey());
+            long left = get(available, physical) - pinned.getValue();
+            if (left > 0) available.put(physical, left);
+            else available.remove(physical);
+        }
+        return available;
+    }
+
+    private boolean isReusableDemandFeasible(ReusableStockRouteKey<K> route, long routeDemand) {
+        var demands = new HashMap<>(reusableBorrowedDemand);
+        if (routeDemand > 0) demands.put(route, routeDemand);
+        return ReusableStockMatcher.allocate(
+                availableReusableStock(), demands,
+                candidate -> graph.reusableStockCandidates(candidate.source(), candidate.plannedKey()))
+                .feasible();
+    }
+
+    private <T> void replaceTracked(Map<T, Long> target, Map<T, Long> replacement) {
+        var keys = new HashSet<T>();
+        keys.addAll(target.keySet());
+        keys.addAll(replacement.keySet());
+        for (var key : keys) {
+            long next = get(replacement, key);
+            if (get(target, key) != next) {
+                put(target, key, next);
+            }
+        }
+    }
+
+    private static long addNonNegative(long left, long right) {
+        return left >= Long.MAX_VALUE - right ? Long.MAX_VALUE : left + right;
+    }
+
+    private record ReusableSeedAcquisition(
+            long unmet, long sharedReturnable, long privateReturnable) {
+    }
+
+    private record BorrowedReusableSeed(long amount, long pinnedExactAmount) {
     }
 
     private static <K> boolean isSelfReturnedSeed(CraftPattern<K> pattern, CraftInput<K> input) {

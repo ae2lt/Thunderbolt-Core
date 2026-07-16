@@ -97,13 +97,28 @@ public final class IndexedCellStorageSavedData extends SavedData {
     private void migrateLegacyIfNeeded(MinecraftServer server) {
         if (legacyMigrationComplete) return;
         var legacy = LegacyInfiniteCellSavedData.get(server);
-        for (var entry : legacy.cells.entrySet()) {
+        importLegacyCells(legacy.cells);
+        legacyMigrationComplete = true;
+        setDirty();
+    }
+
+    void importLegacyCells(Map<UUID, CompoundTag> legacyCells) {
+        for (var entry : legacyCells.entrySet()) {
             cells.putIfAbsent(
                     new StorageKey(LEGACY_AE2LT_TYPE, entry.getKey()),
                     entry.getValue().copy());
         }
-        legacyMigrationComplete = true;
-        setDirty();
+    }
+
+    static Map<UUID, CompoundTag> decodeLegacyCells(CompoundTag tag) {
+        var result = new HashMap<UUID, CompoundTag>();
+        var cellsTag = tag.getCompound("cells");
+        for (var idString : cellsTag.getAllKeys()) {
+            try {
+                result.put(UUID.fromString(idString), cellsTag.getCompound(idString).copy());
+            } catch (IllegalArgumentException ignored) {}
+        }
+        return result;
     }
 
     private static IndexedCellStorageSavedData load(
@@ -145,12 +160,7 @@ public final class IndexedCellStorageSavedData extends SavedData {
         private static LegacyInfiniteCellSavedData load(
                 CompoundTag tag, HolderLookup.Provider registries) {
             var data = new LegacyInfiniteCellSavedData();
-            var cellsTag = tag.getCompound("cells");
-            for (var idString : cellsTag.getAllKeys()) {
-                try {
-                    data.cells.put(UUID.fromString(idString), cellsTag.getCompound(idString));
-                } catch (IllegalArgumentException ignored) {}
-            }
+            data.cells.putAll(decodeLegacyCells(tag));
             return data;
         }
 

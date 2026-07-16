@@ -39,8 +39,7 @@ import com.moakiee.thunderbolt.ae2.crafting.LoopCraftingPlan;
 /**
  * Shared-capacity time-wheel CPU that creates one virtual CPU per crafting job.
  */
-public final class TimeWheelCraftingCpuPool
-        implements ExtendedCraftingCpuCluster, TimeWheelFastPlanningGate.CpuState {
+public final class TimeWheelCraftingCpuPool implements ExtendedCraftingCpuCluster {
     private static final int DATA_VERSION = 1;
     private static final String TAG_VERSION = "version";
     private static final String TAG_CPUS = "cpus";
@@ -55,7 +54,6 @@ public final class TimeWheelCraftingCpuPool
     private int sharedCoProcessors;
     private long remainingStorage;
     private boolean cpuListChanged;
-    private boolean fastPlanningEnabled = true;
 
     public TimeWheelCraftingCpuPool(TimeWheelCraftingCpuPoolHost host) {
         this(host, 0L, 0);
@@ -343,15 +341,6 @@ public final class TimeWheelCraftingCpuPool
 
     public boolean hasInfiniteStorage() {
         return totalStorage == Long.MAX_VALUE;
-    }
-
-    @Override
-    public boolean isFastPlanningEnabled() {
-        return fastPlanningEnabled;
-    }
-
-    public void setFastPlanningEnabled(boolean fastPlanningEnabled) {
-        this.fastPlanningEnabled = fastPlanningEnabled;
     }
 
     @Override

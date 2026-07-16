@@ -4,8 +4,7 @@ package com.moakiee.thunderbolt.ae2.crafting;
  * Per-calculation enable hook for the fast-crafting planner, implemented by the
  * {@code CraftingCalculation} mixin and driven by the host mod.
  *
- * <p>Thunderbolt Core can run standalone (the planner is enabled by {@code CoreConfig.FAST_PATH_ENABLED}
- * for every calculation). The crafting-service extension uses this hook to gate the portable fast
+ * <p>The crafting-service extension uses this internal calculation hook to enable the portable fast
  * path when an active time-wheel CPU is registered. CPU ownership is a separate plan-level concern represented by
  * {@link LoopCraftingPlan}; enabling this optimization does not itself lock a plan to one CPU.
  *

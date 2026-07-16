@@ -402,11 +402,8 @@ final class LoopSeedLedgerBook {
 
         var consumers = new ArrayList<UUID>();
         for (var consumer : consumerGroups.keySet()) {
-            if (sharedPool) {
-                if (!singleSeedConsumers.contains(consumer)) continue;
-            } else if (!consumerGroups.getOrDefault(consumer, Set.of()).contains(group)) {
-                continue;
-            }
+            if (!consumerGroups.getOrDefault(consumer, Set.of()).contains(group)) continue;
+            if (sharedPool && !singleSeedConsumers.contains(consumer)) continue;
             long capacity = hostBootstrapRequirements
                     .getOrDefault(consumer, Map.of()).getOrDefault(expected, 0L);
             if (capacity > 0) consumers.add(consumer);
@@ -423,9 +420,7 @@ final class LoopSeedLedgerBook {
         }
         var match = matchCapacitiesPartially(supply, capacity, (variantIndex, consumerIndex) -> {
             var actual = variants.get(variantIndex).what();
-            return sharedPool
-                    ? expected.equals(actual)
-                    : acceptsVariant(consumers.get(consumerIndex), expected, actual);
+            return acceptsVariant(consumers.get(consumerIndex), expected, actual);
         });
         if (match == null) return accepted;
         if (!hostAssignmentsUseWholeBundles(expected, variants, consumers, match.flows)) {

@@ -71,6 +71,10 @@ dependencies {
     testRuntimeOnly "org.junit.platform:junit-platform-launcher"
 }
 
+// Tests that exercise SavedData/codecs need the same generated Minecraft/NeoForge classes as main.
+sourceSets.test.compileClasspath += sourceSets.main.compileClasspath
+sourceSets.test.runtimeClasspath += sourceSets.main.runtimeClasspath
+
 test {
     useJUnitPlatform()
     testLogging {

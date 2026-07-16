@@ -1,6 +1,7 @@
 package com.moakiee.thunderbolt.core.planner;
 
 import java.util.ArrayList;
+import java.util.LinkedHashSet;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -17,12 +18,15 @@ public final class CraftGraph<K> {
     private final Map<K, List<CraftPattern<K>>> patternsByOutput;
     private final Map<K, Long> stock;
     private final Map<ReusableStockKey<K>, Long> reusableStock;
+    private final Map<ReusableStockRouteKey<K>, List<K>> reusableStockRoutes;
 
     private CraftGraph(Map<K, List<CraftPattern<K>>> patternsByOutput, Map<K, Long> stock,
-                       Map<ReusableStockKey<K>, Long> reusableStock) {
+                       Map<ReusableStockKey<K>, Long> reusableStock,
+                       Map<ReusableStockRouteKey<K>, List<K>> reusableStockRoutes) {
         this.patternsByOutput = patternsByOutput;
         this.stock = stock;
         this.reusableStock = reusableStock;
+        this.reusableStockRoutes = reusableStockRoutes;
     }
 
     /** Patterns whose primary output is {@code key}, in caller-defined preference order. */
@@ -42,6 +46,21 @@ public final class CraftGraph<K> {
         return value == null ? 0L : Math.max(0L, value);
     }
 
+    /** Total physical stock accepted by this exact pattern route (capacity estimate only). */
+    public long reusableStock(ReusableStockSource source, K plannedKey) {
+        long total = 0L;
+        for (var actual : reusableStockCandidates(source, plannedKey)) {
+            total = Sat.add(total, reusableStock(source.storageScope(), actual));
+        }
+        return total;
+    }
+
+    public List<K> reusableStockCandidates(ReusableStockSource source, K plannedKey) {
+        var route = new ReusableStockRouteKey<>(source, plannedKey);
+        var candidates = reusableStockRoutes.get(route);
+        return candidates != null ? candidates : List.of(plannedKey);
+    }
+
     Map<ReusableStockKey<K>, Long> reusableStock() {
         return reusableStock;
     }
@@ -54,6 +73,8 @@ public final class CraftGraph<K> {
         private final Map<K, List<CraftPattern<K>>> patterns = new HashMap<>();
         private final Map<K, Long> stock = new HashMap<>();
         private final Map<ReusableStockKey<K>, Long> reusableStock = new HashMap<>();
+        private final Map<ReusableStockRouteKey<K>, LinkedHashSet<K>> reusableStockRoutes =
+                new HashMap<>();
 
         /** Adds a pattern; patterns for the same output keep insertion order (= preference order). */
         public Builder<K> pattern(CraftPattern<K> pattern) {
@@ -89,10 +110,25 @@ public final class CraftGraph<K> {
             return this;
         }
 
+        /** Registers the concrete physical variants accepted by one pattern-specific seed route. */
+        public Builder<K> reusableStockRoute(
+                ReusableStockSource source, K plannedKey, Iterable<? extends K> actualVariants) {
+            var route = new ReusableStockRouteKey<>(source, plannedKey);
+            var accepted = reusableStockRoutes.computeIfAbsent(route, ignored -> new LinkedHashSet<>());
+            for (var actual : actualVariants) {
+                if (actual != null) accepted.add(actual);
+            }
+            return this;
+        }
+
         public CraftGraph<K> build() {
             Map<K, List<CraftPattern<K>>> frozen = new HashMap<>();
             patterns.forEach((k, v) -> frozen.put(k, List.copyOf(v)));
-            return new CraftGraph<>(frozen, Map.copyOf(stock), Map.copyOf(reusableStock));
+            var frozenRoutes = new HashMap<ReusableStockRouteKey<K>, List<K>>();
+            reusableStockRoutes.forEach((route, variants) ->
+                    frozenRoutes.put(route, List.copyOf(variants)));
+            return new CraftGraph<>(frozen, Map.copyOf(stock), Map.copyOf(reusableStock),
+                    Map.copyOf(frozenRoutes));
         }
     }
 }

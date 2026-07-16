@@ -3,6 +3,7 @@ package com.moakiee.thunderbolt.ae2.mixin;
 import java.util.IdentityHashMap;
 import java.util.Map;
 
+import org.jetbrains.annotations.Nullable;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Shadow;
 import org.spongepowered.asm.mixin.Unique;
@@ -18,7 +19,6 @@ import appeng.crafting.CraftingPlan;
 import appeng.crafting.inv.NetworkCraftingSimulationState;
 
 import com.moakiee.thunderbolt.ThunderboltCore;
-import com.moakiee.thunderbolt.CoreConfig;
 import com.moakiee.thunderbolt.ae2.crafting.FastCraftingControl;
 import com.moakiee.thunderbolt.ae2.crafting.FastCraftingPlanner;
 import com.moakiee.thunderbolt.ae2.crafting.FastPlanningWatchdog;
@@ -34,10 +34,9 @@ import com.moakiee.thunderbolt.core.planner.ReusableStockUsageKey;
  * tree simulation of each attempt. The planner is best-effort and never falls back to AE2's exhaustive
  * simulator (Policy A) — that quadratic/NBT-fuzzy path is exactly what hangs on heavy graphs.
  *
- * <p>Gating: {@link #ae2lt$fastPlanningEnabled} defaults to {@link CoreConfig#FAST_PATH_ENABLED} so the
- * lib accelerates every calculation when running standalone. The crafting-service extension calls
- * {@link FastCraftingControl#ae2lt$setFastPlanningEnabled(boolean)} on a fresh calculation when a
- * registered time-wheel CPU enables the current fast-planning path. Closed-loop results are wrapped in a
+ * <p>Gating: the crafting-service extension explicitly enables this optimization for a fresh
+ * calculation when at least one active time-wheel cluster is registered. The calculation itself does
+ * not expose or consult any per-CPU/UI toggle. Closed-loop results are wrapped in a
  * {@link LoopCraftingPlan} before leaving the calculation.
  *
  * <p>Every attempt is wrapped by {@link FastPlanningWatchdog} so a hang is captured with a live stack.
@@ -61,37 +60,43 @@ public abstract class CraftingCalculationMixin implements FastCraftingControl {
     abstract net.minecraft.world.level.Level getLevel();
 
     @Unique
-    private boolean ae2lt$fastPlanningEnabled = CoreConfig.FAST_PATH_ENABLED;
+    private boolean ae2lt$fastPlanningInitialized;
 
     @Unique
-    private final Map<CraftingPlan, Map<ReusableStockUsageKey<AEKey>, Long>>
-            thunderbolt$reusableStockByAttempt = new IdentityHashMap<>();
+    private boolean ae2lt$fastPlanningEnabled;
+
+    @Unique
+    @Nullable
+    private Map<CraftingPlan, Map<ReusableStockUsageKey<AEKey>, Long>>
+            thunderbolt$reusableStockByAttempt;
 
     @Override
     public void ae2lt$setFastPlanningEnabled(boolean enabled) {
+        this.ae2lt$fastPlanningInitialized = true;
         this.ae2lt$fastPlanningEnabled = enabled;
     }
 
     @Override
     public boolean ae2lt$isFastPlanningEnabled() {
-        return this.ae2lt$fastPlanningEnabled;
+        return this.ae2lt$fastPlanningInitialized && this.ae2lt$fastPlanningEnabled;
     }
 
     @Inject(method = "run", at = @At("RETURN"), cancellable = true, remap = false)
     private void thunderbolt$wrapLoopPlan(CallbackInfoReturnable<ICraftingPlan> cir) {
         var result = cir.getReturnValue();
+        var reusableStockByAttempt = thunderbolt$getReusableStockByAttempt();
         Map<ReusableStockUsageKey<AEKey>, Long> usedReusableStock = null;
         if (result instanceof CraftingPlan craftingPlan) {
-            usedReusableStock = thunderbolt$reusableStockByAttempt.get(craftingPlan);
+            usedReusableStock = reusableStockByAttempt.get(craftingPlan);
         }
         cir.setReturnValue(LoopCraftingPlan.wrapIfNeeded(result, usedReusableStock));
-        thunderbolt$reusableStockByAttempt.clear();
+        reusableStockByAttempt.clear();
     }
 
     @Inject(method = "runCraftAttempt", at = @At("HEAD"), cancellable = true, remap = false)
     private void ae2ltCore$fastAttempt(boolean simulate, long amount,
                                        CallbackInfoReturnable<CraftingPlan> cir) {
-        if (!this.ae2lt$fastPlanningEnabled) {
+        if (!ae2lt$isFastPlanningEnabled()) {
             return;
         }
         var gridNode = simRequester.getGridNode();
@@ -112,7 +117,7 @@ public abstract class CraftingCalculationMixin implements FastCraftingControl {
                 // CraftingCalculation#isSimulation() reflects the attempt that produced this plan.
                 this.simulate = simulate;
                 if (attempt.plan() != null) {
-                    thunderbolt$reusableStockByAttempt.put(
+                    thunderbolt$getReusableStockByAttempt().put(
                             attempt.plan(), attempt.usedReusableStock());
                 }
                 cir.setReturnValue(attempt.plan());
@@ -126,5 +131,14 @@ public abstract class CraftingCalculationMixin implements FastCraftingControl {
         } finally {
             FastPlanningWatchdog.stop();
         }
+    }
+
+    @Unique
+    private Map<CraftingPlan, Map<ReusableStockUsageKey<AEKey>, Long>>
+            thunderbolt$getReusableStockByAttempt() {
+        if (this.thunderbolt$reusableStockByAttempt == null) {
+            this.thunderbolt$reusableStockByAttempt = new IdentityHashMap<>();
+        }
+        return this.thunderbolt$reusableStockByAttempt;
     }
 }

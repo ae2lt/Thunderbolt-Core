@@ -4,6 +4,7 @@ import java.util.HashMap;
 import java.util.IdentityHashMap;
 import java.util.Map;
 
+import org.jetbrains.annotations.Nullable;
 import org.spongepowered.asm.mixin.Final;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Shadow;
@@ -55,11 +56,11 @@ public abstract class CraftingCpuLogicBatchMixin {
     public abstract ListCraftingInventory getInventory();
 
     @Unique
-    private final Map<IPatternDetails, IdentityHashMap<ICraftingProvider, Boolean>> ae2lt$batchedByTask =
-            new HashMap<>();
+    @Nullable
+    private Map<IPatternDetails, IdentityHashMap<ICraftingProvider, Boolean>> ae2lt$batchedByTask;
 
     @Unique
-    private long ae2lt$batchTick = Long.MIN_VALUE;
+    private long ae2lt$batchTick;
 
     @Unique
     private boolean ae2lt$batchExhaustedThisTick;
@@ -80,9 +81,10 @@ public abstract class CraftingCpuLogicBatchMixin {
                                           Level level,
                                           Operation<Integer> original) {
         long now = TickHandler.instance().getCurrentTick();
+        var batchedByTask = ae2lt$getBatchedByTask();
         if (now != ae2lt$batchTick) {
             ae2lt$batchTick = now;
-            ae2lt$batchedByTask.clear();
+            batchedByTask.clear();
             ae2lt$batchExhaustedThisTick = false;
         }
 
@@ -98,7 +100,7 @@ public abstract class CraftingCpuLogicBatchMixin {
                 level,
                 new VanillaBatchJobView(job),
                 getInventory(),
-                ae2lt$batchedByTask,
+                batchedByTask,
                 cluster::markDirty);
 
         if (batchResult.dispatchedCopies() > 0) {
@@ -125,9 +127,18 @@ public abstract class CraftingCpuLogicBatchMixin {
                                                             IPatternDetails details,
                                                             Operation<Iterable<ICraftingProvider>> original) {
         var raw = original.call(craftingService, details);
-        if (ae2lt$batchedByTask.isEmpty()) return raw;
-        var perTask = ae2lt$batchedByTask.get(details);
+        var batchedByTask = ae2lt$getBatchedByTask();
+        if (batchedByTask.isEmpty()) return raw;
+        var perTask = batchedByTask.get(details);
         if (perTask == null || perTask.isEmpty()) return raw;
         return new BatchProviderFilterIterable(raw, perTask);
+    }
+
+    @Unique
+    private Map<IPatternDetails, IdentityHashMap<ICraftingProvider, Boolean>> ae2lt$getBatchedByTask() {
+        if (this.ae2lt$batchedByTask == null) {
+            this.ae2lt$batchedByTask = new HashMap<>();
+        }
+        return this.ae2lt$batchedByTask;
     }
 }

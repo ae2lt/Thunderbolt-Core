@@ -21,7 +21,7 @@ import appeng.api.networking.crafting.ICraftingSubmitResult;
 import appeng.api.networking.security.IActionSource;
 import appeng.api.stacks.GenericStack;
 
-public final class TimeWheelCraftingCPU implements ICraftingCPU, TimeWheelFastPlanningGate.CpuState {
+public final class TimeWheelCraftingCPU implements ICraftingCPU {
     private final TimeWheelCraftingCpuHost host;
     private final long storageBytes;
     private final int coProcessors;
@@ -93,7 +93,6 @@ public final class TimeWheelCraftingCPU implements ICraftingCPU, TimeWheelFastPl
         return host.getSelectionMode();
     }
 
-    @Override
     public boolean isActive() {
         return host.isCpuActive();
     }

@@ -36,12 +36,18 @@ public interface ReusableSeedPattern {
         Object pool = hasSingleSeedInputPerMember()
                 ? new SharedPool(storage)
                 : new DedicatedPool(storage, reusableSeedGroupId());
-        return new ReusableStockSource(storage, pool);
+        return new ReusableStockSource(storage, pool, reusableSeedGroupId());
     }
 
     /**
-     * Read-only host seed snapshot available to this contracted pattern during planning. The
-     * executing CPU still performs the real extraction atomically when the job is submitted.
+     * Read-only host seed snapshot available to this contracted pattern during planning.
+     *
+     * <p>Each map key is a concrete physical {@code actual} variant, never a planned requirement
+     * key with fuzzy-compatible variants pre-aggregated into it. Multiple patterns sharing one
+     * {@link #reusableSeedStorageScope() storage scope} may report the same physical snapshot;
+     * {@code CraftGraph.Builder} de-duplicates those repeated observations by taking the maximum
+     * quantity for each {@code (storageScope, actualVariant)} pair. The executing CPU still
+     * performs the real extraction atomically when the job is submitted.
      */
     default Map<AEKey, Long> availableReusableSeedSnapshot() {
         return Map.of();

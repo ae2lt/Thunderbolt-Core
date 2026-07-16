@@ -1,8 +1,6 @@
 package com.moakiee.thunderbolt.ae2.mixin;
 
 import java.util.ArrayList;
-import java.util.Comparator;
-import java.util.HashSet;
 import java.util.Set;
 import java.util.concurrent.Future;
 
@@ -40,10 +38,13 @@ import appeng.api.stacks.AEKey;
 import appeng.crafting.CraftingCalculation;
 import appeng.crafting.CraftingLink;
 import appeng.crafting.execution.CraftingSubmitResult;
+import appeng.me.cluster.implementations.CraftingCPUCluster;
 import appeng.me.service.CraftingService;
 
+import com.moakiee.thunderbolt.ae2.crafting.CraftingCpuSelectionOrder;
+import com.moakiee.thunderbolt.ae2.crafting.DynamicCraftingCpuClusterIndex;
 import com.moakiee.thunderbolt.ae2.crafting.ExtendedCraftingCpuCluster;
-import com.moakiee.thunderbolt.ae2.crafting.ExtendedCraftingCpuClusterHost;
+import com.moakiee.thunderbolt.ae2.crafting.ExtendedCraftingCpuClusterProvider;
 import com.moakiee.thunderbolt.ae2.crafting.FastCraftingControl;
 import com.moakiee.thunderbolt.ae2.crafting.LoopCraftingPlan;
 import com.moakiee.thunderbolt.ae2.timewheel.TimeWheelCraftingCpuPool;
@@ -51,16 +52,15 @@ import com.moakiee.thunderbolt.ae2.timewheel.TimeWheelCraftingCpuPool;
 @Mixin(value = CraftingService.class, remap = false)
 public abstract class ExtendedCraftingCpuServiceMixin {
     @Unique
-    private static final Comparator<ExtendedCraftingCpuCluster> THUNDERBOLT_EXTENDED_CPU_FAST_FIRST = Comparator
-            .comparingInt(ExtendedCraftingCpuCluster::getCoProcessors)
-            .reversed()
-            .thenComparingLong(ExtendedCraftingCpuCluster::getAvailableStorage);
+    @Nullable
+    private DynamicCraftingCpuClusterIndex<IGridNode, ExtendedCraftingCpuCluster>
+            thunderbolt$extendedCpuClusterIndex;
 
     @Unique
-    private final Set<ExtendedCraftingCpuCluster> thunderbolt$extendedCpuClusters = new HashSet<>();
+    private long thunderbolt$lastExtendedCraftingLogicChangeTick;
 
     @Unique
-    private long thunderbolt$lastExtendedCraftingLogicChangeTick = Long.MIN_VALUE;
+    private boolean thunderbolt$lastExtendedCraftingLogicChangeTickInitialized;
 
     @Shadow
     @Final
@@ -96,7 +96,8 @@ public abstract class ExtendedCraftingCpuServiceMixin {
                                                                CalculationStrategy strategy,
                                                                CallbackInfoReturnable<Future<ICraftingPlan>> cir,
                                                                @Local CraftingCalculation job) {
-        boolean enabled = this.thunderbolt$extendedCpuClusters.stream()
+        thunderbolt$refreshExtendedCpuClusters();
+        boolean enabled = thunderbolt$getExtendedCpuClusters().stream()
                 .anyMatch(cluster -> cluster instanceof TimeWheelCraftingCpuPool && cluster.isActive());
         ((FastCraftingControl) job).ae2lt$setFastPlanningEnabled(enabled);
     }
@@ -109,15 +110,18 @@ public abstract class ExtendedCraftingCpuServiceMixin {
                     opcode = Opcodes.GETFIELD,
                     ordinal = 0))
     private void thunderbolt$tickExtendedCpuClusters(CallbackInfo ci) {
+        thunderbolt$refreshExtendedCpuClusters();
         long latest = Long.MIN_VALUE;
-        for (var cluster : this.thunderbolt$extendedCpuClusters) {
+        for (var cluster : thunderbolt$getExtendedCpuClusters()) {
             latest = Math.max(latest, cluster.tickCraftingLogic(
                     this.energyGrid, (CraftingService) (Object) this));
             if (cluster.consumeCpuListChanged()) {
                 this.updateList = true;
             }
         }
-        if (latest != this.thunderbolt$lastExtendedCraftingLogicChangeTick) {
+        if (!this.thunderbolt$lastExtendedCraftingLogicChangeTickInitialized
+                || latest != this.thunderbolt$lastExtendedCraftingLogicChangeTick) {
+            this.thunderbolt$lastExtendedCraftingLogicChangeTickInitialized = true;
             this.thunderbolt$lastExtendedCraftingLogicChangeTick = latest;
             // Force AE2's normal waiting-key refresh without capturing its latestChange local.
             this.lastProcessedCraftingLogicChangeTick = -1L;
@@ -132,37 +136,38 @@ public abstract class ExtendedCraftingCpuServiceMixin {
                     opcode = Opcodes.GETFIELD,
                     ordinal = 0))
     private void thunderbolt$addExtendedWaitingKeys(CallbackInfo ci) {
-        for (var cluster : this.thunderbolt$extendedCpuClusters) {
+        for (var cluster : thunderbolt$getExtendedCpuClusters()) {
             cluster.addWaitingKeys(this.currentlyCrafting);
         }
     }
 
     @Inject(method = "removeNode", at = @At("TAIL"))
     private void thunderbolt$onRemoveNode(IGridNode gridNode, CallbackInfo ci) {
-        if (gridNode.getOwner() instanceof ExtendedCraftingCpuClusterHost host) {
-            this.thunderbolt$extendedCpuClusters.remove(host.getExtendedCraftingCpuCluster());
-            this.updateList = true;
+        if (thunderbolt$getExtendedCpuClusterIndex().removeProvider(gridNode)) {
+            thunderbolt$refreshExtendedCpuClusters();
         }
     }
 
     @Inject(method = "addNode", at = @At("TAIL"))
     private void thunderbolt$onAddNode(IGridNode gridNode, CompoundTag savedData, CallbackInfo ci) {
-        if (gridNode.getOwner() instanceof ExtendedCraftingCpuClusterHost host) {
-            thunderbolt$addExtendedCpuCluster(host.getExtendedCraftingCpuCluster());
-            this.updateList = true;
+        if (thunderbolt$getExtendedCpuClusterProvider(gridNode) != null) {
+            thunderbolt$getExtendedCpuClusterIndex().addProvider(gridNode);
+            thunderbolt$refreshExtendedCpuClusters();
         }
     }
 
     @Inject(method = "updateCPUClusters", at = @At("TAIL"))
     private void thunderbolt$updateExtendedCpuClusters(CallbackInfo ci) {
-        this.thunderbolt$extendedCpuClusters.clear();
+        var providerNodes = new ArrayList<IGridNode>();
         for (var machineClass : this.grid.getMachineClasses()) {
             for (var node : this.grid.getMachineNodes(machineClass)) {
-                if (node.getOwner() instanceof ExtendedCraftingCpuClusterHost host) {
-                    thunderbolt$addExtendedCpuCluster(host.getExtendedCraftingCpuCluster());
+                if (thunderbolt$getExtendedCpuClusterProvider(node) != null) {
+                    providerNodes.add(node);
                 }
             }
         }
+        thunderbolt$getExtendedCpuClusterIndex().replaceProviders(providerNodes);
+        thunderbolt$refreshExtendedCpuClusters();
     }
 
     @Inject(
@@ -176,7 +181,7 @@ public abstract class ExtendedCraftingCpuServiceMixin {
             Actionable type,
             CallbackInfoReturnable<Long> cir) {
         long inserted = cir.getReturnValue();
-        for (var cluster : this.thunderbolt$extendedCpuClusters) {
+        for (var cluster : thunderbolt$getExtendedCpuClusters()) {
             if (inserted >= amount) {
                 break;
             }
@@ -206,7 +211,7 @@ public abstract class ExtendedCraftingCpuServiceMixin {
         }
 
         if (target != null) {
-            for (var cluster : this.thunderbolt$extendedCpuClusters) {
+            for (var cluster : thunderbolt$getExtendedCpuClusters()) {
                 if (cluster.containsCpu(target)) {
                     cir.setReturnValue(CraftingSubmitResult.CPU_BUSY);
                     return;
@@ -220,7 +225,7 @@ public abstract class ExtendedCraftingCpuServiceMixin {
                 return;
             }
             var cluster = thunderbolt$findSuitableExtendedCpuCluster(
-                    job, src, new MutableObject<>());
+                    job, prioritizePower, src, new MutableObject<>());
             cir.setReturnValue(cluster != null
                     ? cluster.submitJob(this.grid, job, src, requestingMachine)
                     : CraftingSubmitResult.CPU_OFFLINE);
@@ -244,18 +249,37 @@ public abstract class ExtendedCraftingCpuServiceMixin {
             boolean prioritizePower,
             IActionSource src,
             CallbackInfoReturnable<ICraftingSubmitResult> cir,
+            @Local CraftingCPUCluster cpuCluster,
             @Local MutableObject<UnsuitableCpus> unsuitableCpusResult) {
-        var cluster = thunderbolt$findSuitableExtendedCpuCluster(
-                job, src, unsuitableCpusResult);
-        if (cluster != null) {
-            cir.setReturnValue(cluster.submitJob(this.grid, job, src, requestingMachine));
+        if (thunderbolt$isPlanBound(job)) {
+            return;
+        }
+
+        var extendedCluster = thunderbolt$findSuitableExtendedCpuCluster(
+                job, prioritizePower, src, unsuitableCpusResult);
+        if (extendedCluster == null) {
+            return;
+        }
+
+        // AE2 has already selected the best concrete cluster. Compare that winner against the
+        // best extended cluster with the same preferred/power/storage order, keeping vanilla on
+        // an exact tie so installing Thunderbolt does not arbitrarily move ordinary jobs.
+        if (cpuCluster == null || CraftingCpuSelectionOrder.compare(
+                extendedCluster.isPreferredFor(src),
+                extendedCluster.getCoProcessors(),
+                extendedCluster.getAvailableStorage(),
+                cpuCluster.isPreferredFor(src),
+                cpuCluster.getCoProcessors(),
+                cpuCluster.getAvailableStorage(),
+                prioritizePower) < 0) {
+            cir.setReturnValue(extendedCluster.submitJob(this.grid, job, src, requestingMachine));
         }
     }
 
     @Inject(method = "getCpus", at = @At("RETURN"), cancellable = true, order = 1500)
     private void thunderbolt$getExtendedCpus(CallbackInfoReturnable<ImmutableSet<ICraftingCPU>> cir) {
         var cpus = ImmutableSet.<ICraftingCPU>builder().addAll(cir.getReturnValue());
-        for (var cluster : this.thunderbolt$extendedCpuClusters) {
+        for (var cluster : thunderbolt$getExtendedCpuClusters()) {
             if (!cluster.isActive()) {
                 continue;
             }
@@ -272,7 +296,7 @@ public abstract class ExtendedCraftingCpuServiceMixin {
     @Inject(method = "getRequestedAmount", at = @At("RETURN"), cancellable = true, order = 1500)
     private void thunderbolt$getExtendedRequestedAmount(AEKey what, CallbackInfoReturnable<Long> cir) {
         long requested = cir.getReturnValue();
-        for (var cluster : this.thunderbolt$extendedCpuClusters) {
+        for (var cluster : thunderbolt$getExtendedCpuClusters()) {
             long addition = cluster.getRequestedAmount(what);
             requested = requested >= Long.MAX_VALUE - addition ? Long.MAX_VALUE : requested + addition;
         }
@@ -281,7 +305,7 @@ public abstract class ExtendedCraftingCpuServiceMixin {
 
     @Inject(method = "hasCpu", at = @At("HEAD"), cancellable = true)
     private void thunderbolt$hasExtendedCpu(ICraftingCPU cpu, CallbackInfoReturnable<Boolean> cir) {
-        for (var cluster : this.thunderbolt$extendedCpuClusters) {
+        for (var cluster : thunderbolt$getExtendedCpuClusters()) {
             if (cluster.containsCpu(cpu)) {
                 cir.setReturnValue(true);
                 return;
@@ -291,27 +315,71 @@ public abstract class ExtendedCraftingCpuServiceMixin {
 
     @Unique
     private void thunderbolt$addExtendedCpuCluster(ExtendedCraftingCpuCluster cluster) {
-        if (cluster == null || !this.thunderbolt$extendedCpuClusters.add(cluster)) {
-            return;
-        }
         cluster.prepareForCraftingService();
         cluster.restoreCraftingLinks(this::addLink);
+    }
+
+    @Unique
+    private void thunderbolt$refreshExtendedCpuClusters() {
+        boolean changed = thunderbolt$getExtendedCpuClusterIndex().refresh(
+                ExtendedCraftingCpuServiceMixin::thunderbolt$resolveExtendedCpuCluster,
+                this::thunderbolt$addExtendedCpuCluster);
+        if (changed) {
+            this.updateList = true;
+        }
+    }
+
+    @Unique
+    private DynamicCraftingCpuClusterIndex<IGridNode, ExtendedCraftingCpuCluster>
+            thunderbolt$getExtendedCpuClusterIndex() {
+        if (this.thunderbolt$extendedCpuClusterIndex == null) {
+            this.thunderbolt$extendedCpuClusterIndex = new DynamicCraftingCpuClusterIndex<>();
+        }
+        return this.thunderbolt$extendedCpuClusterIndex;
+    }
+
+    @Unique
+    private Set<ExtendedCraftingCpuCluster> thunderbolt$getExtendedCpuClusters() {
+        return thunderbolt$getExtendedCpuClusterIndex().clusters();
+    }
+
+    @Unique
+    @Nullable
+    private static ExtendedCraftingCpuClusterProvider thunderbolt$getExtendedCpuClusterProvider(IGridNode node) {
+        var service = node.getService(ExtendedCraftingCpuClusterProvider.class);
+        if (service != null) {
+            return service;
+        }
+        return node.getOwner() instanceof ExtendedCraftingCpuClusterProvider provider ? provider : null;
+    }
+
+    @Unique
+    @Nullable
+    private static ExtendedCraftingCpuCluster thunderbolt$resolveExtendedCpuCluster(IGridNode node) {
+        var provider = thunderbolt$getExtendedCpuClusterProvider(node);
+        return provider != null ? provider.getExtendedCraftingCpuCluster() : null;
     }
 
     @Unique
     @Nullable
     private ExtendedCraftingCpuCluster thunderbolt$findSuitableExtendedCpuCluster(
             ICraftingPlan job,
+            boolean prioritizePower,
             IActionSource src,
             MutableObject<UnsuitableCpus> unsuitableCpusResult) {
-        var valid = new ArrayList<ExtendedCraftingCpuCluster>(
-                this.thunderbolt$extendedCpuClusters.size());
+        var clusters = thunderbolt$getExtendedCpuClusters();
+        var valid = new ArrayList<ExtendedCraftingCpuCluster>(clusters.size());
         int offline = 0;
+        int busy = 0;
         int tooSmall = 0;
         int excluded = 0;
-        for (var cluster : this.thunderbolt$extendedCpuClusters) {
+        for (var cluster : clusters) {
             if (!cluster.isActive()) {
                 offline++;
+                continue;
+            }
+            if (cluster.isBusy()) {
+                busy++;
                 continue;
             }
             if (cluster.getAvailableStorage() < job.bytes()) {
@@ -330,14 +398,14 @@ public abstract class ExtendedCraftingCpuServiceMixin {
         }
 
         if (valid.isEmpty()) {
-            if (offline > 0 || tooSmall > 0 || excluded > 0) {
+            if (offline > 0 || busy > 0 || tooSmall > 0 || excluded > 0) {
                 var existing = unsuitableCpusResult.getValue();
                 if (existing == null) {
-                    unsuitableCpusResult.setValue(new UnsuitableCpus(offline, 0, tooSmall, excluded));
+                    unsuitableCpusResult.setValue(new UnsuitableCpus(offline, busy, tooSmall, excluded));
                 } else {
                     unsuitableCpusResult.setValue(new UnsuitableCpus(
                             saturatingAdd(existing.offline(), offline),
-                            existing.busy(),
+                            saturatingAdd(existing.busy(), busy),
                             saturatingAdd(existing.tooSmall(), tooSmall),
                             saturatingAdd(existing.excluded(), excluded)));
                 }
@@ -345,14 +413,14 @@ public abstract class ExtendedCraftingCpuServiceMixin {
             return null;
         }
 
-        valid.sort((a, b) -> {
-            boolean firstPreferred = a.isPreferredFor(src);
-            boolean secondPreferred = b.isPreferredFor(src);
-            if (firstPreferred != secondPreferred) {
-                return Boolean.compare(secondPreferred, firstPreferred);
-            }
-            return THUNDERBOLT_EXTENDED_CPU_FAST_FIRST.compare(a, b);
-        });
+        valid.sort((a, b) -> CraftingCpuSelectionOrder.compare(
+                a.isPreferredFor(src),
+                a.getCoProcessors(),
+                a.getAvailableStorage(),
+                b.isPreferredFor(src),
+                b.getCoProcessors(),
+                b.getAvailableStorage(),
+                prioritizePower));
         return valid.getFirst();
     }
 

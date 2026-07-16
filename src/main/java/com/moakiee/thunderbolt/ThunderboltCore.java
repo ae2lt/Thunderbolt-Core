@@ -19,7 +19,7 @@ import org.slf4j.Logger;
  *
  * <p>It hosts low-level AE2 patches: most notably a linear-time autocrafting planner installed via
  * mixin on AE2's {@code CraftingCalculation}. It depends only on AE2, not on AE2 Lightning Tech, so
- * it can be used as a standalone AE2 crafting accelerator.
+ * compatible host mods can register extended crafting CPU clusters without duplicating AE2 hooks.
  */
 @Mod(ThunderboltCore.MODID)
 public final class ThunderboltCore {
@@ -32,8 +32,7 @@ public final class ThunderboltCore {
         modEventBus.addListener(this::onCommonSetup);
         NeoForge.EVENT_BUS.addListener(this::onServerStarting);
         NeoForge.EVENT_BUS.addListener(this::onServerStopped);
-        LOGGER.info("[Thunderbolt Core] initialized; fast-path autocrafting planner active={}",
-                CoreConfig.FAST_PATH_ENABLED);
+        LOGGER.info("[Thunderbolt Core] initialized");
     }
 
     private void onServerStarting(ServerStartingEvent event) {

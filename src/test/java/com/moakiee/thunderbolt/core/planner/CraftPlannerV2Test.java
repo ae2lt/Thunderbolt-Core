@@ -190,6 +190,104 @@ class CraftPlannerV2Test {
     }
 
     @Test
+    void nonExactReturnedSeedStaysPrivateToItsRoutingConsumer() {
+        var first = new ReusableStockSource("host", "shared-loop-pool", "first-route");
+        var second = new ReusableStockSource("host", "shared-loop-pool", "second-route");
+        CraftGraph<String> graph = CraftGraph.<String>builder()
+                .pattern("result", 1, List.of(
+                        CraftInput.of("first", 1), CraftInput.of("second", 1)))
+                .pattern("first", 1, List.of(CraftInput.returnedFrom("A", 1, first)))
+                .pattern("second", 1, List.of(CraftInput.returnedFrom("A", 1, second)))
+                .reusableStock("host", "X", 1)
+                .reusableStockRoute(first, "A", List.of("A", "X"))
+                .reusableStockRoute(second, "A", List.of("A", "X"))
+                .build();
+
+        CraftPlan<String> plan = CraftPlannerV2.plan(graph, "result", 1);
+
+        assertFalse(plan.feasible(), "one fuzzy X must not become a cross-consumer logical A");
+        assertEquals(1L, plan.usedReusableStock().values().stream()
+                .mapToLong(Long::longValue).sum());
+        assertEquals(1L, plan.missing().get("A"));
+    }
+
+    @Test
+    void nonExactReturnedSeedCanBeReusedInsideTheSameRoutingConsumer() {
+        var source = new ReusableStockSource("host", "shared-loop-pool", "one-route");
+        CraftGraph<String> graph = CraftGraph.<String>builder()
+                .pattern("result", 1, List.of(
+                        CraftInput.of("first", 1), CraftInput.of("second", 1)))
+                .pattern("first", 1, List.of(CraftInput.returnedFrom("A", 1, source)))
+                .pattern("second", 1, List.of(CraftInput.returnedFrom("A", 1, source)))
+                .reusableStock("host", "X", 1)
+                .reusableStockRoute(source, "A", List.of("A", "X"))
+                .build();
+
+        CraftPlan<String> plan = CraftPlannerV2.plan(graph, "result", 1);
+
+        assertTrue(plan.feasible());
+        assertEquals(1L, plan.usedReusableStock().get(
+                new ReusableStockUsageKey<>(
+                        "host", "shared-loop-pool", "one-route", "A", "X")));
+        assertTrue(plan.missing().isEmpty());
+    }
+
+    @Test
+    void exactReturnedSeedRemainsShareableAcrossRoutingConsumers() {
+        var first = new ReusableStockSource("host", "shared-loop-pool", "first-route");
+        var second = new ReusableStockSource("host", "shared-loop-pool", "second-route");
+        CraftGraph<String> graph = CraftGraph.<String>builder()
+                .pattern("result", 1, List.of(
+                        CraftInput.of("first", 1), CraftInput.of("second", 1)))
+                .pattern("first", 1, List.of(CraftInput.returnedFrom("A", 1, first)))
+                .pattern("second", 1, List.of(CraftInput.returnedFrom("A", 1, second)))
+                .reusableStock("host", "A", 1)
+                .reusableStockRoute(first, "A", List.of("A"))
+                .reusableStockRoute(second, "A", List.of("A"))
+                .build();
+
+        CraftPlan<String> plan = CraftPlannerV2.plan(graph, "result", 1);
+
+        assertTrue(plan.feasible());
+        assertEquals(1L, plan.usedReusableStock().get(
+                new ReusableStockUsageKey<>(
+                        "host", "shared-loop-pool", "first-route", "A", "A")));
+        assertTrue(plan.missing().isEmpty());
+    }
+
+    @Test
+    void sharedExactAllocationCannotBeRematchedAfterAnotherRouteConsumesItsCredit() {
+        var first = new ReusableStockSource("host", "shared-loop-pool", "first-route");
+        var second = new ReusableStockSource("host", "shared-loop-pool", "second-route");
+        var constrained = new ReusableStockSource(
+                "host", "other-shared-loop-pool", "constrained-route");
+        CraftGraph<String> graph = CraftGraph.<String>builder()
+                .pattern("result", 1, List.of(
+                        CraftInput.of("first", 1),
+                        CraftInput.of("second", 1),
+                        CraftInput.of("constrained", 1)))
+                .pattern("first", 1, List.of(CraftInput.returnedFrom("A", 1, first)))
+                .pattern("second", 1, List.of(CraftInput.returnedFrom("A", 1, second)))
+                .pattern("constrained", 1,
+                        List.of(CraftInput.returnedFrom("B", 1, constrained)))
+                .reusableStock("host", "A", 1)
+                .reusableStock("host", "X", 1)
+                .reusableStockRoute(first, "A", List.of("A", "X"))
+                .reusableStockRoute(second, "A", List.of("A", "X"))
+                .reusableStockRoute(constrained, "B", List.of("A"))
+                .build();
+
+        CraftPlan<String> plan = CraftPlannerV2.plan(graph, "result", 1);
+
+        assertFalse(plan.feasible(),
+                "the later B route must not steal exact A after A entered the shared pool");
+        assertEquals(1L, plan.missing().get("B"));
+        assertEquals(1L, plan.usedReusableStock().get(
+                new ReusableStockUsageKey<>(
+                        "host", "shared-loop-pool", "first-route", "A", "A")));
+    }
+
+    @Test
     void dedicatedLoopPoolsCompeteForTheSamePhysicalHostSeed() {
         var leftPool = new ReusableStockSource("host", "left-loop");
         var rightPool = new ReusableStockSource("host", "right-loop");
@@ -226,6 +324,83 @@ class CraftPlannerV2Test {
                 new ReusableStockUsageKey<>("host", "left-loop", "seed")));
         assertEquals(1L, plan.usedReusableStock().get(
                 new ReusableStockUsageKey<>("host", "right-loop", "seed")));
+    }
+
+    @Test
+    void fuzzyReusableStockDoesNotPreallocateSharedVariantToUnrequestedPattern() {
+        var sourceA = new ReusableStockSource("host", "shared", "route-a");
+        var sourceB = new ReusableStockSource("host", "shared", "route-b");
+        CraftGraph<String> graph = CraftGraph.<String>builder()
+                .pattern("A-product", 1, List.of(CraftInput.returnedFrom("A", 1, sourceA)))
+                .pattern("B-product", 1, List.of(CraftInput.returnedFrom("B", 1, sourceB)))
+                .reusableStock("host", "X", 1)
+                .reusableStockRoute(sourceA, "A", List.of("X"))
+                .reusableStockRoute(sourceB, "B", List.of("X"))
+                .build();
+
+        CraftPlan<String> plan = CraftPlannerV2.plan(graph, "B-product", 1);
+
+        assertTrue(plan.feasible());
+        assertEquals(1L, plan.usedReusableStock().get(
+                new ReusableStockUsageKey<>("host", "shared", "route-b", "B", "X")));
+    }
+
+    @Test
+    void overlappingFuzzyReusableRoutesCannotDoubleSpendOneActualVariant() {
+        var sourceA = new ReusableStockSource("host", "shared", "route-a");
+        var sourceB = new ReusableStockSource("host", "shared", "route-b");
+        CraftGraph<String> graph = fuzzySharedVariantGraph(sourceA, sourceB, 1, 0, false);
+
+        CraftPlan<String> plan = CraftPlannerV2.plan(graph, "result", 1);
+
+        assertFalse(plan.feasible());
+        assertEquals(1L, plan.usedReusableStock().values().stream()
+                .mapToLong(Long::longValue).sum());
+    }
+
+    @Test
+    void fuzzyReusableMatchingReassignsEarlierBorrowAndIgnoresPatternOrder() {
+        var sourceA = new ReusableStockSource("host", "shared", "route-a");
+        var sourceB = new ReusableStockSource("host", "shared", "route-b");
+
+        CraftPlan<String> forward = CraftPlannerV2.plan(
+                fuzzySharedVariantGraph(sourceA, sourceB, 1, 1, false), "result", 1);
+        CraftPlan<String> reversed = CraftPlannerV2.plan(
+                fuzzySharedVariantGraph(sourceA, sourceB, 1, 1, true), "result", 1);
+
+        for (var plan : List.of(forward, reversed)) {
+            assertTrue(plan.feasible());
+            assertEquals(1L, plan.usedReusableStock().get(
+                    new ReusableStockUsageKey<>("host", "shared", "route-a", "A", "Y")));
+            assertEquals(1L, plan.usedReusableStock().get(
+                    new ReusableStockUsageKey<>("host", "shared", "route-b", "B", "X")));
+        }
+    }
+
+    private static CraftGraph<String> fuzzySharedVariantGraph(
+            ReusableStockSource sourceA,
+            ReusableStockSource sourceB,
+            long sharedX,
+            long onlyA,
+            boolean reverse) {
+        var builder = CraftGraph.<String>builder();
+        if (reverse) {
+            builder.pattern("result", 1, List.of(
+                    CraftInput.of("B-product", 1), CraftInput.of("A-product", 1)))
+                    .pattern("B-product", 1, List.of(CraftInput.returnedFrom("B", 1, sourceB)))
+                    .pattern("A-product", 1, List.of(CraftInput.returnedFrom("A", 1, sourceA)));
+        } else {
+            builder.pattern("result", 1, List.of(
+                    CraftInput.of("A-product", 1), CraftInput.of("B-product", 1)))
+                    .pattern("A-product", 1, List.of(CraftInput.returnedFrom("A", 1, sourceA)))
+                    .pattern("B-product", 1, List.of(CraftInput.returnedFrom("B", 1, sourceB)));
+        }
+        return builder
+                .reusableStock("host", "X", sharedX)
+                .reusableStock("host", "Y", onlyA)
+                .reusableStockRoute(sourceA, "A", List.of("X", "Y"))
+                .reusableStockRoute(sourceB, "B", List.of("X"))
+                .build();
     }
 
     /**

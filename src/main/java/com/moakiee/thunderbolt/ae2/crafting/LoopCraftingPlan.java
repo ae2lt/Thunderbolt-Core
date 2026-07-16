@@ -69,6 +69,8 @@ public record LoopCraftingPlan(
         var totalSeeds = aggregateTotalSeeds(reusablePatterns);
         var hostSeeds = new LinkedHashMap<AEKey, Long>();
         var hostAllocations = new ArrayList<HostReusableSeedAllocation>();
+        var hostUsageByRoute = new LinkedHashMap<HostRequirementKey, Long>();
+        var hostLimitByRoute = aggregateHostLimits(reusablePatterns);
         if (usedReusableStock != null) {
             for (var entry : usedReusableStock.entrySet()) {
                 if (entry.getKey() != null && entry.getValue() != null && entry.getValue() > 0) {
@@ -79,20 +81,25 @@ public record LoopCraftingPlan(
                     }
                     hostSeeds.merge(
                             entry.getKey().key(), entry.getValue(), LoopCraftingPlan::saturatingAdd);
+                    hostUsageByRoute.merge(
+                            HostRequirementKey.from(entry.getKey()), entry.getValue(),
+                            LoopCraftingPlan::saturatingAdd);
                     hostAllocations.add(new HostReusableSeedAllocation(
                             entry.getKey().storageScope(),
                             entry.getKey().poolScope(),
+                            entry.getKey().routingScope(),
                             entry.getKey().key(),
+                            entry.getKey().actualKey(),
                             entry.getValue(),
                             owner.reusableSeedGroupId(),
                             owner.hasSingleSeedInputPerMember()));
                 }
             }
         }
-        for (var entry : hostSeeds.entrySet()) {
-            if (entry.getValue() > totalSeeds.getOrDefault(entry.getKey(), 0L)) {
+        for (var usage : hostUsageByRoute.entrySet()) {
+            if (usage.getValue() > hostLimitByRoute.getOrDefault(usage.getKey(), 0L)) {
                 throw new IllegalStateException(
-                        "private reusable-stock usage exceeds the loop seed requirement");
+                        "private reusable-stock usage exceeds its route seed requirement");
             }
         }
         return restrictions.isEmpty()
@@ -135,8 +142,10 @@ public record LoopCraftingPlan(
             var source = seeded.reusableStockSource();
             if (allocation.storageScope().equals(source.storageScope())
                     && allocation.poolScope().equals(source.poolScope())
+                    && allocation.routingScope().equals(source.routingScope())
                     && seeded.totalReusableSeedRequirements()
                             .getOrDefault(allocation.plannedKey(), 0L) > 0
+                    && allocation.actualKey().equals(actual)
                     && seeded.acceptsReusableSeedVariant(allocation.plannedKey(), actual)) {
                 return true;
             }
@@ -231,6 +240,28 @@ public record LoopCraftingPlan(
         return Map.copyOf(total);
     }
 
+    /**
+     * Physical host borrowing is bounded per route, not by the final shared return quota. Several
+     * patterns may publish the same group view, so duplicate route requirements merge by maximum.
+     */
+    private static Map<HostRequirementKey, Long> aggregateHostLimits(
+            List<ReusableSeedPattern> patterns) {
+        var result = new LinkedHashMap<HostRequirementKey, Long>();
+        for (var seeded : patterns) {
+            var source = seeded.reusableStockSource();
+            for (var requirement : seeded.totalReusableSeedRequirements().entrySet()) {
+                long amount = positive(requirement.getValue());
+                if (requirement.getKey() != null && amount > 0) {
+                    result.merge(new HostRequirementKey(
+                                    source.storageScope(), source.poolScope(), source.routingScope(),
+                                    requirement.getKey()),
+                            amount, Math::max);
+                }
+            }
+        }
+        return Map.copyOf(result);
+    }
+
     private static ReusableSeedPattern reusableStockOwner(
             List<ReusableSeedPattern> patterns,
             ReusableStockUsageKey<AEKey> usage) {
@@ -238,6 +269,7 @@ public record LoopCraftingPlan(
             var source = seeded.reusableStockSource();
             if (usage.storageScope().equals(source.storageScope())
                     && usage.poolScope().equals(source.poolScope())
+                    && usage.routingScope().equals(source.routingScope())
                     && seeded.totalReusableSeedRequirements()
                             .getOrDefault(usage.key(), 0L) > 0) {
                 return seeded;
@@ -249,16 +281,28 @@ public record LoopCraftingPlan(
     public record HostReusableSeedAllocation(
             Object storageScope,
             Object poolScope,
+            Object routingScope,
             AEKey plannedKey,
+            AEKey actualKey,
             long amount,
             UUID reusableSeedGroupId,
             boolean sharedPool) {
         public HostReusableSeedAllocation {
             Objects.requireNonNull(storageScope, "storageScope");
             Objects.requireNonNull(poolScope, "poolScope");
+            Objects.requireNonNull(routingScope, "routingScope");
             Objects.requireNonNull(plannedKey, "plannedKey");
+            Objects.requireNonNull(actualKey, "actualKey");
             Objects.requireNonNull(reusableSeedGroupId, "reusableSeedGroupId");
             if (amount <= 0) throw new IllegalArgumentException("amount must be > 0");
+        }
+    }
+
+    private record HostRequirementKey(
+            Object storageScope, Object poolScope, Object routingScope, AEKey plannedKey) {
+        private static HostRequirementKey from(ReusableStockUsageKey<AEKey> usage) {
+            return new HostRequirementKey(
+                    usage.storageScope(), usage.poolScope(), usage.routingScope(), usage.key());
         }
     }
 

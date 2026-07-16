@@ -27,12 +27,9 @@ import appeng.api.stacks.AEKeyType;
 import appeng.api.stacks.GenericStack;
 import appeng.api.stacks.KeyCounter;
 import appeng.crafting.CraftingLink;
-import appeng.crafting.execution.ExecutingCraftingJob;
 import appeng.crafting.inv.ListCraftingInventory;
 
 import com.moakiee.thunderbolt.ae2.api.crafting.CraftingPatternDelegates;
-import com.moakiee.thunderbolt.ae2.mixin.ElapsedTimeTrackerAccessor;
-import com.moakiee.thunderbolt.ae2.mixin.ExecutingCraftingJobAccessor;
 import com.moakiee.thunderbolt.ae2.util.MixinReflectionSupport;
 import com.moakiee.thunderbolt.ae2.overload.cpu.InsertContext;
 import com.moakiee.thunderbolt.ae2.overload.cpu.OverloadClaimResult;
@@ -46,13 +43,10 @@ import com.moakiee.thunderbolt.ae2.overload.pattern.OverloadedProviderOnlyPatter
  * NeoECOAEExtension's {@code ECOCraftingCPULogic}. Mirrors the seven injection
  * points used by {@link CraftingCpuLogicMixin} and {@link AdvCraftingCpuLogicMixin}.
  * <p>
- * Critical simplification compared to the AdvancedAE variant: ECO's logic uses
- * AE2's own {@code appeng.crafting.execution.ExecutingCraftingJob} for its
- * {@code job} field (via {@code import appeng.crafting.execution.*;}), so the
- * job's internals can be reached through the existing
- * {@link ExecutingCraftingJobAccessor} / {@link ElapsedTimeTrackerAccessor}
- * accessors instead of more reflection. ECO also lacks an {@code updateOutput}
- * hook, so the corresponding monitor-update calls are intentionally omitted.
+ * NeoECO 1.3.4 owns distinct {@code ExecutingCraftingJob} and
+ * {@code ElapsedTimeTracker} classes. All access to those optional types is therefore reflective;
+ * Thunderbolt never hard-links NeoECO classes when the addon is absent. ECO also lacks an
+ * {@code updateOutput} hook, so the corresponding monitor-update calls are intentionally omitted.
  */
 @Pseudo
 @Mixin(targets = "cn.dancingsnow.neoecoae.api.me.ECOCraftingCPULogic", remap = false)
@@ -63,6 +57,14 @@ public abstract class ECOCraftingCpuLogicMixin {
     @Unique
     private static final @Nullable Class<?> AE2LT_ECO_LOGIC_CLASS =
             MixinReflectionSupport.findClassSafe("cn.dancingsnow.neoecoae.api.me.ECOCraftingCPULogic");
+
+    @Unique
+    private static final @Nullable Class<?> AE2LT_ECO_JOB_CLASS =
+            MixinReflectionSupport.findClassSafe("cn.dancingsnow.neoecoae.api.me.ExecutingCraftingJob");
+
+    @Unique
+    private static final @Nullable Class<?> AE2LT_ECO_ELAPSED_TRACKER_CLASS =
+            MixinReflectionSupport.findClassSafe("cn.dancingsnow.neoecoae.api.me.ElapsedTimeTracker");
 
     @Unique
     private static final @Nullable Field AE2LT_ECO_JOB_FIELD =
@@ -84,6 +86,31 @@ public abstract class ECOCraftingCpuLogicMixin {
     private static final @Nullable Method AE2LT_ECO_POST_CHANGE_METHOD =
             MixinReflectionSupport.findDeclaredMethodSafe(AE2LT_ECO_LOGIC_CLASS, "postChange", AEKey.class);
 
+    @Unique
+    private static final @Nullable Field AE2LT_ECO_JOB_WAITING_FOR_FIELD =
+            MixinReflectionSupport.findDeclaredFieldSafe(AE2LT_ECO_JOB_CLASS, "waitingFor");
+
+    @Unique
+    private static final @Nullable Field AE2LT_ECO_JOB_TIME_TRACKER_FIELD =
+            MixinReflectionSupport.findDeclaredFieldSafe(AE2LT_ECO_JOB_CLASS, "timeTracker");
+
+    @Unique
+    private static final @Nullable Field AE2LT_ECO_JOB_FINAL_OUTPUT_FIELD =
+            MixinReflectionSupport.findDeclaredFieldSafe(AE2LT_ECO_JOB_CLASS, "finalOutput");
+
+    @Unique
+    private static final @Nullable Field AE2LT_ECO_JOB_REMAINING_AMOUNT_FIELD =
+            MixinReflectionSupport.findDeclaredFieldSafe(AE2LT_ECO_JOB_CLASS, "remainingAmount");
+
+    @Unique
+    private static final @Nullable Field AE2LT_ECO_JOB_LINK_FIELD =
+            MixinReflectionSupport.findDeclaredFieldSafe(AE2LT_ECO_JOB_CLASS, "link");
+
+    @Unique
+    private static final @Nullable Method AE2LT_ECO_DECREMENT_ITEMS_METHOD =
+            MixinReflectionSupport.findDeclaredMethodSafe(AE2LT_ECO_ELAPSED_TRACKER_CLASS,
+                    "decrementItems", long.class, AEKeyType.class);
+
     /**
      * Whether all required reflection targets are available.
      * If false, every injection handler short-circuits to a no-op so the mixin
@@ -91,11 +118,19 @@ public abstract class ECOCraftingCpuLogicMixin {
      */
     @Unique
     private static final boolean AE2LT_ECO_AVAILABLE = AE2LT_ECO_LOGIC_CLASS != null
+            && AE2LT_ECO_JOB_CLASS != null
+            && AE2LT_ECO_ELAPSED_TRACKER_CLASS != null
             && AE2LT_ECO_JOB_FIELD != null
             && AE2LT_ECO_INVENTORY_FIELD != null
             && AE2LT_ECO_CPU_FIELD != null
             && AE2LT_ECO_FINISH_JOB_METHOD != null
-            && AE2LT_ECO_POST_CHANGE_METHOD != null;
+            && AE2LT_ECO_POST_CHANGE_METHOD != null
+            && AE2LT_ECO_JOB_WAITING_FOR_FIELD != null
+            && AE2LT_ECO_JOB_TIME_TRACKER_FIELD != null
+            && AE2LT_ECO_JOB_FINAL_OUTPUT_FIELD != null
+            && AE2LT_ECO_JOB_REMAINING_AMOUNT_FIELD != null
+            && AE2LT_ECO_JOB_LINK_FIELD != null
+            && AE2LT_ECO_DECREMENT_ITEMS_METHOD != null;
 
     @Unique
     @Nullable
@@ -156,11 +191,10 @@ public abstract class ECOCraftingCpuLogicMixin {
 
         var job = ae2lt$getJob();
         if (job == null) return;
-        var jobAccessor = (ExecutingCraftingJobAccessor) job;
-        CraftingLink link = jobAccessor.getLink();
+        CraftingLink link = ae2lt$getJobLink(job);
         long requesterLimit = Math.min(
                 preview.claimedForRequester(),
-                Math.max(0L, jobAccessor.getRemainingAmount()));
+                Math.max(0L, ae2lt$getJobRemainingAmount(job)));
         long requesterAccepted = requesterLimit;
         if (requesterLimit > 0) {
             requesterAccepted = link != null
@@ -207,8 +241,7 @@ public abstract class ECOCraftingCpuLogicMixin {
         OverloadPatternReference patternReference = null;
         if (overloadDetails != null) {
             var activeJob = ae2lt$getJob();
-            var waitingFor = activeJob != null
-                    ? ((ExecutingCraftingJobAccessor) activeJob).getWaitingFor() : null;
+            var waitingFor = activeJob != null ? ae2lt$getJobWaitingFor(activeJob) : null;
             if (waitingFor == null
                     || OverloadCpuInsertSupport.hasStrictCollisionWithOverloadPattern(
                             this, details, overloadDetails, waitingFor.list)) {
@@ -228,10 +261,9 @@ public abstract class ECOCraftingCpuLogicMixin {
         boolean pushed = original.call(provider, details, inputHolder);
         var job = ae2lt$getJob();
         if (pushed && overloadDetails != null && job != null) {
-            var jobAccessor = (ExecutingCraftingJobAccessor) job;
-            GenericStack finalOutput = jobAccessor.getFinalOutput();
+            GenericStack finalOutput = ae2lt$getJobFinalOutput(job);
             AEKey finalOutputKey = finalOutput != null ? finalOutput.what() : null;
-            CraftingLink link = jobAccessor.getLink();
+            CraftingLink link = ae2lt$getJobLink(job);
             if (link != null) {
                 UUID craftingId = link.getCraftingID();
                 OverloadCpuStateManager.INSTANCE.registerExpectedOutputs(
@@ -268,7 +300,7 @@ public abstract class ECOCraftingCpuLogicMixin {
         OverloadCpuStateManager.INSTANCE.clear(this);
         var job = ae2lt$getJob();
         if (job != null && data.contains("ae2ltOverloadState", CompoundTag.TAG_COMPOUND)) {
-            CraftingLink link = ((ExecutingCraftingJobAccessor) job).getLink();
+            CraftingLink link = ae2lt$getJobLink(job);
             if (link != null) {
                 OverloadCpuStateManager.INSTANCE.readFromTag(
                         this,
@@ -312,11 +344,10 @@ public abstract class ECOCraftingCpuLogicMixin {
         }
 
         ae2lt$decrementJobItems(job, claimed, incoming.getType());
-        var jobAccessor = (ExecutingCraftingJobAccessor) job;
         ae2lt$invokePostChange(incoming);
 
-        long remaining = Math.max(0L, jobAccessor.getRemainingAmount() - claimed);
-        jobAccessor.setRemainingAmount(remaining);
+        long remaining = Math.max(0L, ae2lt$getJobRemainingAmount(job) - claimed);
+        ae2lt$setJobRemainingAmount(job, remaining);
 
         if (remaining <= 0) {
             ae2lt$invokeFinishJob(true);
@@ -334,7 +365,7 @@ public abstract class ECOCraftingCpuLogicMixin {
             return;
         }
 
-        ListCraftingInventory waitingFor = ((ExecutingCraftingJobAccessor) job).getWaitingFor();
+        ListCraftingInventory waitingFor = ae2lt$getJobWaitingFor(job);
         if (waitingFor == null) return;
 
         for (var claim : claims.claims()) {
@@ -342,22 +373,13 @@ public abstract class ECOCraftingCpuLogicMixin {
         }
     }
 
-    @Unique
-    private void ae2lt$decrementJobItems(ExecutingCraftingJob job, long amount, AEKeyType keyType) {
-        var jobAccessor = (ExecutingCraftingJobAccessor) job;
-        var timeTracker = jobAccessor.getTimeTracker();
-        if (timeTracker != null) {
-            ((ElapsedTimeTrackerAccessor) timeTracker).invokeDecrementItems(amount, keyType);
-        }
-    }
-
     // ========================= Reflection Accessors (null-safe) =========================
 
     @Unique
     @Nullable
-    private ExecutingCraftingJob ae2lt$getJob() {
-        Object val = MixinReflectionSupport.getFieldValueSafe(AE2LT_ECO_JOB_FIELD, this);
-        return val instanceof ExecutingCraftingJob ecj ? ecj : null;
+    private Object ae2lt$getJob() {
+        var job = MixinReflectionSupport.getFieldValueSafe(AE2LT_ECO_JOB_FIELD, this);
+        return AE2LT_ECO_JOB_CLASS != null && AE2LT_ECO_JOB_CLASS.isInstance(job) ? job : null;
     }
 
     @Unique
@@ -371,6 +393,49 @@ public abstract class ECOCraftingCpuLogicMixin {
     @Nullable
     private Object ae2lt$getCpu() {
         return MixinReflectionSupport.getFieldValueSafe(AE2LT_ECO_CPU_FIELD, this);
+    }
+
+    @Unique
+    @Nullable
+    private ListCraftingInventory ae2lt$getJobWaitingFor(Object job) {
+        Object val = MixinReflectionSupport.getFieldValueSafe(AE2LT_ECO_JOB_WAITING_FOR_FIELD, job);
+        return val instanceof ListCraftingInventory inv ? inv : null;
+    }
+
+    @Unique
+    @Nullable
+    private GenericStack ae2lt$getJobFinalOutput(Object job) {
+        Object val = MixinReflectionSupport.getFieldValueSafe(AE2LT_ECO_JOB_FINAL_OUTPUT_FIELD, job);
+        return val instanceof GenericStack stack ? stack : null;
+    }
+
+    @Unique
+    private long ae2lt$getJobRemainingAmount(Object job) {
+        return MixinReflectionSupport.getLongFieldSafe(AE2LT_ECO_JOB_REMAINING_AMOUNT_FIELD, job, 0L);
+    }
+
+    @Unique
+    private void ae2lt$setJobRemainingAmount(Object job, long remainingAmount) {
+        MixinReflectionSupport.setLongFieldSafe(
+                AE2LT_ECO_JOB_REMAINING_AMOUNT_FIELD, job, remainingAmount,
+                "set ECO job remaining amount");
+    }
+
+    @Unique
+    @Nullable
+    private CraftingLink ae2lt$getJobLink(Object job) {
+        Object val = MixinReflectionSupport.getFieldValueSafe(AE2LT_ECO_JOB_LINK_FIELD, job);
+        return val instanceof CraftingLink link ? link : null;
+    }
+
+    @Unique
+    private void ae2lt$decrementJobItems(Object job, long amount, AEKeyType keyType) {
+        var timeTracker = MixinReflectionSupport.getFieldValueSafe(AE2LT_ECO_JOB_TIME_TRACKER_FIELD, job);
+        if (timeTracker != null) {
+            MixinReflectionSupport.invokeMethodSafe(
+                    AE2LT_ECO_DECREMENT_ITEMS_METHOD, timeTracker,
+                    "decrement ECO job items", amount, keyType);
+        }
     }
 
     @Unique
