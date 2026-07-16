@@ -54,22 +54,26 @@ public abstract class CraftingCalculationMixin implements FastCraftingControl {
     abstract net.minecraft.world.level.Level getLevel();
 
     @Unique
-    private boolean ae2lt$fastPlanningEnabled = CoreConfig.FAST_PATH_ENABLED;
+    private boolean ae2lt$fastPlanningInitialized;
+
+    @Unique
+    private boolean ae2lt$fastPlanningEnabled;
 
     @Override
     public void ae2lt$setFastPlanningEnabled(boolean enabled) {
+        this.ae2lt$fastPlanningInitialized = true;
         this.ae2lt$fastPlanningEnabled = enabled;
     }
 
     @Override
     public boolean ae2lt$isFastPlanningEnabled() {
-        return this.ae2lt$fastPlanningEnabled;
+        return ae2lt$getFastPlanningEnabled();
     }
 
     @Inject(method = "runCraftAttempt", at = @At("HEAD"), cancellable = true, remap = false)
     private void ae2ltCore$fastAttempt(boolean simulate, long amount,
                                        CallbackInfoReturnable<CraftingPlan> cir) {
-        if (!this.ae2lt$fastPlanningEnabled) {
+        if (!ae2lt$getFastPlanningEnabled()) {
             return;
         }
         var gridNode = simRequester.getGridNode();
@@ -98,5 +102,14 @@ public abstract class CraftingCalculationMixin implements FastCraftingControl {
         } finally {
             FastPlanningWatchdog.stop();
         }
+    }
+
+    @Unique
+    private boolean ae2lt$getFastPlanningEnabled() {
+        if (!this.ae2lt$fastPlanningInitialized) {
+            this.ae2lt$fastPlanningEnabled = CoreConfig.FAST_PATH_ENABLED;
+            this.ae2lt$fastPlanningInitialized = true;
+        }
+        return this.ae2lt$fastPlanningEnabled;
     }
 }

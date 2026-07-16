@@ -62,12 +62,13 @@ public abstract class PathingCalculationCapMixin {
     @Unique private boolean ae2lt$useMaxFlow;
     @Unique private BorrowedCapacityCalculator.Result ae2lt$flowResult;
     // -1 = not applicable, fall through to vanilla channelsInUse
-    @Unique private int ae2lt$maxFlowChannelsInUse = -1;
+    @Unique private int ae2lt$maxFlowChannelsInUse;
 
     // ── Phase 1: constructor – identify & unify overloaded controllers ──
 
     @Inject(method = "<init>", at = @At("TAIL"))
     private void ae2lt$unifyOverloadedControllers(IGrid grid, CallbackInfo ci) {
+        ae2lt$maxFlowChannelsInUse = -1;
         var allControllers = OverloadedChannelOwnerHelper.getAllControllerNodes(grid);
 
         List<IGridNode> overloaded = new ArrayList<>();

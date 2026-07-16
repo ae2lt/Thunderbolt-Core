@@ -60,16 +60,16 @@ public abstract class TimeWheelCraftingServiceMixin {
             .thenComparingLong(TimeWheelCraftingCpuPool::getAvailableStorage);
 
     @Unique
-    private final Set<IGridNode> thunderbolt$timeWheelProviderNodes = Collections
-            .newSetFromMap(new IdentityHashMap<>());
+    @Nullable
+    private Set<IGridNode> thunderbolt$timeWheelProviderNodes;
 
     @Unique
-    private final Set<TimeWheelCraftingCpuPool> thunderbolt$timeWheelPools = Collections
-            .newSetFromMap(new IdentityHashMap<>());
+    @Nullable
+    private Set<TimeWheelCraftingCpuPool> thunderbolt$timeWheelPools;
 
     @Unique
-    private final Set<TimeWheelCraftingCpuPool> thunderbolt$refreshedTimeWheelPools = Collections
-            .newSetFromMap(new IdentityHashMap<>());
+    @Nullable
+    private Set<TimeWheelCraftingCpuPool> thunderbolt$refreshedTimeWheelPools;
 
     @Shadow
     @Final
@@ -102,7 +102,7 @@ public abstract class TimeWheelCraftingServiceMixin {
                                                                 CalculationStrategy strategy,
                                                                 CallbackInfoReturnable<Future<ICraftingPlan>> cir,
                                                                 @Local CraftingCalculation job) {
-        boolean enabled = TimeWheelFastPlanningGate.shouldEnableFastPlanning(this.thunderbolt$timeWheelPools);
+        boolean enabled = TimeWheelFastPlanningGate.shouldEnableFastPlanning(thunderbolt$getTimeWheelPools());
         ((FastCraftingControl) job).ae2lt$setFastPlanningEnabled(enabled);
     }
 
@@ -117,7 +117,7 @@ public abstract class TimeWheelCraftingServiceMixin {
                                                  @Local(ordinal = 0) LocalLongRef latestChange) {
         thunderbolt$refreshTimeWheelPools();
         long latest = latestChange.get();
-        for (var pool : this.thunderbolt$timeWheelPools) {
+        for (var pool : thunderbolt$getTimeWheelPools()) {
             latest = Math.max(latest, pool.tickCraftingLogic(this.energyGrid, (CraftingService) (Object) this));
             if (pool.consumeCpuListChanged()) {
                 this.updateList = true;
@@ -134,14 +134,14 @@ public abstract class TimeWheelCraftingServiceMixin {
                     opcode = Opcodes.GETFIELD,
                     ordinal = 0))
     private void thunderbolt$addTimeWheelWaitingKeys(CallbackInfo ci) {
-        for (var pool : this.thunderbolt$timeWheelPools) {
+        for (var pool : thunderbolt$getTimeWheelPools()) {
             pool.addWaitingKeys(this.currentlyCrafting);
         }
     }
 
     @Inject(method = "removeNode", at = @At("TAIL"))
     private void thunderbolt$onRemoveNode(IGridNode gridNode, CallbackInfo ci) {
-        if (this.thunderbolt$timeWheelProviderNodes.remove(gridNode)) {
+        if (thunderbolt$getTimeWheelProviderNodes().remove(gridNode)) {
             thunderbolt$refreshTimeWheelPools();
         }
     }
@@ -149,18 +149,19 @@ public abstract class TimeWheelCraftingServiceMixin {
     @Inject(method = "addNode", at = @At("TAIL"))
     private void thunderbolt$onAddNode(IGridNode gridNode, CompoundTag savedData, CallbackInfo ci) {
         if (thunderbolt$getTimeWheelProvider(gridNode) != null) {
-            this.thunderbolt$timeWheelProviderNodes.add(gridNode);
+            thunderbolt$getTimeWheelProviderNodes().add(gridNode);
             thunderbolt$refreshTimeWheelPools();
         }
     }
 
     @Inject(method = "updateCPUClusters", at = @At("TAIL"))
     private void thunderbolt$updateTimeWheelPools(CallbackInfo ci) {
-        this.thunderbolt$timeWheelProviderNodes.clear();
+        var providerNodes = thunderbolt$getTimeWheelProviderNodes();
+        providerNodes.clear();
         for (var machineClass : this.grid.getMachineClasses()) {
             for (var node : this.grid.getMachineNodes(machineClass)) {
                 if (thunderbolt$getTimeWheelProvider(node) != null) {
-                    this.thunderbolt$timeWheelProviderNodes.add(node);
+                    providerNodes.add(node);
                 }
             }
         }
@@ -176,7 +177,7 @@ public abstract class TimeWheelCraftingServiceMixin {
                                                        Actionable type,
                                                        CallbackInfoReturnable<Long> cir,
                                                        @Local(ordinal = 1) LocalLongRef inserted) {
-        for (var pool : this.thunderbolt$timeWheelPools) {
+        for (var pool : thunderbolt$getTimeWheelPools()) {
             if (inserted.get() >= amount) {
                 break;
             }
@@ -236,7 +237,7 @@ public abstract class TimeWheelCraftingServiceMixin {
                     target = "Lcom/google/common/collect/ImmutableSet$Builder;build()Lcom/google/common/collect/ImmutableSet;"))
     private void thunderbolt$getTimeWheelCpus(CallbackInfoReturnable<ImmutableSet<ICraftingCPU>> cir,
                                                @Local(ordinal = 0) ImmutableSet.Builder<ICraftingCPU> cpus) {
-        for (var pool : this.thunderbolt$timeWheelPools) {
+        for (var pool : thunderbolt$getTimeWheelPools()) {
             if (!pool.isActive()) {
                 continue;
             }
@@ -252,7 +253,7 @@ public abstract class TimeWheelCraftingServiceMixin {
     @Inject(method = "getRequestedAmount", at = @At("RETURN"), cancellable = true)
     private void thunderbolt$getTimeWheelRequestedAmount(AEKey what, CallbackInfoReturnable<Long> cir) {
         long requested = cir.getReturnValue();
-        for (var pool : this.thunderbolt$timeWheelPools) {
+        for (var pool : thunderbolt$getTimeWheelPools()) {
             long addition = pool.getRequestedAmount(what);
             requested = requested >= Long.MAX_VALUE - addition ? Long.MAX_VALUE : requested + addition;
         }
@@ -261,7 +262,7 @@ public abstract class TimeWheelCraftingServiceMixin {
 
     @Inject(method = "hasCpu", at = @At("HEAD"), cancellable = true)
     private void thunderbolt$hasTimeWheelCpu(ICraftingCPU cpu, CallbackInfoReturnable<Boolean> cir) {
-        for (var pool : this.thunderbolt$timeWheelPools) {
+        for (var pool : thunderbolt$getTimeWheelPools()) {
             if (pool.containsCpu(cpu)) {
                 cir.setReturnValue(true);
                 return;
@@ -271,7 +272,7 @@ public abstract class TimeWheelCraftingServiceMixin {
 
     @Unique
     private void thunderbolt$addTimeWheelPool(TimeWheelCraftingCpuPool pool) {
-        if (!this.thunderbolt$timeWheelPools.add(pool)) {
+        if (!thunderbolt$getTimeWheelPools().add(pool)) {
             return;
         }
         pool.resolvePendingLoad();
@@ -280,21 +281,24 @@ public abstract class TimeWheelCraftingServiceMixin {
 
     @Unique
     private void thunderbolt$refreshTimeWheelPools() {
-        this.thunderbolt$refreshedTimeWheelPools.clear();
-        for (var node : this.thunderbolt$timeWheelProviderNodes) {
+        var providerNodes = thunderbolt$getTimeWheelProviderNodes();
+        var pools = thunderbolt$getTimeWheelPools();
+        var refreshedPools = thunderbolt$getRefreshedTimeWheelPools();
+        refreshedPools.clear();
+        for (var node : providerNodes) {
             var provider = thunderbolt$getTimeWheelProvider(node);
             if (provider == null) {
                 continue;
             }
             var pool = provider.getTimeWheelCraftingCpuPool();
             if (pool != null) {
-                this.thunderbolt$refreshedTimeWheelPools.add(pool);
+                refreshedPools.add(pool);
             }
         }
 
-        boolean changed = !this.thunderbolt$timeWheelPools.equals(this.thunderbolt$refreshedTimeWheelPools);
-        this.thunderbolt$timeWheelPools.removeIf(pool -> !this.thunderbolt$refreshedTimeWheelPools.contains(pool));
-        for (var pool : this.thunderbolt$refreshedTimeWheelPools) {
+        boolean changed = !pools.equals(refreshedPools);
+        pools.removeIf(pool -> !refreshedPools.contains(pool));
+        for (var pool : refreshedPools) {
             thunderbolt$addTimeWheelPool(pool);
         }
         if (changed) {
@@ -313,16 +317,41 @@ public abstract class TimeWheelCraftingServiceMixin {
     }
 
     @Unique
+    private Set<IGridNode> thunderbolt$getTimeWheelProviderNodes() {
+        if (this.thunderbolt$timeWheelProviderNodes == null) {
+            this.thunderbolt$timeWheelProviderNodes = Collections.newSetFromMap(new IdentityHashMap<>());
+        }
+        return this.thunderbolt$timeWheelProviderNodes;
+    }
+
+    @Unique
+    private Set<TimeWheelCraftingCpuPool> thunderbolt$getTimeWheelPools() {
+        if (this.thunderbolt$timeWheelPools == null) {
+            this.thunderbolt$timeWheelPools = Collections.newSetFromMap(new IdentityHashMap<>());
+        }
+        return this.thunderbolt$timeWheelPools;
+    }
+
+    @Unique
+    private Set<TimeWheelCraftingCpuPool> thunderbolt$getRefreshedTimeWheelPools() {
+        if (this.thunderbolt$refreshedTimeWheelPools == null) {
+            this.thunderbolt$refreshedTimeWheelPools = Collections.newSetFromMap(new IdentityHashMap<>());
+        }
+        return this.thunderbolt$refreshedTimeWheelPools;
+    }
+
+    @Unique
     @Nullable
     private TimeWheelCraftingCpuPool thunderbolt$findSuitableTimeWheelPool(
             ICraftingPlan job,
             IActionSource src,
             MutableObject<UnsuitableCpus> unsuitableCpusResult) {
-        var valid = new ArrayList<TimeWheelCraftingCpuPool>(this.thunderbolt$timeWheelPools.size());
+        var pools = thunderbolt$getTimeWheelPools();
+        var valid = new ArrayList<TimeWheelCraftingCpuPool>(pools.size());
         int offline = 0;
         int tooSmall = 0;
         int excluded = 0;
-        for (var pool : this.thunderbolt$timeWheelPools) {
+        for (var pool : pools) {
             if (!pool.isActive()) {
                 offline++;
                 continue;
