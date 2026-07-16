@@ -9,34 +9,43 @@ public final class BatchCpuAccounting {
         QUADRATIC
     }
 
-    public static int maxCopiesForCpuOps(int cpuOps, Mode mode) {
+    public static long maxCopiesForCpuOps(int cpuOps, Mode mode) {
         if (cpuOps <= 0) return 0;
         if (mode == Mode.LINEAR) return cpuOps;
-        return maxCopiesForCpuOps(cpuOps);
+        return (long) cpuOps * cpuOps;
     }
 
     public static int cpuOpsForCopies(int copies, Mode mode) {
+        return cpuOpsForCopies((long) copies, mode);
+    }
+
+    public static int cpuOpsForCopies(long copies, Mode mode) {
         if (copies <= 0) return 0;
-        if (mode == Mode.LINEAR) return copies;
+        if (mode == Mode.LINEAR) return copies >= Integer.MAX_VALUE ? Integer.MAX_VALUE : (int) copies;
         return cpuOpsForCopies(copies);
     }
 
-    public static int maxCopiesForCpuOps(int cpuOps) {
+    public static long maxCopiesForCpuOps(int cpuOps) {
         if (cpuOps <= 0) return 0;
-        long maxCopies = (long) cpuOps * cpuOps;
-        return maxCopies >= Integer.MAX_VALUE ? Integer.MAX_VALUE : (int) maxCopies;
+        return (long) cpuOps * cpuOps;
     }
 
     public static int cpuOpsForCopies(int copies) {
-        if (copies <= 0) return 0;
+        return cpuOpsForCopies((long) copies);
+    }
 
-        int root = (int) Math.sqrt(copies);
-        while ((long) root * root < copies) {
+    public static int cpuOpsForCopies(long copies) {
+        if (copies <= 0) return 0;
+        long maxRepresentableCopies = (long) Integer.MAX_VALUE * Integer.MAX_VALUE;
+        if (copies >= maxRepresentableCopies) return Integer.MAX_VALUE;
+
+        long root = (long) Math.sqrt(copies);
+        while (root * root < copies) {
             root++;
         }
-        while (root > 0 && (long) (root - 1) * (root - 1) >= copies) {
+        while (root > 0 && (root - 1) * (root - 1) >= copies) {
             root--;
         }
-        return root;
+        return (int) root;
     }
 }

@@ -43,7 +43,7 @@ public final class CraftingCore implements Sweepable {
     private final CraftingCoreRegistry registry;
     private final WheelCell[] wheel = new WheelCell[WHEEL_SIZE];
     private final Map<IPatternDetails, Map<InputSignature, CachedAssembly>> assemblyCache = new IdentityHashMap<>();
-    private int threadsInFlight;
+    private long threadsInFlight;
     private long lastSweptTick;
 
     public CraftingCore(CraftingCoreHost host, CopyAssembler assembler, CraftingCoreRegistry registry) {
@@ -64,7 +64,7 @@ public final class CraftingCore implements Sweepable {
      * template (NOT multiplied by {@code copies}); materials are assumed to have been extracted
      * upstream already.
      */
-    public int pushBatch(IPatternDetails details, KeyCounter[] oneCopyTemplate, int copies, int delay) {
+    public long pushBatch(IPatternDetails details, KeyCounter[] oneCopyTemplate, long copies, int delay) {
         if (copies <= 0 || oneCopyTemplate == null) return 0;
         if (!(details instanceof IMolecularAssemblerSupportedPattern)) return 0;
 
@@ -76,7 +76,7 @@ public final class CraftingCore implements Sweepable {
         }
 
         WheelCell cell = wheel[(int) ((now + d) & WHEEL_MASK)];
-        int accepted = appendableCopies(cell, copies);
+        long accepted = appendableCopies(cell, copies);
         if (accepted <= 0) {
             return 0;
         }
@@ -157,12 +157,12 @@ public final class CraftingCore implements Sweepable {
     }
 
     /** Sweep matured cells up to now, then report total in-flight copies (for the rate limiter). */
-    public int liveThreads() {
+    public long liveThreads() {
         sweepNonLive(host.getGameTime());
         return threadsInFlight;
     }
 
-    public int threadsInFlight() {
+    public long threadsInFlight() {
         return threadsInFlight;
     }
 
@@ -202,7 +202,7 @@ public final class CraftingCore implements Sweepable {
 
             var cellTag = new CompoundTag();
             cellTag.putByte(NBT_INDEX, (byte) i);
-            cellTag.putInt(NBT_COPIES, cell.copies);
+            cellTag.putLong(NBT_COPIES, cell.copies);
             var outputs = new ListTag();
             for (Object2LongMap.Entry<AEKey> entry : cell.outputs.object2LongEntrySet()) {
                 if (entry.getKey() == null || entry.getLongValue() <= 0) continue;
@@ -230,7 +230,7 @@ public final class CraftingCore implements Sweepable {
         for (int i = 0; i < cells.size(); i++) {
             CompoundTag cellTag = cells.getCompound(i);
             int idx = cellTag.getByte(NBT_INDEX) & WHEEL_MASK;
-            int copies = cellTag.getInt(NBT_COPIES);
+            long copies = cellTag.getLong(NBT_COPIES);
             if (copies <= 0) continue;
 
             WheelCell cell = wheel[idx];
@@ -333,16 +333,16 @@ public final class CraftingCore implements Sweepable {
         threadsInFlight = 0;
     }
 
-    private int appendableCopies(WheelCell cell, int requested) {
-        int cellSpace = Integer.MAX_VALUE - cell.copies;
-        int globalSpace = Integer.MAX_VALUE - threadsInFlight;
+    private long appendableCopies(WheelCell cell, long requested) {
+        long cellSpace = Long.MAX_VALUE - cell.copies;
+        long globalSpace = Long.MAX_VALUE - threadsInFlight;
         return Math.min(requested, Math.min(cellSpace, globalSpace));
     }
 
-    private static long saturatedMultiply(long amount, int copies) {
+    private static long saturatedMultiply(long amount, long copies) {
         if (amount <= 0 || copies <= 0) return 0L;
         if (amount > Long.MAX_VALUE / copies) return Long.MAX_VALUE;
-        return amount * (long) copies;
+        return amount * copies;
     }
 
     private static long saturatedAdd(long left, long right) {

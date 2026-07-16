@@ -18,12 +18,12 @@ public final class ParallelBatchCpuHelper {
     }
 
     @Nullable
-    public static BulkResult bulkExtract(IPatternDetails details, ListCraftingInventory inv, int maxCraft) {
+    public static BulkResult bulkExtract(IPatternDetails details, ListCraftingInventory inv, long maxCraft) {
         return bulkExtract(details, inv, maxCraft, true, Map.of());
     }
 
     @Nullable
-    public static BulkResult bulkExtract(IPatternDetails details, ListCraftingInventory inv, int maxCraft,
+    public static BulkResult bulkExtract(IPatternDetails details, ListCraftingInventory inv, long maxCraft,
                                          boolean allowSharedInputs, Map<AEKey, Long> reservedStock) {
         if (maxCraft <= 0) return null;
 
@@ -90,8 +90,6 @@ public final class ParallelBatchCpuHelper {
             if (variable > 0) actual = Math.min(actual, (entry.getValue() - fixed) / variable);
             if (actual <= 0) return null;
         }
-        if (actual > Integer.MAX_VALUE) return null;
-
         var extractedByKey = new HashMap<AEKey, Long>(availableByKey.size() * 2);
         for (var entry : availableByKey.entrySet()) {
             long need = saturatingAdd(
@@ -115,12 +113,12 @@ public final class ParallelBatchCpuHelper {
             long amount = shared[slot] ? units[slot] : saturatingMultiply(units[slot], actual);
             if (amount > 0) scaled[slot].add(chosenKeys[slot], amount);
         }
-        return new BulkResult(scaled, (int) actual, chosenKeys, units, shared);
+        return new BulkResult(scaled, actual, chosenKeys, units, shared);
     }
 
-    public static void reinject(BulkResult result, int leftoverCopies, ListCraftingInventory inv) {
+    public static void reinject(BulkResult result, long leftoverCopies, ListCraftingInventory inv) {
         if (leftoverCopies <= 0) return;
-        int returnedCopies = Math.min(leftoverCopies, result.remainingCopies);
+        long returnedCopies = Math.min(leftoverCopies, result.remainingCopies);
         for (int slot = 0; slot < result.scaledInputs.length; slot++) {
             if (result.sharedInputs[slot]) continue;
             long amount = saturatingMultiply(result.units[slot], returnedCopies);
@@ -134,17 +132,17 @@ public final class ParallelBatchCpuHelper {
     }
 
     public static void registerExpectedOutputs(BatchJobView job, IPatternDetails details,
-                                               BulkResult result, int dispatched) {
+                                               BulkResult result, long dispatched) {
         registerExpectedOutputs(job, details, result.keys, result.sharedInputs, dispatched);
     }
 
     public static void registerExpectedOutputs(BatchJobView job, IPatternDetails details,
-                                               AEKey[] chosenKeys, int dispatched) {
+                                               AEKey[] chosenKeys, long dispatched) {
         registerExpectedOutputs(job, details, chosenKeys, null, dispatched);
     }
 
     private static void registerExpectedOutputs(BatchJobView job, IPatternDetails details,
-                                                AEKey[] chosenKeys, boolean[] shared, int dispatched) {
+                                                AEKey[] chosenKeys, boolean[] shared, long dispatched) {
         if (dispatched <= 0) return;
         var executionDetails = details instanceof ExecuteLoopPattern loop
                 ? loop.delegate() : details;
@@ -187,7 +185,7 @@ public final class ParallelBatchCpuHelper {
         return copySlice(result, 1);
     }
 
-    public static KeyCounter[] copySlice(BulkResult result, int sliceCount) {
+    public static KeyCounter[] copySlice(BulkResult result, long sliceCount) {
         var slice = new KeyCounter[result.scaledInputs.length];
         for (int slot = 0; slot < slice.length; slot++) {
             slice[slot] = new KeyCounter();
@@ -199,9 +197,9 @@ public final class ParallelBatchCpuHelper {
         return slice;
     }
 
-    public static void markDispatched(BulkResult result, int dispatchedCopies) {
+    public static void markDispatched(BulkResult result, long dispatchedCopies) {
         if (dispatchedCopies <= 0) return;
-        int accepted = Math.min(dispatchedCopies, result.remainingCopies);
+        long accepted = Math.min(dispatchedCopies, result.remainingCopies);
         for (int slot = 0; slot < result.scaledInputs.length; slot++) {
             long amount;
             if (result.sharedInputs[slot]) {
@@ -219,14 +217,14 @@ public final class ParallelBatchCpuHelper {
 
     public static final class BulkResult {
         public final KeyCounter[] scaledInputs;
-        public final int actualCopies;
+        public final long actualCopies;
         final AEKey[] keys;
         final long[] units;
         final boolean[] sharedInputs;
-        int remainingCopies;
+        long remainingCopies;
         boolean sharedDispatched;
 
-        public BulkResult(KeyCounter[] scaledInputs, int actualCopies, AEKey[] keys,
+        public BulkResult(KeyCounter[] scaledInputs, long actualCopies, AEKey[] keys,
                           long[] units, boolean[] sharedInputs) {
             this.scaledInputs = scaledInputs;
             this.actualCopies = actualCopies;

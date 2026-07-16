@@ -521,7 +521,8 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
             return null;
         }
 
-        int actual = result.actualCopies;
+        // This non-batch path is explicitly bounded by the int maxCopies argument above.
+        int actual = (int) result.actualCopies;
         // The first clone doubles as the power probe and the first container handed to a provider.
         KeyCounter[] pending = ParallelBatchCpuHelper.cloneSingleCopy(result);
         double powerOne = patternPowerFor(details, pending);

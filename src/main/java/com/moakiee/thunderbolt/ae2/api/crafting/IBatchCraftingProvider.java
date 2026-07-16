@@ -31,13 +31,13 @@ public interface IBatchCraftingProvider extends ICraftingProvider {
      * calling {@link #pushBatch}; it is NOT a correctness constraint. {@code pushBatch} is the
      * real gatekeeper (it returns the leftover it could not accept), and the CPU's own op budget
      * also limits dispatch. Returning {@code 0} opts this provider out for now (busy / full /
-     * offline). The default returns {@link Integer#MAX_VALUE} when not busy, i.e. "no extra cap
+     * offline). The default returns {@link Long#MAX_VALUE} when not busy, i.e. "no extra cap
      * beyond what pushBatch and the CPU budget already enforce". Override with a tighter, accurate
      * value if you want to stop the CPU from over-extracting inputs that pushBatch would only
      * reinject.
      */
-    default int getBatchCapacity(IPatternDetails details) {
-        return isBusy() ? 0 : Integer.MAX_VALUE;
+    default long getBatchCapacity(IPatternDetails details) {
+        return isBusy() ? 0L : Long.MAX_VALUE;
     }
 
     /** Explicit opt-in for one reusable seed being sent once for an entire batch. */
@@ -53,10 +53,10 @@ public interface IBatchCraftingProvider extends ICraftingProvider {
      * @param maxCraft maximum copies the caller is willing to dispatch
      * @return leftover copy count in {@code [0, maxCraft]}
      */
-    int pushBatch(IPatternDetails details, KeyCounter[] oneCopyTemplate, int maxCraft);
+    long pushBatch(IPatternDetails details, KeyCounter[] oneCopyTemplate, long maxCraft);
 
     @Override
     default boolean pushPattern(IPatternDetails patternDetails, KeyCounter[] inputHolder) {
-        return pushBatch(patternDetails, inputHolder, 1) == 0;
+        return pushBatch(patternDetails, inputHolder, 1L) == 0L;
     }
 }

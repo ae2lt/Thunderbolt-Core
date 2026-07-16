@@ -74,7 +74,7 @@ public final class BatchExecutor {
         var taskIter = job.taskIterator();
         if (!taskIter.hasNext()) return BatchRunResult.EMPTY;
 
-        int totalPushed = 0;
+        long totalPushed = 0;
         int consumedOps = 0;
         int opsBudget = remainingOps;
         if (opsBudget <= 0) return BatchRunResult.EMPTY;
@@ -109,7 +109,7 @@ public final class BatchExecutor {
                 if (executionDetails instanceof SharedBatchInputPattern
                         && !batch.supportsSingleSeedBatch()) continue;
                 if (perTaskBatched != null && perTaskBatched.containsKey(provider)) continue;
-                int capacity = batch.getBatchCapacity(executionDetails);
+                long capacity = batch.getBatchCapacity(executionDetails);
                 if (capacity <= 0) continue;
                 var dispatchMode = batch.getBatchDispatchMode(executionDetails);
                 if (dispatchMode == null) {
@@ -118,7 +118,7 @@ public final class BatchExecutor {
                 if (eligible == null) {
                     eligible = new java.util.ArrayList<>();
                 }
-                eligible.add(new EligibleProvider(batch, capacity, dispatchMode));
+                eligible.add(new EligibleProvider(batch, provider, capacity, dispatchMode));
             }
             if (eligible == null) continue;
 
@@ -132,26 +132,9 @@ public final class BatchExecutor {
 
             boolean hasUnboundedProvider = eligible.stream()
                     .anyMatch(provider -> provider.mode() == BatchDispatchMode.UNBOUNDED);
-            if (!hasUnboundedProvider) {
-                // Preserve the original normal-only provider cutoff: once their combined capacity
-                // reaches Integer.MAX_VALUE, later providers do not participate in this run.
-                long capacity = 0;
-                int participatingProviders = 0;
-                for (var provider : eligible) {
-                    capacity += provider.capacity();
-                    participatingProviders++;
-                    if (capacity >= Integer.MAX_VALUE) break;
-                }
-                if (participatingProviders < eligible.size()) {
-                    eligible.subList(participatingProviders, eligible.size()).clear();
-                }
-            }
-
             long availableBatchCapacity = 0;
             for (var provider : eligible) {
-                availableBatchCapacity = Math.min(
-                        Integer.MAX_VALUE,
-                        availableBatchCapacity + provider.capacity());
+                availableBatchCapacity = saturatingAdd(availableBatchCapacity, provider.capacity());
             }
             if (availableBatchCapacity <= 0) continue;
 
@@ -159,19 +142,19 @@ public final class BatchExecutor {
             // CPU copy budget. Normal providers retain the smaller-first balancing order.
             eligible.sort(java.util.Comparator
                     .comparing((EligibleProvider provider) -> provider.mode() != BatchDispatchMode.UNBOUNDED)
-                    .thenComparingInt(EligibleProvider::capacity));
+                    .thenComparingLong(EligibleProvider::capacity));
 
-            int copyBudget = hasUnboundedProvider
-                    ? Integer.MAX_VALUE
+            long copyBudget = hasUnboundedProvider
+                    ? Long.MAX_VALUE
                     : BatchCpuAccounting.maxCopiesForCpuOps(opsBudget, accountingMode);
             if (copyBudget <= 0) {
                 if (dirty) markDirty.run();
                 return new BatchRunResult(totalPushed, consumedOps, sawBatchProvider);
             }
 
-            int budget = (int) Math.min(Math.min(taskValue, availableBatchCapacity), copyBudget);
+            long budget = Math.min(Math.min(taskValue, availableBatchCapacity), copyBudget);
             if (details instanceof BatchCopyLimitPattern limited) {
-                budget = Math.min(budget, Math.max(1, limited.maxBatchCopies()));
+                budget = Math.min(budget, Math.max(1L, limited.maxBatchCopies()));
             }
             if (budget <= 0) continue;
 
@@ -181,48 +164,48 @@ public final class BatchExecutor {
                 continue;
             }
 
-            int realCraft = result.actualCopies;
+            long realCraft = result.actualCopies;
             double powerForReal = CraftingCpuHelper.calculatePatternPower(result.scaledInputs);
             double powerOne = realCraft > 0 ? powerForReal / realCraft : 0.0D;
             double availablePower = es.extractAEPower(powerForReal, Actionable.SIMULATE, PowerMultiplier.CONFIG);
             if (availablePower < powerForReal - 0.01D) {
-                int affordable = powerOne > 0.0D ? (int) Math.floor(availablePower / powerOne) : 0;
+                long affordable = powerOne > 0.0D ? floorToLong(availablePower / powerOne) : 0L;
                 if (affordable <= 0) {
                     ParallelBatchCpuHelper.reinject(result, realCraft, inv);
                     if (dirty) markDirty.run();
                     return new BatchRunResult(totalPushed, consumedOps, sawBatchProvider);
                 }
-                int scaleDown = realCraft - affordable;
+                long scaleDown = realCraft - affordable;
                 if (scaleDown > 0) {
                     ParallelBatchCpuHelper.reinject(result, scaleDown, inv);
                     realCraft = affordable;
                 }
             }
 
-            int initialRealCraft = realCraft;
-            int leftover = realCraft;
+            long initialRealCraft = realCraft;
+            long leftover = realCraft;
             KeyCounter[] oneCopy = ParallelBatchCpuHelper.cloneSingleCopy(result);
 
             for (int i = 0; i < eligible.size() && leftover > 0; i++) {
                 var eligibleProvider = eligible.get(i);
                 var batch = eligibleProvider.provider();
                 boolean unbounded = eligibleProvider.mode() == BatchDispatchMode.UNBOUNDED;
-                int sliceCap = unbounded
-                        ? Integer.MAX_VALUE
+                long sliceCap = unbounded
+                        ? Long.MAX_VALUE
                         : BatchCpuAccounting.maxCopiesForCpuOps(opsBudget, accountingMode);
                 if (sliceCap <= 0) break;
-                int slice;
+                long slice;
                 if (unbounded) {
                     slice = leftover;
                 } else {
                     int remainingProviders = eligible.size() - i;
-                    slice = Math.max(1, leftover / remainingProviders);
+                    slice = Math.max(1L, leftover / remainingProviders);
                 }
                 slice = Math.min(slice, leftover);
                 slice = Math.min(slice, sliceCap);
                 slice = Math.min(slice, eligibleProvider.capacity());
 
-                int subLeftover;
+                long subLeftover;
                 try {
                     subLeftover = batch.pushBatch(executionDetails, oneCopy, slice);
                 } catch (Throwable t) {
@@ -236,7 +219,7 @@ public final class BatchExecutor {
                     subLeftover = slice;
                 }
 
-                int dispatched = slice - subLeftover;
+                long dispatched = slice - subLeftover;
                 if (dispatched <= 0) continue;
 
                 ParallelBatchCpuHelper.markDispatched(result, dispatched);
@@ -259,7 +242,7 @@ public final class BatchExecutor {
                     if (perTaskBatched == null) {
                         perTaskBatched = batchedByTask.computeIfAbsent(details, key -> new IdentityHashMap<>());
                     }
-                    perTaskBatched.put((ICraftingProvider) batch, Boolean.TRUE);
+                    perTaskBatched.put(eligibleProvider.identity(), Boolean.TRUE);
                 }
 
                 if (newValue <= 0) {
@@ -294,16 +277,22 @@ public final class BatchExecutor {
         return new BatchRunResult(totalPushed, consumedOps, sawBatchProvider);
     }
 
-    private static int saturatingAdd(int left, int right) {
+    private static long saturatingAdd(long left, long right) {
         if (right <= 0) return left;
-        return left > Integer.MAX_VALUE - right ? Integer.MAX_VALUE : left + right;
+        return left > Long.MAX_VALUE - right ? Long.MAX_VALUE : left + right;
     }
 
-    private record EligibleProvider(IBatchCraftingProvider provider, int capacity, BatchDispatchMode mode) {
+    private static long floorToLong(double value) {
+        if (!Double.isFinite(value) || value >= Long.MAX_VALUE) return Long.MAX_VALUE;
+        return value <= 0.0D ? 0L : (long) Math.floor(value);
     }
 
-    public record BatchRunResult(int dispatchedCopies, int consumedCpuOps, boolean sawBatchProvider) {
-        public static final BatchRunResult EMPTY = new BatchRunResult(0, 0, false);
+    private record EligibleProvider(IBatchCraftingProvider provider, ICraftingProvider identity,
+                                    long capacity, BatchDispatchMode mode) {
+    }
+
+    public record BatchRunResult(long dispatchedCopies, int consumedCpuOps, boolean sawBatchProvider) {
+        public static final BatchRunResult EMPTY = new BatchRunResult(0L, 0, false);
 
         public boolean shouldRetryBatchThisTick() {
             return dispatchedCopies > 0;
