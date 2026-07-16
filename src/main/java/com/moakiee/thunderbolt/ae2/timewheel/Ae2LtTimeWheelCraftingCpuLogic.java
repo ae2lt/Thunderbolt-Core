@@ -7,6 +7,7 @@ import java.util.HashMap;
 import java.util.HashSet;
 import java.util.IdentityHashMap;
 import java.util.Iterator;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -60,11 +61,21 @@ import com.moakiee.thunderbolt.ae2.batch.BatchCpuAccounting;
 import com.moakiee.thunderbolt.ae2.batch.BatchJobView;
 import com.moakiee.thunderbolt.ae2.batch.BatchTaskHandle;
 import com.moakiee.thunderbolt.ae2.batch.ParallelBatchCpuHelper;
+import com.moakiee.thunderbolt.ae2.api.crafting.CraftingTaskPriorities;
+import com.moakiee.thunderbolt.ae2.api.crafting.CraftingPatternDelegates;
+import com.moakiee.thunderbolt.ae2.api.crafting.ISeedPreservingCraftingTask;
 import com.moakiee.thunderbolt.ae2.mixin.ElapsedTimeTrackerAccessor;
 import com.moakiee.thunderbolt.ae2.overload.cpu.OverloadClaimResult;
+import com.moakiee.thunderbolt.ae2.overload.cpu.OverloadConsumerCredit;
 import com.moakiee.thunderbolt.ae2.overload.cpu.OverloadCpuStateManager;
 import com.moakiee.thunderbolt.ae2.overload.cpu.OverloadPatternReference;
+import com.moakiee.thunderbolt.ae2.overload.cpu.OverloadReusableSeedMetadata;
+import com.moakiee.thunderbolt.ae2.overload.model.MatchMode;
 import com.moakiee.thunderbolt.ae2.overload.pattern.OverloadedProviderOnlyPatternDetails;
+import com.moakiee.thunderbolt.ae2.crafting.PatternFiringExpander;
+import com.moakiee.thunderbolt.ae2.crafting.ExecuteLoopPattern;
+import com.moakiee.thunderbolt.ae2.crafting.LoopCraftingPlan;
+import com.moakiee.thunderbolt.core.planner.Sat;
 
 public final class Ae2LtTimeWheelCraftingCpuLogic {
     private static final int WHEEL_SIZE = 64;
@@ -75,6 +86,9 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
     private static final String TAG_INVENTORY = "inventory";
     private static final String TAG_JOB = "job";
     private static final String TAG_OVERLOAD_STATE = "ae2ltOverloadState";
+    private static final String TAG_SEED_RETURN_QUOTA = "reusableSeedReturnQuota";
+    private static final String TAG_SEED_RETURN_QUOTA_FINALIZED = "reusableSeedReturnQuotaFinalized";
+    private static final String TAG_RETAINED_FINAL_OUTPUTS = "retainedLoopFinalOutputs";
 
     private static final String NBT_LINK = "link";
     private static final String NBT_PLAYER_ID = "playerId";
@@ -84,7 +98,16 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
     private static final String NBT_REMAINING_AMOUNT = "remainingAmount";
     private static final String NBT_TASKS = "tasks";
     private static final String NBT_SUSPENDED = "suspended";
+    private static final String NBT_SOFT_CANCELLING = "softCancelling";
     private static final String NBT_CRAFTING_PROGRESS = "#craftingProgress";
+    private static final String NBT_INPUT_SEED = "#inputSeed";
+    private static final String NBT_INITIAL_SEED = "#initialSeed";
+    private static final String NBT_OUTPUT_SEED = "#outputSeed";
+    private static final String NBT_SEED_CONSUMER = "#seedConsumer";
+    private static final String NBT_OUTPUT_SEED_CREDITS = "#outputSeedCredits";
+    private static final String NBT_SHARED_OUTPUT_SEED_CREDITS = "#sharedOutputSeedCredits";
+    private static final String NBT_CREDIT_CONSUMER = "consumer";
+    private static final String NBT_CREDIT_ITEMS = "items";
 
     private final TimeWheelCraftingCPU cpu;
     private final ListCraftingInventory inventory = new ListCraftingInventory(this::postChange);
@@ -108,6 +131,9 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
     // per-copy dispatch loop (it was ~7% of the CPU tick in profiling). Keyed by pattern identity;
     // cleared on every job lifecycle transition below.
     private final Map<IPatternDetails, Double> patternPowerCache = new IdentityHashMap<>();
+    private final KeyCounter seedReturnQuota = new KeyCounter();
+    private final KeyCounter retainedFinalOutputs = new KeyCounter();
+    private final LoopSeedLedgerBook loopSeedLedgers = new LoopSeedLedgerBook();
 
     @Nullable
     private TimeWheelJob job;
@@ -123,6 +149,7 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
     private boolean queueRebuildNeeded = true;
     private boolean cantStoreItems;
     private boolean batchingStatusChanges;
+    private boolean seedReturnQuotaFinalized;
 
     public Ae2LtTimeWheelCraftingCpuLogic(TimeWheelCraftingCPU cpu) {
         this.cpu = cpu;
@@ -145,17 +172,100 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
             AELog.warn("Time wheel crafting CPU inventory is not empty yet a job was submitted.");
         }
 
-        var missingIngredient = CraftingCpuHelper.tryExtractInitialItems(plan, grid, inventory, src);
-        if (missingIngredient != null) {
-            return CraftingSubmitResult.missingIngredient(missingIngredient);
-        }
-
+        var loopPlan = plan instanceof LoopCraftingPlan loop ? loop : null;
+        var seedRequirements = loopPlan != null
+                ? copyToCounter(loopPlan.totalReusableSeeds()) : new KeyCounter();
+        var hostSeedAllocations = loopPlan != null
+                ? loopPlan.hostReusableSeedAllocations() : List.<LoopCraftingPlan.HostReusableSeedAllocation>of();
         var playerId = src.player()
                 .map(p -> p instanceof ServerPlayer serverPlayer ? IPlayerRegistry.getPlayerId(serverPlayer) : null)
                 .orElse(null);
         var craftId = UUID.randomUUID();
-        var linkCpu = new CraftingLink(CraftingCpuHelper.generateLinkData(craftId, requester == null, false), cpu);
-        this.job = new TimeWheelJob(plan, this::postChange, linkCpu, playerId);
+        var linkCpu = new CraftingLink(
+                CraftingCpuHelper.generateLinkData(craftId, requester == null, false), cpu);
+        var candidateJob = new TimeWheelJob(plan, this::postChange, linkCpu, playerId);
+        loopSeedLedgers.initialize(candidateJob.loopPatterns());
+
+        var adjustedUsedItems = copyCounter(plan.usedItems());
+        var hostSeeds = new KeyCounter();
+        boolean hostShortfall = false;
+        for (var allocation : hostSeedAllocations) {
+            long requested = allocation.amount();
+            var extractedVariants = cpu.getHost().extractReusableSeedVariants(
+                    allocation.plannedKey(),
+                    requested,
+                    actual -> loopPlan != null
+                            && loopPlan.acceptsReusableSeedVariant(allocation, actual),
+                    Actionable.MODULATE);
+            var offered = new KeyCounter();
+            long offeredAmount = 0L;
+            for (var actual : extractedVariants) {
+                long amount = Math.min(actual.getLongValue(), requested - offeredAmount);
+                if (amount > 0) {
+                    offered.add(actual.getKey(), amount);
+                    offeredAmount = addSaturated(offeredAmount, amount);
+                }
+                // A conforming host never returns more than requested. Preserve the surplus even
+                // if a third-party implementation violates that contract or its capacity changes
+                // between extraction and rollback.
+                long surplus = actual.getLongValue() - Math.max(0L, amount);
+                if (surplus > 0) {
+                    long returned = cpu.getHost().insertReusableSeed(
+                            actual.getKey(), surplus, Actionable.MODULATE);
+                    long held = surplus - Math.max(0L, returned);
+                    if (held > 0) {
+                        inventory.insert(actual.getKey(), held, Actionable.MODULATE);
+                        hostSeeds.add(actual.getKey(), held);
+                    }
+                }
+            }
+            var acceptedVariants = loopSeedLedgers.assignHostVariantsForGroup(
+                    allocation.reusableSeedGroupId(), allocation.sharedPool(),
+                    allocation.plannedKey(), offered);
+            long extracted = 0L;
+            for (var actual : offered) {
+                long accepted = Math.min(
+                        actual.getLongValue(), acceptedVariants.get(actual.getKey()));
+                if (accepted > 0) {
+                    inventory.insert(actual.getKey(), accepted, Actionable.MODULATE);
+                    hostSeeds.add(actual.getKey(), accepted);
+                    extracted = addSaturated(extracted, accepted);
+                }
+                long rejected = actual.getLongValue() - accepted;
+                if (rejected > 0) {
+                    long returned = cpu.getHost().insertReusableSeed(
+                            actual.getKey(), rejected, Actionable.MODULATE);
+                    if (returned < rejected) {
+                        // Preserve items even if a host concurrently lost capacity. They remain
+                        // ordinary CPU inventory and are not counted as a reusable assignment.
+                        long held = rejected - Math.max(0L, returned);
+                        inventory.insert(actual.getKey(), held, Actionable.MODULATE);
+                        hostSeeds.add(actual.getKey(), held);
+                    }
+                }
+            }
+            if (extracted < requested) {
+                adjustedUsedItems.add(allocation.plannedKey(), requested - extracted);
+                hostShortfall = true;
+            }
+        }
+
+        ICraftingPlan extractionPlan = hostShortfall
+                ? new UsedItemsOverridePlan(plan, adjustedUsedItems) : plan;
+        var missingIngredient = CraftingCpuHelper.tryExtractInitialItems(extractionPlan, grid, inventory, src);
+        if (missingIngredient != null) {
+            rollbackHostSeeds(hostSeeds);
+            loopSeedLedgers.clear();
+            return CraftingSubmitResult.missingIngredient(missingIngredient);
+        }
+
+        this.job = candidateJob;
+        seedReturnQuota.clear();
+        retainedFinalOutputs.clear();
+        for (var entry : seedRequirements) {
+            seedReturnQuota.add(entry.getKey(), entry.getLongValue());
+        }
+        seedReturnQuotaFinalized = false;
         patternPowerCache.clear();
         markWaitingKeysChanged();
         cpu.updateOutput(plan.finalOutput());
@@ -200,8 +310,21 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
             return;
         }
 
+        if (job.softCancelling) {
+            finishSoftCancelIfReady(job);
+            return;
+        }
+
         if (job.link.isCanceled()) {
-            cancel();
+            if (!job.softCancelling) {
+                if (hasReusableSeedPattern(job)) beginSoftCancel(job);
+                else cancel();
+            }
+            return;
+        }
+
+        if (job.remainingAmount <= 0) {
+            finishSuccessfulIfReady(job);
             return;
         }
 
@@ -277,6 +400,8 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
             endStatusChangeBatch();
         }
 
+        if (job == activeJob) flushUnusedRetainedFinalOutputs(activeJob);
+
         return usedOps;
     }
 
@@ -287,6 +412,19 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
                                                          Level level) {
         var activeJob = this.job;
         if (activeJob == null) {
+            return BatchExecutor.BatchRunResult.EMPTY;
+        }
+        // Overload outputs must be registered per dispatched pattern so returned variants can be
+        // split between the requester and the CPU seed pool. BatchExecutor bypasses that
+        // registration path, therefore overload patterns intentionally stay on pushOnePattern.
+        if (CraftingPatternDelegates.forProviderLookup(details)
+                instanceof OverloadedProviderOnlyPatternDetails) {
+            nonBatchTasksThisTick.add(details);
+            return BatchExecutor.BatchRunResult.EMPTY;
+        }
+        if (details instanceof ExecuteLoopPattern loop
+                && loop.requiresActualSeedKeyTracking()) {
+            nonBatchTasksThisTick.add(details);
             return BatchExecutor.BatchRunResult.EMPTY;
         }
         if (nonBatchTasksThisTick.contains(details)) {
@@ -305,7 +443,15 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
                 () -> {
                     cpu.markDirty();
                     postPatternOutputsChange(details);
-                });
+                },
+                reservedSeedStock(details));
+        if (result.dispatchedCopies() > 0) {
+            boolean sharedSeedBatch = (details instanceof ExecuteLoopPattern loop
+                            ? loop.delegate() : details)
+                    instanceof com.moakiee.thunderbolt.ae2.batch.SharedBatchInputPattern;
+            recordLoopPatternDispatch(
+                    details, result.dispatchedCopies(), sharedSeedBatch);
+        }
         if (!result.shouldRetryBatchThisTick()) {
             nonBatchTasksThisTick.add(details);
         }
@@ -327,8 +473,9 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
         // Scratch counters are always emptied on exit (both branches below), so they are clean on
         // entry and need no leading clear. This halves the per-copy KeyCounter clearing that showed
         // up as ~7% of the CPU tick in profiling.
+        var extractionInventory = reservedCraftingInventory(details);
         KeyCounter[] craftingContainer = CraftingCpuHelper.extractPatternInputs(
-                details, inventory, level, expectedOutputs, expectedContainerItems);
+                details, extractionInventory, level, expectedOutputs, expectedContainerItems);
         if (craftingContainer == null) {
             clearScratchCounter(expectedOutputs);
             clearScratchCounter(expectedContainerItems);
@@ -337,8 +484,30 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
 
         boolean pushed = false;
         try {
+            // Overload output routing must also know unchanged container/tool remainders. They
+            // may already satisfy a P2 credit and must not be assigned again to an ID_ONLY output
+            // slot, even when the reusable input itself is strict and has only one candidate.
+            var actualLoopSeedResolution = details instanceof ExecuteLoopPattern loop
+                    ? loop.resolveActualInputSeedUses(craftingContainer) : null;
+            if (actualLoopSeedResolution != null && !actualLoopSeedResolution.complete()) {
+                return DispatchOutcome.RETRY_MISSING_INPUT;
+            }
+            var actualLoopSeedInput = actualLoopSeedResolution != null
+                    ? actualLoopSeedResolution.uses() : null;
+            if (details instanceof ExecuteLoopPattern loop
+                    && !loopSeedLedgers.canRouteActualSeedUses(loop, actualLoopSeedInput)) {
+                return DispatchOutcome.RETRY_MISSING_INPUT;
+            }
+            if (details instanceof ExecuteLoopPattern loop) {
+                var remainderCredits = loopSeedLedgers.previewRemainderCredits(
+                        loop, 1L, false, actualLoopSeedInput);
+                if (hasAmbiguousOverloadOutput(details, remainderCredits)) {
+                    return DispatchOutcome.RETRY_LATER;
+                }
+            }
             var patternPower = patternPowerFor(details, craftingContainer);
-            for (var provider : providersForSinglePush(craftingService, details)) {
+            for (var resolvedProvider : providersForSinglePush(craftingService, details)) {
+                var provider = resolvedProvider.provider();
                 if (provider.isBusy()) {
                     continue;
                 }
@@ -348,14 +517,18 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
                     return DispatchOutcome.RETRY_NO_POWER;
                 }
 
-                if (!provider.pushPattern(details, craftingContainer)) {
+                if (!provider.pushPattern(resolvedProvider.pattern(), craftingContainer)) {
                     continue;
                 }
 
                 pushed = true;
                 craftingContainer = null;
                 energyService.extractAEPower(patternPower, Actionable.MODULATE, PowerMultiplier.CONFIG);
-                recordPushedPattern(activeJob, details, expectedOutputs, expectedContainerItems, 1L);
+                var remainderLoopCredits = recordLoopPatternDispatch(
+                        details, 1L, false, actualLoopSeedInput);
+                recordPushedPattern(
+                        activeJob, details, expectedOutputs, expectedContainerItems, 1L,
+                        remainderLoopCredits);
 
                 consumeTaskCopies(activeJob, details, 1L);
                 return DispatchOutcome.PUSHED;
@@ -363,7 +536,7 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
                 return DispatchOutcome.RETRY_SOON;
         } finally {
             if (!pushed && craftingContainer != null) {
-                CraftingCpuHelper.reinjectPatternInputs(inventory, craftingContainer);
+                CraftingCpuHelper.reinjectPatternInputs(extractionInventory, craftingContainer);
             }
             clearScratchCounter(expectedOutputs);
             clearScratchCounter(expectedContainerItems);
@@ -388,11 +561,16 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
                                      int maxCopies,
                                      CraftingService craftingService,
                                      IEnergyService energyService) {
-        if (details instanceof OverloadedProviderOnlyPatternDetails) {
+        if (CraftingPatternDelegates.forProviderLookup(details)
+                instanceof OverloadedProviderOnlyPatternDetails) {
             return null;
         }
         if (task.value <= 0 || maxCopies <= 0) {
             return new BulkPush(0, 1);
+        }
+        if (details instanceof ExecuteLoopPattern loop
+                && loop.requiresActualSeedKeyTracking()) {
+            return null;
         }
         // Skip the (SIMULATE + MODULATE) extraction entirely if nothing can accept a push right
         // now. Busy providers typically free up within a tick, so retry on the next one (same
@@ -404,12 +582,14 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
         }
 
         int budget = (int) Math.min(task.value, (long) maxCopies);
-        var result = ParallelBatchCpuHelper.bulkExtract(details, inventory, budget);
+        var result = ParallelBatchCpuHelper.bulkExtract(
+                details, inventory, budget, false, reservedSeedStock(details));
         if (result == null) {
             return null;
         }
 
-        int actual = result.actualCopies;
+        // This non-batch path is explicitly bounded by the int maxCopies argument above.
+        int actual = (int) result.actualCopies;
         // The first clone doubles as the power probe and the first container handed to a provider.
         KeyCounter[] pending = ParallelBatchCpuHelper.cloneSingleCopy(result);
         double powerOne = patternPowerFor(details, pending);
@@ -433,13 +613,14 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
         int dispatched = 0;
         boolean freeProviderRejected = false;
         try {
-            var provider = firstProvider;
-            while (provider != null && dispatched < affordable) {
+            var resolvedProvider = firstProvider;
+            while (resolvedProvider != null && dispatched < affordable) {
+                var provider = resolvedProvider.provider();
                 while (dispatched < affordable && !provider.isBusy()) {
                     if (pending == null) {
                         pending = ParallelBatchCpuHelper.cloneSingleCopy(result);
                     }
-                    if (!provider.pushPattern(details, pending)) {
+                    if (!provider.pushPattern(resolvedProvider.pattern(), pending)) {
                         // A rejecting provider must not consume the container, so the clone stays
                         // valid and is reused for the next provider instead of re-cloning.
                         freeProviderRejected = true;
@@ -450,7 +631,7 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
                     ParallelBatchCpuHelper.markDispatched(result, 1);
                     dispatched++;
                 }
-                provider = nextFreeProvider(providers);
+                resolvedProvider = nextFreeProvider(providers);
             }
         } finally {
             int leftover = actual - dispatched;
@@ -462,6 +643,7 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
         if (dispatched > 0) {
             var jobView = scratchBatchJobView.bind(activeJob, details);
             ParallelBatchCpuHelper.registerExpectedOutputs(jobView, details, result, dispatched);
+            recordLoopPatternDispatch(details, dispatched, false);
             consumeTaskCopies(activeJob, details, dispatched);
             cpu.markDirty();
             // Energy-capped visits back off on the energy cadence; otherwise re-poll immediately
@@ -479,11 +661,11 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
     }
 
     @Nullable
-    private ICraftingProvider nextFreeProvider(Iterator<ICraftingProvider> providers) {
+    private ResolvedProvider nextFreeProvider(Iterator<ResolvedProvider> providers) {
         while (providers.hasNext()) {
-            var provider = providers.next();
-            if (!provider.isBusy()) {
-                return provider;
+            var resolved = providers.next();
+            if (!resolved.provider().isBusy()) {
+                return resolved;
             }
         }
         return null;
@@ -495,33 +677,138 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
             return 0;
         }
 
-        long strictMatched = activeJob.waitingFor.extract(what, amount, Actionable.SIMULATE);
-        long acceptedStrict = Math.min(amount, strictMatched);
         long returned = 0;
+        long remaining = amount;
+        long simulatedExactOverload = 0L;
+        long simulatedStrictPrefix = 0L;
+        long exactOverloadWaiting = OverloadCpuStateManager.INSTANCE
+                .getRemainingForExactKey(this, what);
+        if (exactOverloadWaiting > 0) {
+            // Native waiting contains both real STRICT demand and the exact templates mirrored by
+            // ID_ONLY pending slots. Protect the proven STRICT excess first; otherwise an exact
+            // ID_ONLY return can steal an unchanged container remainder that already owns a P2
+            // credit. The remaining mirrored prefix is then consumed through overload state.
+            long strictPrefix = OverloadInsertAccounting.strictPrefixBeforeExactOverload(
+                    remaining, activeJob.waitingFor.list.get(what), exactOverloadWaiting);
+            if (strictPrefix > 0) {
+                returned += acceptStrictWaitingItem(
+                        activeJob, what, strictPrefix, type);
+                remaining -= strictPrefix;
+                if (type == Actionable.SIMULATE) simulatedStrictPrefix = strictPrefix;
+                if (job != activeJob || remaining <= 0) {
+                    if (type == Actionable.MODULATE && job == activeJob) {
+                        finishSuccessfulIfReady(activeJob);
+                    }
+                    return returned;
+                }
+            }
+        }
+        if (OverloadCpuStateManager.INSTANCE.hasExactPending(this, what)) {
+            var overload = acceptOverloadWaitingItem(activeJob, what, remaining, type);
+            returned += overload.accepted();
+            remaining -= overload.claimed();
+            if (type == Actionable.SIMULATE) simulatedExactOverload = overload.claimed();
+            if (job != activeJob || remaining <= 0) {
+                if (type == Actionable.MODULATE && job == activeJob) {
+                    finishSuccessfulIfReady(activeJob);
+                }
+                return returned;
+            }
+        }
+
+        // In SIMULATE the overload claim above cannot mutate AE2's exact waitingFor entry. Probe
+        // against the original offer, then remove the already-simulated overload prefix. Probing
+        // only `remaining` before subtracting would under-count ordinary strict demand and could
+        // claim the same overload entry again below.
+        long simulatedOverlap = addSaturated(
+                simulatedExactOverload, simulatedStrictPrefix);
+        long strictProbeAmount = OverloadInsertAccounting.strictProbeAmount(
+                remaining, simulatedOverlap);
+        long strictMatched = activeJob.waitingFor.extract(
+                what, strictProbeAmount, Actionable.SIMULATE);
+        strictMatched = OverloadInsertAccounting.strictMatchAfterExactOverload(
+                remaining, strictMatched, simulatedOverlap);
+        long acceptedStrict = Math.min(remaining, strictMatched);
         if (acceptedStrict > 0) {
-            returned += acceptStrictWaitingItem(activeJob, what, acceptedStrict, type);
+            long accepted = acceptStrictWaitingItem(
+                    activeJob, what, acceptedStrict, type);
+            returned += accepted;
         }
+        remaining -= strictMatched;
 
-        long overloadRemainder = Math.max(0L, amount - strictMatched);
-        if (overloadRemainder <= 0 || !OverloadCpuStateManager.INSTANCE.hasAnyPending(this)) {
+        if (remaining <= 0
+                || !OverloadInsertAccounting.mayClaimOverloadRemainder(simulatedExactOverload)
+                || !OverloadCpuStateManager.INSTANCE.hasAnyPending(this)) {
+            if (type == Actionable.MODULATE) finishSuccessfulIfReady(activeJob);
             return returned;
         }
 
-        var claims = OverloadCpuStateManager.INSTANCE.claim(this, what, overloadRemainder, type);
-        if (!claims.claimedAnything()) {
-            return returned;
+        var overload = acceptOverloadWaitingItem(activeJob, what, remaining, type);
+        returned += overload.accepted();
+        if (type == Actionable.MODULATE && job == activeJob) finishSuccessfulIfReady(activeJob);
+        return returned;
+    }
+
+    private OverloadInsert acceptOverloadWaitingItem(
+            TimeWheelJob activeJob, AEKey what, long amount, Actionable type) {
+        if (amount <= 0) return OverloadInsert.EMPTY;
+        var preview = OverloadCpuStateManager.INSTANCE.claim(
+                this, what, amount, Actionable.SIMULATE,
+                (consumer, expected) -> loopSeedLedgers.acceptsReturnedVariant(
+                        consumer, expected, what));
+        if (!preview.claimedAnything()) {
+            return OverloadInsert.EMPTY;
         }
 
+        long retainedRequester = 0L;
+        long requesterAccepted = 0L;
+        var limited = preview;
+        if (!activeJob.softCancelling && preview.claimedForRequester() > 0) {
+            retainedRequester = retainableFinalOutputAmount(
+                    activeJob, what, preview.claimedForRequester());
+            long requesterLimit = Math.min(
+                    Math.max(0L, preview.claimedForRequester() - retainedRequester),
+                    activeJob.remainingAmount);
+            requesterAccepted = requesterLimit > 0
+                    ? activeJob.link.insert(what, requesterLimit, type) : 0L;
+            limited = preview.partitionRequester(requesterLimit, requesterAccepted);
+        }
+        var claims = limited;
+        if (type == Actionable.MODULATE) {
+            claims = OverloadCpuStateManager.INSTANCE.commitPreview(this, claims);
+        }
+        if (!claims.claimedAnything()) return OverloadInsert.EMPTY;
+
+        long accepted = 0L;
         if (type == Actionable.MODULATE) {
             deductClaimedWaitingFor(activeJob, claims);
-            returned += applyInventoryClaims(activeJob, what, claims);
-            returned += applyRequesterClaims(activeJob, what, claims);
+            rekeyOverloadReusableSeeds(what, claims);
+            if (activeJob.softCancelling) {
+                long claimed = claims.claimedAmount();
+                decrementItems(activeJob.timeTracker, claimed, what.getType());
+                inventory.insert(what, claimed, Actionable.MODULATE);
+                accepted += claimed;
+                if (activeJob.waitingKeys.isEmpty()
+                        && !OverloadCpuStateManager.INSTANCE.hasAnyPending(this)) {
+                    finishSoftCancelIfReady(activeJob);
+                }
+            } else {
+                retainedRequester = Math.min(
+                        retainedRequester, overloadPublicInventory(claims));
+                accepted += applyInventoryClaims(activeJob, what, claims);
+                markRetainedRequesterClaim(what, retainedRequester);
+                accepted += applyRequesterClaims(activeJob, what, claims);
+            }
             cpu.markDirty();
         } else {
-            returned += claims.claimedAmount();
+            accepted += claims.claimedAmount();
         }
 
-        return returned;
+        return new OverloadInsert(claims.claimedAmount(), accepted);
+    }
+
+    private record OverloadInsert(long claimed, long accepted) {
+        private static final OverloadInsert EMPTY = new OverloadInsert(0L, 0L);
     }
 
     private long acceptStrictWaitingItem(TimeWheelJob activeJob, AEKey what, long amount, Actionable type) {
@@ -531,25 +818,167 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
             cpu.markDirty();
         }
 
-        long inserted = amount;
-        if (what.matches(activeJob.finalOutput)) {
-            inserted = activeJob.link.insert(what, amount, type);
+        if (activeJob.softCancelling) {
             if (type == Actionable.MODULATE) {
-                postChange(what);
-                activeJob.remainingAmount = Math.max(0, activeJob.remainingAmount - amount);
-                if (activeJob.remainingAmount <= 0) {
-                    finishJob(true);
-                    cpu.updateOutput(null);
-                } else {
-                    cpu.updateOutput(new GenericStack(activeJob.finalOutput.what(), activeJob.remainingAmount));
+                inventory.insert(what, amount, Actionable.MODULATE);
+                if (activeJob.waitingKeys.isEmpty()
+                        && !OverloadCpuStateManager.INSTANCE.hasAnyPending(this)) {
+                    finishSoftCancelIfReady(activeJob);
                 }
             }
+            return amount;
+        }
+
+        long inserted = amount;
+        if (what.matches(activeJob.finalOutput)) {
+            inserted = acceptFinalOutputWithReusableSeed(activeJob, what, amount, type);
         } else if (type == Actionable.MODULATE) {
             inventory.insert(what, amount, Actionable.MODULATE);
             wakeSchedulerForReturnedInput(what);
         }
 
         return inserted;
+    }
+
+    private long acceptFinalOutputWithReusableSeed(
+            TimeWheelJob activeJob, AEKey what, long amount, Actionable type) {
+        long seedQuota = Math.max(
+                seedReturnQuota.get(what), loopSeedLedgers.totalReserved(what));
+        long accepted = 0L;
+        long remaining = amount;
+        // Seed ownership always wins when the returned key is also the requested output. Only the
+        // amount left after restoring the seed quota may satisfy the final-output request.
+        long reserved = reserveReturnedSeed(what, remaining, seedQuota, type);
+        accepted += reserved;
+        remaining -= reserved;
+
+        // Public output remains ordinary job output. While another loop copy can consume it, keep
+        // it in the CPU and borrow it only at the next successful dispatch; it is not promoted into
+        // the permanent seed account. This is what turns A -> 2A into logarithmic dispatch depth.
+        long retained = retainFinalOutputForLoop(activeJob, what, remaining, type);
+        accepted += retained;
+        remaining -= retained;
+
+        long finalOffer = Math.min(remaining, activeJob.remainingAmount);
+        long delivered = finalOffer > 0
+                ? activeJob.link.insert(what, finalOffer, type) : 0L;
+        accepted += delivered;
+        // Keep the unaccepted part of finalOffer with the caller so it can retry when the output
+        // destination becomes available. Only the physical tail beyond that offer is seed/excess.
+        long tail = remaining - finalOffer;
+
+        // Any deterministic output beyond both the requested final amount and the one retained seed
+        // is a normal byproduct/net surplus and belongs in CPU inventory for ordinary return to ME.
+        if (tail > 0) {
+            if (type == Actionable.MODULATE) inventory.insert(what, tail, Actionable.MODULATE);
+            accepted += tail;
+        }
+
+        if (type == Actionable.MODULATE && delivered > 0) {
+            finishDeliveredFinalOutput(activeJob, what, delivered);
+        } else if (type == Actionable.MODULATE && reserved > 0) {
+            wakeSchedulerForReturnedInput(what);
+        }
+        return accepted;
+    }
+
+    private long reserveReturnedSeed(
+            AEKey what, long amount, long quota, Actionable type) {
+        if (amount <= 0 || quota <= 0) return 0L;
+        long alreadyHeld = inventory.extract(what, Long.MAX_VALUE, Actionable.SIMULATE);
+        long reserved = Math.min(amount, Math.max(0L, quota - alreadyHeld));
+        if (reserved > 0 && type == Actionable.MODULATE) {
+            inventory.insert(what, reserved, Actionable.MODULATE);
+            wakeSchedulerForReturnedInput(what);
+        }
+        return reserved;
+    }
+
+    private void finishDeliveredFinalOutput(TimeWheelJob activeJob, AEKey what, long delivered) {
+        postChange(what);
+        activeJob.remainingAmount = Math.max(0L, activeJob.remainingAmount - delivered);
+        if (activeJob.remainingAmount > 0) {
+            cpu.updateOutput(new GenericStack(activeJob.finalOutput.what(), activeJob.remainingAmount));
+        } else {
+            // The requested output may arrive before an external executor returns its catalyst.
+            // Keep the job/link alive until every reusable seed is physically back in this CPU.
+            cpu.updateOutput(null);
+        }
+    }
+
+    private void finishSuccessfulIfReady(TimeWheelJob activeJob) {
+        if (job != activeJob || activeJob.softCancelling) return;
+        if (activeJob.remainingAmount > 0
+                || !activeJob.tasks.isEmpty()
+                || !activeJob.waitingKeys.isEmpty()
+                || OverloadCpuStateManager.INSTANCE.hasAnyPending(this)) return;
+        finalizeSeedReturnQuota();
+        if (!returnReusableSeedsToHost()) return;
+        finishJob(true);
+        cpu.updateOutput(null);
+    }
+
+    private void finishSoftCancelIfReady(TimeWheelJob activeJob) {
+        if (job != activeJob || !activeJob.softCancelling
+                || !activeJob.waitingKeys.isEmpty()
+                || OverloadCpuStateManager.INSTANCE.hasAnyPending(this)) return;
+        finalizeSeedReturnQuota();
+        if (!returnReusableSeedsToHost()) return;
+        finishJob(false);
+        cpu.updateOutput(null);
+    }
+
+    /** Moves returned seeds into the private host drive before the link is allowed to finish. */
+    private boolean returnReusableSeedsToHost() {
+        if (seedReturnQuota.isEmpty()) return true;
+        for (var seed : seedReturnQuota) {
+            if (inventory.extract(seed.getKey(), Long.MAX_VALUE, Actionable.SIMULATE)
+                    < seed.getLongValue()) return false;
+        }
+        var returnedSeeds = new ArrayList<GenericStack>();
+        for (var seed : seedReturnQuota) {
+            returnedSeeds.add(new GenericStack(seed.getKey(), seed.getLongValue()));
+        }
+        boolean changed = false;
+        for (var seed : returnedSeeds) {
+            long held = inventory.extract(seed.what(), Long.MAX_VALUE, Actionable.SIMULATE);
+            long acceptable = cpu.getHost().insertReusableSeed(
+                    seed.what(), seed.amount(), Actionable.SIMULATE);
+            long transferable = ReusableSeedStorageProgress.transferable(
+                    seed.amount(), held, acceptable);
+            if (transferable <= 0) continue;
+            long removed = inventory.extract(
+                    seed.what(), transferable, Actionable.MODULATE);
+            long inserted = removed > 0
+                    ? cpu.getHost().insertReusableSeed(
+                            seed.what(), removed, Actionable.MODULATE) : 0L;
+            if (inserted < removed) {
+                inventory.insert(seed.what(), removed - inserted, Actionable.MODULATE);
+            }
+            if (inserted > 0) {
+                seedReturnQuota.remove(seed.what(), inserted);
+                changed = true;
+            }
+        }
+        if (!seedReturnQuota.isEmpty()) cantStoreItems = true;
+        if (changed) cpu.markDirty();
+        return seedReturnQuota.isEmpty();
+    }
+
+    private void finalizeSeedReturnQuota() {
+        if (seedReturnQuotaFinalized) return;
+        seedReturnQuota.clear();
+        for (var entry : loopSeedLedgers.positiveSnapshot().entrySet()) {
+            seedReturnQuota.add(entry.getKey(), entry.getValue());
+        }
+        seedReturnQuotaFinalized = true;
+        cpu.markDirty();
+    }
+
+    private void discardHeldReusableSeeds() {
+        for (var seed : seedReturnQuota) {
+            inventory.extract(seed.getKey(), seed.getLongValue(), Actionable.MODULATE);
+        }
     }
 
     private void finishJob(boolean success) {
@@ -576,6 +1005,9 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
                 success ? CraftingJobStatusPacket.Status.FINISHED : CraftingJobStatusPacket.Status.CANCELLED);
 
         this.job = null;
+        seedReturnQuotaFinalized = false;
+        retainedFinalOutputs.clear();
+        clearLoopSeedState();
         patternPowerCache.clear();
         clearTaskWheel();
         storeItems();
@@ -585,17 +1017,67 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
         if (job == null) {
             return;
         }
+        if (!job.softCancelling && hasReusableSeedPattern(job)) {
+            beginSoftCancel(job);
+            return;
+        }
+        discardHeldReusableSeeds();
+        seedReturnQuota.clear();
+        seedReturnQuotaFinalized = false;
+        clearLoopSeedState();
         cpu.updateOutput(null);
         finishJob(false);
     }
 
+    /**
+     * Starts the normal safe-cancellation path and releases everything that can
+     * be returned immediately. Closed-loop jobs that are still waiting for
+     * reusable seeds remain persistent instead of discarding their ledger.
+     */
+    void tryReleaseContents() {
+        cancel();
+        if (job == null) {
+            storeItems();
+        }
+    }
+
+    private boolean hasReusableSeedPattern(TimeWheelJob activeJob) {
+        return !seedReturnQuota.isEmpty() || activeJob.closedLoopJob;
+    }
+
+    private void beginSoftCancel(TimeWheelJob activeJob) {
+        activeJob.softCancelling = true;
+        activeJob.suspended = false;
+        for (var details : List.copyOf(activeJob.tasks.keySet())) {
+            removeTask(activeJob, details);
+            postPatternOutputsChange(details);
+        }
+        clearTaskWheel();
+        cpu.updateOutput(null);
+        cpu.markDirty();
+        if (activeJob.waitingKeys.isEmpty()
+                && !OverloadCpuStateManager.INSTANCE.hasAnyPending(this)) {
+            finishSoftCancelIfReady(activeJob);
+        }
+    }
+
     public void prepareForRemoval() {
         if (this.job != null) {
-            cancel();
+            // A removed CPU cannot remain in the first-stage "wait for seed" state. Removal is the
+            // destructive second cancellation: stop tracking late returns, cancel the link and
+            // return/drop only content that is still physically in the CPU.
+            discardHeldReusableSeeds();
+            seedReturnQuota.clear();
+            seedReturnQuotaFinalized = false;
+            clearLoopSeedState();
+            finishJob(false);
         }
         this.pendingJobTag = null;
         this.pendingOverloadTag = null;
         OverloadCpuStateManager.INSTANCE.clear(this);
+        seedReturnQuota.clear();
+        seedReturnQuotaFinalized = false;
+        clearLoopSeedState();
         clearTaskWheel();
         cpu.updateOutput(null);
         cantStoreItems = false;
@@ -630,11 +1112,298 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
         var storage = grid.getStorageService().getInventory();
         for (var entry : this.inventory.list) {
             postChange(entry.getKey());
+            long intercept = Math.min(entry.getLongValue(), seedReturnQuota.get(entry.getKey()));
+            long seedInserted = intercept > 0
+                    ? cpu.getHost().insertReusableSeed(entry.getKey(), intercept, Actionable.MODULATE)
+                    : 0L;
+            if (seedInserted > 0) {
+                seedReturnQuota.remove(entry.getKey(), seedInserted);
+                entry.setValue(entry.getLongValue() - seedInserted);
+            }
             var inserted = storage.insert(entry.getKey(), entry.getLongValue(), Actionable.MODULATE, cpu.getSrc());
             entry.setValue(entry.getLongValue() - inserted);
         }
         this.inventory.list.removeZeros();
+        if (this.inventory.list.isEmpty()) {
+            seedReturnQuota.clear();
+            clearLoopSeedState();
+        }
         cpu.markDirty();
+    }
+
+    private static KeyCounter copyToCounter(Map<AEKey, Long> source) {
+        var result = new KeyCounter();
+        for (var entry : source.entrySet()) {
+            if (entry.getKey() != null && entry.getValue() != null && entry.getValue() > 0) {
+                result.add(entry.getKey(), entry.getValue());
+            }
+        }
+        return result;
+    }
+
+    /** Positive ledger entries are hidden unless this loop task declares the key as inputSeed. */
+    private Map<AEKey, Long> reservedSeedStock(IPatternDetails details) {
+        UUID ownConsumer = null;
+        java.util.function.Predicate<AEKey> allowedSeedInput = ignored -> false;
+        ExecuteLoopPattern ownLoop = null;
+        if (details instanceof ExecuteLoopPattern loopPattern) {
+            ownLoop = loopPattern;
+            ownConsumer = loopPattern.seedConsumerId();
+            allowedSeedInput = loopPattern::isInputSeedKey;
+        }
+        var ledgerReservations = loopSeedLedgers.reservationView(
+                ownConsumer,
+                allowedSeedInput,
+                details instanceof ExecuteLoopPattern loop
+                        && loop.hasSingleSeedInputPerMember());
+        var allowedLoop = ownLoop;
+        return new java.util.AbstractMap<>() {
+            @Override
+            public Long get(Object key) {
+                if (!(key instanceof AEKey aeKey)) return null;
+                long reserved = ledgerReservations.getOrDefault(aeKey, 0L);
+                if (allowedLoop == null || !allowedLoop.isInputSeedKey(aeKey)) {
+                    reserved = addSaturated(reserved, retainedFinalOutputs.get(aeKey));
+                }
+                return reserved > 0 ? reserved : null;
+            }
+
+            @Override
+            public Set<Entry<AEKey, Long>> entrySet() {
+                return Set.of();
+            }
+        };
+    }
+
+    private appeng.crafting.inv.ICraftingInventory reservedCraftingInventory(
+            IPatternDetails details) {
+        return !loopSeedLedgers.hasReservations() && retainedFinalOutputs.isEmpty()
+                ? inventory
+                : new ReservedCraftingInventory(inventory, reservedSeedStock(details));
+    }
+
+    private Map<UUID, KeyCounter> recordLoopPatternDispatch(
+            IPatternDetails details,
+            long copies,
+            boolean sharedBatch) {
+        return recordLoopPatternDispatch(details, copies, sharedBatch, null);
+    }
+
+    private Map<UUID, KeyCounter> recordLoopPatternDispatch(
+            IPatternDetails details,
+            long copies,
+            boolean sharedBatch,
+            @Nullable List<ExecuteLoopPattern.ActualSeedUse> actualInputSeed) {
+        if (!(details instanceof ExecuteLoopPattern loopPattern)
+                || copies <= 0) {
+            return Map.of();
+        }
+        var changedCredits = loopSeedLedgers.recordDispatch(
+                loopPattern, copies, sharedBatch, actualInputSeed);
+        consumeRetainedFinalOutput(loopPattern, copies, sharedBatch, actualInputSeed);
+        cpu.markDirty();
+        return changedCredits;
+    }
+
+    private void consumeRetainedFinalOutput(
+            ExecuteLoopPattern pattern,
+            long copies,
+            boolean sharedBatch,
+            @Nullable List<ExecuteLoopPattern.ActualSeedUse> actualInputSeed) {
+        if (retainedFinalOutputs.isEmpty()) return;
+        if (actualInputSeed != null) {
+            for (var use : actualInputSeed) {
+                removeUpTo(retainedFinalOutputs, use.actual(), use.amount());
+            }
+            return;
+        }
+        long scale = sharedBatch ? 1L : copies;
+        for (var input : pattern.inputSeed()) {
+            removeUpTo(retainedFinalOutputs, input.getKey(),
+                    multiplySaturated(input.getLongValue(), scale));
+        }
+    }
+
+    private long pendingLoopSeedDemand(TimeWheelJob activeJob, AEKey key) {
+        if (activeJob == null || key == null) return 0L;
+        long demand = 0L;
+        for (var task : activeJob.tasks.entrySet()) {
+            if (!(task.getKey() instanceof ExecuteLoopPattern loop)
+                    || task.getValue().value <= 0) continue;
+            long perCopy = loop.inputSeedAmountFor(key);
+            if (perCopy <= 0) continue;
+            demand = addSaturated(demand,
+                    multiplySaturated(perCopy, task.getValue().value));
+        }
+        return demand;
+    }
+
+    private long retainFinalOutputForLoop(
+            TimeWheelJob activeJob, AEKey what, long amount, Actionable type) {
+        long retained = retainableFinalOutputAmount(activeJob, what, amount);
+        if (retained > 0 && type == Actionable.MODULATE) {
+            retainLoopFinalOutput(what, retained);
+        }
+        return retained;
+    }
+
+    private long retainableFinalOutputAmount(
+            TimeWheelJob activeJob, AEKey what, long amount) {
+        if (amount <= 0 || activeJob == null || what == null
+                || activeJob.finalOutput == null
+                || !what.dropSecondary().equals(activeJob.finalOutput.what().dropSecondary())) {
+            return 0L;
+        }
+        long demand = pendingLoopSeedDemand(activeJob, what);
+        long alreadyRetained = 0L;
+        for (var retained : retainedFinalOutputs) {
+            if (sharesPendingLoopConsumer(activeJob, what, retained.getKey())) {
+                alreadyRetained = addSaturated(alreadyRetained, retained.getLongValue());
+            }
+        }
+        return Math.min(amount, Math.max(0L, demand - alreadyRetained));
+    }
+
+    private boolean sharesPendingLoopConsumer(
+            TimeWheelJob activeJob, AEKey left, AEKey right) {
+        if (activeJob == null || left == null || right == null) return false;
+        if (left.equals(right)) return true;
+        for (var task : activeJob.tasks.entrySet()) {
+            if (!(task.getKey() instanceof ExecuteLoopPattern loop)
+                    || task.getValue().value <= 0) continue;
+            if (loop.inputSeedAmountFor(left) > 0 && loop.inputSeedAmountFor(right) > 0) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private void retainLoopFinalOutput(AEKey what, long amount) {
+        if (what == null || amount <= 0) return;
+        inventory.insert(what, amount, Actionable.MODULATE);
+        retainedFinalOutputs.add(what, amount);
+        wakeSchedulerForReturnedInput(what);
+        cpu.markDirty();
+    }
+
+    private void flushUnusedRetainedFinalOutputs(TimeWheelJob activeJob) {
+        if (activeJob == null || retainedFinalOutputs.isEmpty()) return;
+        var retained = new ArrayList<GenericStack>();
+        for (var entry : retainedFinalOutputs) {
+            if (entry.getLongValue() > 0 && pendingLoopSeedDemand(activeJob, entry.getKey()) <= 0) {
+                retained.add(new GenericStack(entry.getKey(), entry.getLongValue()));
+            }
+        }
+        for (var entry : retained) {
+            long held = inventory.extract(entry.what(), Long.MAX_VALUE, Actionable.SIMULATE);
+            long free = Math.max(0L, held - loopSeedLedgers.totalReserved(entry.what()));
+            long offer = Math.min(entry.amount(), Math.min(free, activeJob.remainingAmount));
+            if (offer <= 0) continue;
+            long accepted = activeJob.link.insert(entry.what(), offer, Actionable.SIMULATE);
+            if (accepted <= 0) continue;
+            long removed = inventory.extract(entry.what(), accepted, Actionable.MODULATE);
+            if (removed <= 0) continue;
+            long delivered = activeJob.link.insert(entry.what(), removed, Actionable.MODULATE);
+            if (delivered < removed) {
+                inventory.insert(entry.what(), removed - delivered, Actionable.MODULATE);
+            }
+            if (delivered > 0) {
+                removeUpTo(retainedFinalOutputs, entry.what(), delivered);
+                finishDeliveredFinalOutput(activeJob, entry.what(), delivered);
+                cpu.markDirty();
+            }
+        }
+    }
+
+    private static void removeUpTo(KeyCounter counter, AEKey key, long amount) {
+        if (counter == null || key == null || amount <= 0) return;
+        long removed = Math.min(counter.get(key), amount);
+        if (removed > 0) counter.remove(key, removed);
+    }
+
+    private void clearLoopSeedState() {
+        loopSeedLedgers.clear();
+    }
+
+    private void readLoopSeedState(CompoundTag data, HolderLookup.Provider registries) {
+        loopSeedLedgers.readFromNBT(data, registries);
+    }
+
+    private void writeLoopSeedState(CompoundTag data, HolderLookup.Provider registries) {
+        loopSeedLedgers.writeToNBT(data, registries);
+    }
+
+    private static KeyCounter readCounter(
+            ListTag tags, HolderLookup.Provider registries) {
+        var result = new KeyCounter();
+        for (int i = 0; i < tags.size(); i++) {
+            var stack = GenericStack.readTag(registries, tags.getCompound(i));
+            if (stack != null && stack.amount() > 0) result.add(stack.what(), stack.amount());
+        }
+        return result;
+    }
+
+    private static ListTag writeCounter(
+            KeyCounter counter, HolderLookup.Provider registries) {
+        var result = new ListTag();
+        for (var entry : counter) {
+            if (entry.getLongValue() > 0) {
+                result.add(GenericStack.writeTag(
+                        registries, new GenericStack(entry.getKey(), entry.getLongValue())));
+            }
+        }
+        return result;
+    }
+
+    private static Map<UUID, KeyCounter> readSeedCredits(
+            ListTag tags, HolderLookup.Provider registries) {
+        var result = new LinkedHashMap<UUID, KeyCounter>();
+        for (int i = 0; i < tags.size(); i++) {
+            var creditTag = tags.getCompound(i);
+            if (!creditTag.hasUUID(NBT_CREDIT_CONSUMER)) continue;
+            var items = readCounter(
+                    creditTag.getList(NBT_CREDIT_ITEMS, Tag.TAG_COMPOUND), registries);
+            if (!items.isEmpty()) {
+                result.put(creditTag.getUUID(NBT_CREDIT_CONSUMER), items);
+            }
+        }
+        return Map.copyOf(result);
+    }
+
+    private static ListTag writeSeedCredits(
+            Map<UUID, KeyCounter> credits, HolderLookup.Provider registries) {
+        var result = new ListTag();
+        var consumers = new ArrayList<>(credits.keySet());
+        consumers.sort(UUID::compareTo);
+        for (var consumer : consumers) {
+            var items = credits.get(consumer);
+            if (items == null || items.isEmpty()) continue;
+            var creditTag = new CompoundTag();
+            creditTag.putUUID(NBT_CREDIT_CONSUMER, consumer);
+            creditTag.put(NBT_CREDIT_ITEMS, writeCounter(items, registries));
+            result.add(creditTag);
+        }
+        return result;
+    }
+
+    private static KeyCounter copyCounter(KeyCounter source) {
+        var copy = new KeyCounter();
+        copy.addAll(source);
+        return copy;
+    }
+
+    private void rollbackHostSeeds(KeyCounter hostSeeds) {
+        for (var entry : hostSeeds) {
+            long removed = inventory.extract(entry.getKey(), entry.getLongValue(), Actionable.MODULATE);
+            if (removed > 0) {
+                long returned = cpu.getHost().insertReusableSeed(
+                        entry.getKey(), removed, Actionable.MODULATE);
+                if (returned < removed) {
+                    inventory.insert(
+                            entry.getKey(), removed - Math.max(0L, returned), Actionable.MODULATE);
+                }
+            }
+        }
     }
 
     public void readFromNBT(CompoundTag data, HolderLookup.Provider registries) {
@@ -643,6 +1412,27 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
         this.pendingJobTag = null;
         this.pendingOverloadTag = null;
         OverloadCpuStateManager.INSTANCE.clear(this);
+        seedReturnQuota.clear();
+        retainedFinalOutputs.clear();
+        seedReturnQuotaFinalized = data.getBoolean(TAG_SEED_RETURN_QUOTA_FINALIZED);
+        clearLoopSeedState();
+        if (data.contains(TAG_SEED_RETURN_QUOTA, Tag.TAG_LIST)) {
+            var seeds = data.getList(TAG_SEED_RETURN_QUOTA, Tag.TAG_COMPOUND);
+            for (int i = 0; i < seeds.size(); i++) {
+                var stack = GenericStack.readTag(registries, seeds.getCompound(i));
+                if (stack != null && stack.amount() > 0) seedReturnQuota.add(stack.what(), stack.amount());
+            }
+        }
+        if (data.contains(TAG_RETAINED_FINAL_OUTPUTS, Tag.TAG_LIST)) {
+            var retained = data.getList(TAG_RETAINED_FINAL_OUTPUTS, Tag.TAG_COMPOUND);
+            for (int i = 0; i < retained.size(); i++) {
+                var stack = GenericStack.readTag(registries, retained.getCompound(i));
+                if (stack != null && stack.amount() > 0) {
+                    retainedFinalOutputs.add(stack.what(), stack.amount());
+                }
+            }
+        }
+        readLoopSeedState(data, registries);
         clearTaskWheel();
 
         if (data.contains(TAG_JOB, Tag.TAG_COMPOUND)) {
@@ -668,6 +1458,28 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
         } else {
             data.remove(TAG_INVENTORY);
         }
+        if (!seedReturnQuota.isEmpty()) {
+            var seeds = new ListTag();
+            for (var entry : seedReturnQuota) {
+                seeds.add(GenericStack.writeTag(registries,
+                        new GenericStack(entry.getKey(), entry.getLongValue())));
+            }
+            data.put(TAG_SEED_RETURN_QUOTA, seeds);
+        } else {
+            data.remove(TAG_SEED_RETURN_QUOTA);
+        }
+        if (seedReturnQuotaFinalized) {
+            data.putBoolean(TAG_SEED_RETURN_QUOTA_FINALIZED, true);
+        } else {
+            data.remove(TAG_SEED_RETURN_QUOTA_FINALIZED);
+        }
+        if (!retainedFinalOutputs.isEmpty()) {
+            data.put(TAG_RETAINED_FINAL_OUTPUTS,
+                    writeCounter(retainedFinalOutputs, registries));
+        } else {
+            data.remove(TAG_RETAINED_FINAL_OUTPUTS);
+        }
+        writeLoopSeedState(data, registries);
         if (this.job != null) {
             data.put(TAG_JOB, this.job.writeToNBT(registries));
             var overloadTag = OverloadCpuStateManager.INSTANCE.writeToTag(this, registries);
@@ -716,6 +1528,7 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
             finishJob(false);
             return;
         }
+        loopSeedLedgers.registerConsumers(this.job.loopPatterns());
 
         cpu.updateOutput(new GenericStack(job.finalOutput.what(), job.remainingAmount));
         markWaitingKeysChanged();
@@ -780,6 +1593,7 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
                 || this.pendingJobTag != null
                 || this.pendingOverloadTag != null
                 || !this.inventory.list.isEmpty()
+                || !seedReturnQuota.isEmpty()
                 || OverloadCpuStateManager.INSTANCE.hasAnyPending(this);
     }
 
@@ -839,6 +1653,10 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
         return job != null && job.suspended;
     }
 
+    public boolean isSoftCancelling() {
+        return job != null && job.softCancelling;
+    }
+
     public void setJobSuspended(boolean suspended) {
         if (job != null && job.suspended != suspended) {
             job.suspended = suspended;
@@ -846,30 +1664,39 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
         }
     }
 
-    private Iterable<ICraftingProvider> providersForSinglePush(CraftingService craftingService,
-                                                               IPatternDetails details) {
+    private Iterable<ResolvedProvider> providersForSinglePush(CraftingService craftingService,
+                                                              IPatternDetails details) {
+        var providerPattern = CraftingPatternDelegates.forProviderLookup(details);
         var skipped = batchedByTask.get(details);
         if (skipped == null || skipped.isEmpty()) {
-            return craftingService.getProviders(details);
+            return () -> new Iterator<>() {
+                private final Iterator<ICraftingProvider> raw = craftingService
+                        .getProviders(providerPattern).iterator();
+                @Override public boolean hasNext() { return raw.hasNext(); }
+                @Override public ResolvedProvider next() {
+                    return new ResolvedProvider(raw.next(), providerPattern);
+                }
+            };
         }
         return () -> new Iterator<>() {
-            private final Iterator<ICraftingProvider> raw = craftingService.getProviders(details).iterator();
+            private final Iterator<ICraftingProvider> raw = craftingService
+                    .getProviders(providerPattern).iterator();
             @Nullable
-            private ICraftingProvider next;
+            private ResolvedProvider next;
 
             @Override
             public boolean hasNext() {
                 while (next == null && raw.hasNext()) {
                     var candidate = raw.next();
                     if (!skipped.containsKey(candidate)) {
-                        next = candidate;
+                        next = new ResolvedProvider(candidate, providerPattern);
                     }
                 }
                 return next != null;
             }
 
             @Override
-            public ICraftingProvider next() {
+            public ResolvedProvider next() {
                 if (!hasNext()) {
                     throw new java.util.NoSuchElementException();
                 }
@@ -880,25 +1707,51 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
         };
     }
 
+    private record ResolvedProvider(ICraftingProvider provider, IPatternDetails pattern) { }
+
     private boolean hasAmbiguousOverloadOutput(IPatternDetails details) {
-        if (!(details instanceof OverloadedProviderOnlyPatternDetails overloadDetails)) {
+        return hasAmbiguousOverloadOutput(details, null);
+    }
+
+    private boolean hasAmbiguousOverloadOutput(
+            IPatternDetails details,
+            @Nullable Map<UUID, KeyCounter> preallocatedRemainderCredits) {
+        var providerDetails = CraftingPatternDelegates.forProviderLookup(details);
+        if (!(providerDetails instanceof OverloadedProviderOnlyPatternDetails overloadDetails)) {
+            // STRICT outputs and remainders are partitioned from mirrored exact ID_ONLY waiting
+            // in insert(). They no longer need to serialize behind unrelated overload work.
             return false;
         }
 
-        var reference = new OverloadPatternReference(
-                overloadDetails.overloadPatternIdentity(),
-                overloadDetails.overloadPatternDetailsView().sourcePattern());
-        return OverloadCpuStateManager.INSTANCE.hasAmbiguousOutputRegistration(
+        var reference = overloadPatternReference(details, overloadDetails);
+        if (details instanceof ExecuteLoopPattern && preallocatedRemainderCredits != null) {
+            var seedMetadata = reusableSeedOverloadOutputs(
+                    details, overloadDetails, 1L, preallocatedRemainderCredits);
+            var outputs = details.getOutputs();
+            for (var entry : seedMetadata.entrySet()) {
+                if (entry.getKey() < 0 || entry.getKey() >= outputs.size()) return true;
+                var planned = outputs.get(entry.getKey()).what();
+                for (var credit : entry.getValue().consumerCredits()) {
+                    if (!loopSeedLedgers.acceptsLateBoundVariantCredit(
+                            credit.consumerId(), planned)) return true;
+                }
+            }
+        }
+        if (OverloadCpuStateManager.INSTANCE.hasAmbiguousOutputRegistration(
                 this,
                 reference,
-                overloadDetails.overloadPatternDetailsView());
+                overloadDetails.overloadPatternDetailsView())) {
+            return true;
+        }
+        return false;
     }
 
     private void recordPushedPattern(TimeWheelJob activeJob,
                                      IPatternDetails details,
                                      KeyCounter expectedOutputs,
                                      KeyCounter expectedContainerItems,
-                                     long copies) {
+                                     long copies,
+                                     Map<UUID, KeyCounter> remainderLoopCredits) {
         for (var expectedOutput : expectedOutputs) {
             insertWaitingFor(
                     activeJob,
@@ -911,20 +1764,20 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
             addMaxItems(activeJob.timeTracker, amount, expectedContainerItem.getKey().getType());
         }
 
-        registerOverloadExpectedOutputs(activeJob, details, copies);
+        registerOverloadExpectedOutputs(activeJob, details, copies, remainderLoopCredits);
         cpu.markDirty();
     }
 
     private void registerOverloadExpectedOutputs(TimeWheelJob activeJob,
                                                  IPatternDetails details,
-                                                 long copies) {
-        if (!(details instanceof OverloadedProviderOnlyPatternDetails overloadDetails) || copies <= 0) {
+                                                 long copies,
+                                                 Map<UUID, KeyCounter> remainderLoopCredits) {
+        if (!(CraftingPatternDelegates.forProviderLookup(details)
+                instanceof OverloadedProviderOnlyPatternDetails overloadDetails) || copies <= 0) {
             return;
         }
 
-        var reference = new OverloadPatternReference(
-                overloadDetails.overloadPatternIdentity(),
-                overloadDetails.overloadPatternDetailsView().sourcePattern());
+        var reference = overloadPatternReference(details, overloadDetails);
         var finalOutputKey = activeJob.finalOutput != null ? activeJob.finalOutput.what() : null;
         OverloadCpuStateManager.INSTANCE.registerExpectedOutputs(
                 this,
@@ -933,7 +1786,127 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
                 overloadDetails.overloadPatternDetailsView(),
                 details.getOutputs(),
                 finalOutputKey,
-                copies);
+                copies,
+                reusableSeedOverloadOutputs(
+                        details, overloadDetails, copies, remainderLoopCredits));
+    }
+
+    private OverloadPatternReference overloadPatternReference(
+            IPatternDetails details,
+            OverloadedProviderOnlyPatternDetails overloadDetails) {
+        var identity = overloadDetails.overloadPatternIdentity();
+        if (details instanceof ExecuteLoopPattern loop) {
+            identity += "#loop-seed:" + loop.reusableSeedGroupId();
+        }
+        return new OverloadPatternReference(
+                identity, overloadDetails.overloadPatternDetailsView().sourcePattern());
+    }
+
+    private Map<Integer, OverloadReusableSeedMetadata> reusableSeedOverloadOutputs(
+            IPatternDetails details,
+            OverloadedProviderOnlyPatternDetails overloadDetails,
+            long copies,
+            Map<UUID, KeyCounter> remainderLoopCredits) {
+        if (!(details instanceof ExecuteLoopPattern loop) || copies <= 0) return Map.of();
+        // Keep the ownership split all the way through the fuzzy-output pending queue. The
+        // producer is irrelevant after registration: each returned unit is re-keyed directly in
+        // the fixed downstream consumer account that was credited when this pattern dispatched.
+        var remainingCredits = new LinkedHashMap<AEKey, LinkedHashMap<UUID, Long>>();
+        for (var target : loop.runtimeOutputSeedCredits().entrySet()) {
+            for (var output : target.getValue()) {
+                long amount = Sat.mul(output.getLongValue(), copies);
+                if (amount <= 0) continue;
+                remainingCredits
+                        .computeIfAbsent(output.getKey(), ignored -> new LinkedHashMap<>())
+                        .merge(target.getKey(), amount, Ae2LtTimeWheelCraftingCpuLogic::addSaturated);
+            }
+        }
+        if (remainingCredits.isEmpty()) return Map.of();
+        consumePreallocatedLoopCredits(remainingCredits, remainderLoopCredits);
+        var actualOutputs = details.getOutputs();
+        // When strict and ID_ONLY slots expose the same planned key, consume the strict physical
+        // capacity first. Otherwise a strict downstream consumer could be assigned the fuzzy slot
+        // merely because overload metadata is registered separately from AE2's waiting list.
+        for (var output : overloadDetails.overloadPatternDetailsView().outputs()) {
+            if (output.matchMode() == MatchMode.ID_ONLY) continue;
+            int slot = output.slotIndex();
+            if (slot < 0 || slot >= actualOutputs.size()) continue;
+            var byConsumer = remainingCredits.get(actualOutputs.get(slot).what());
+            if (byConsumer != null && !byConsumer.isEmpty()) {
+                takeConsumerCredits(
+                        byConsumer,
+                        multiplySaturated(output.amountPerCraft(), copies));
+            }
+        }
+        var result = new HashMap<Integer, OverloadReusableSeedMetadata>();
+        for (var output : overloadDetails.overloadPatternDetailsView().outputs()) {
+            if (output.matchMode() != MatchMode.ID_ONLY) continue;
+            int slot = output.slotIndex();
+            if (slot < 0 || slot >= actualOutputs.size()) continue;
+            var expected = actualOutputs.get(slot).what();
+            var byConsumer = remainingCredits.get(expected);
+            if (byConsumer == null || byConsumer.isEmpty()) continue;
+            long slotAmount = multiplySaturated(output.amountPerCraft(), copies);
+            var credits = takeConsumerCredits(byConsumer, slotAmount);
+            if (credits.isEmpty()) continue;
+            result.put(slot, new OverloadReusableSeedMetadata(
+                    credits, loop.hasSingleSeedInputPerMember()));
+        }
+        return result.isEmpty() ? Map.of() : Map.copyOf(result);
+    }
+
+    private static void consumePreallocatedLoopCredits(
+            LinkedHashMap<AEKey, LinkedHashMap<UUID, Long>> remainingCredits,
+            Map<UUID, KeyCounter> preallocatedLoopCredits) {
+        if (preallocatedLoopCredits == null || preallocatedLoopCredits.isEmpty()) return;
+        for (var consumer : preallocatedLoopCredits.entrySet()) {
+            for (var credit : consumer.getValue()) {
+                var byConsumer = remainingCredits.get(credit.getKey());
+                if (byConsumer == null) {
+                    throw new IllegalStateException(
+                            "preallocated loop credit has no matching planned output");
+                }
+                long available = byConsumer.getOrDefault(consumer.getKey(), 0L);
+                if (credit.getLongValue() > available) {
+                    throw new IllegalStateException(
+                            "preallocated loop credit exceeds its fixed consumer allocation");
+                }
+                long left = available - credit.getLongValue();
+                if (left > 0) byConsumer.put(consumer.getKey(), left);
+                else byConsumer.remove(consumer.getKey());
+                if (byConsumer.isEmpty()) remainingCredits.remove(credit.getKey());
+            }
+        }
+    }
+
+    private static List<OverloadConsumerCredit> takeConsumerCredits(
+            LinkedHashMap<UUID, Long> remainingByConsumer, long maximumAmount) {
+        if (remainingByConsumer == null || maximumAmount <= 0) return List.of();
+        long remaining = maximumAmount;
+        var result = new ArrayList<OverloadConsumerCredit>();
+        var iterator = remainingByConsumer.entrySet().iterator();
+        while (iterator.hasNext() && remaining > 0) {
+            var entry = iterator.next();
+            long amount = Math.min(Math.max(0L, entry.getValue()), remaining);
+            if (amount > 0) {
+                result.add(new OverloadConsumerCredit(entry.getKey(), amount));
+                remaining -= amount;
+            }
+            long left = entry.getValue() - amount;
+            if (left <= 0) iterator.remove();
+            else entry.setValue(left);
+        }
+        return List.copyOf(result);
+    }
+
+    private void rekeyOverloadReusableSeeds(AEKey incoming, OverloadClaimResult claims) {
+        for (var claim : claims.claims()) {
+            for (var credit : claim.consumerCredits()) {
+                loopSeedLedgers.rekeyAvailable(
+                        credit.consumerId(),
+                        claim.exactExpectedKey(), incoming, credit.amount());
+            }
+        }
     }
 
     private long applyInventoryClaims(TimeWheelJob activeJob, AEKey incoming, OverloadClaimResult claims) {
@@ -948,24 +1921,41 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
         return claimed;
     }
 
-    private long applyRequesterClaims(TimeWheelJob activeJob, AEKey incoming, OverloadClaimResult claims) {
+    private static long overloadPublicInventory(OverloadClaimResult claims) {
+        long result = 0L;
+        for (var claim : claims.claims()) {
+            if (!claim.routesToRequester()) continue;
+            long amount = claim.claimedAmount()
+                    - claim.reusableSeedAmount()
+                    - claim.requesterAmount();
+            if (amount > 0) result = addSaturated(result, amount);
+        }
+        return result;
+    }
+
+    private void markRetainedRequesterClaim(AEKey incoming, long retained) {
+        if (retained <= 0) return;
+        retainedFinalOutputs.add(incoming, retained);
+        cpu.markDirty();
+    }
+
+    private long applyRequesterClaims(
+            TimeWheelJob activeJob, AEKey incoming, OverloadClaimResult claims) {
         long claimed = claims.claimedForRequester();
         if (claimed <= 0) {
             return 0;
         }
 
         decrementItems(activeJob.timeTracker, claimed, incoming.getType());
-        long inserted = activeJob.link.insert(incoming, claimed, Actionable.MODULATE);
         postChange(incoming);
 
         activeJob.remainingAmount = Math.max(0L, activeJob.remainingAmount - claimed);
-        if (activeJob.remainingAmount <= 0) {
-            finishJob(true);
-            cpu.updateOutput(null);
-        } else {
+        if (activeJob.remainingAmount > 0) {
             cpu.updateOutput(new GenericStack(activeJob.finalOutput.what(), activeJob.remainingAmount));
+        } else {
+            cpu.updateOutput(null);
         }
-        return inserted;
+        return claimed;
     }
 
     private void consumeTaskCopies(TimeWheelJob activeJob, IPatternDetails details, long copies) {
@@ -1110,7 +2100,9 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
             return;
         }
 
-        for (var entry : activeJob.tasks.entrySet()) {
+        var entries = new ArrayList<>(activeJob.tasks.entrySet());
+        entries.sort((left, right) -> CraftingTaskPriorities.compare(left.getKey(), right.getKey()));
+        for (var entry : entries) {
             if (entry.getValue().value > 0) {
                 scheduleRebuiltTask(activeJob, entry.getKey());
             }
@@ -1247,16 +2239,29 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
     @Nullable
     private IPatternDetails pollDueTask(TimeWheelJob activeJob) {
         var bucket = taskWheel[wheelCursor];
-        while (!bucket.isEmpty()) {
-            var details = bucket.pollFirst();
-            queuedTasks.remove(details);
+        IPatternDetails selected = null;
+        for (var iterator = bucket.iterator(); iterator.hasNext(); ) {
+            var details = iterator.next();
             var task = activeJob.tasks.get(details);
-            if (task != null && task.value > 0) {
-                unparkTask(details);
-                return details;
+            if (task == null || task.value <= 0) {
+                iterator.remove();
+                queuedTasks.remove(details);
+                continue;
+            }
+            if (selected == null || CraftingTaskPriorities.compare(details, selected) < 0) {
+                selected = details;
             }
         }
-        return null;
+        if (selected == null) return null;
+        for (var iterator = bucket.iterator(); iterator.hasNext(); ) {
+            if (iterator.next() == selected) {
+                iterator.remove();
+                break;
+            }
+        }
+        queuedTasks.remove(selected);
+        unparkTask(selected);
+        return selected;
     }
 
     private void rescheduleIfStillPending(TimeWheelJob activeJob, IPatternDetails details, int delayTicks) {
@@ -1453,6 +2458,36 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
     private record WaitingExtract(long extracted, boolean removedKey) {
     }
 
+    private static final class ReservedCraftingInventory
+            implements appeng.crafting.inv.ICraftingInventory {
+        private final appeng.crafting.inv.ICraftingInventory delegate;
+        private final Map<AEKey, Long> reserved;
+
+        private ReservedCraftingInventory(
+                appeng.crafting.inv.ICraftingInventory delegate, Map<AEKey, Long> reserved) {
+            this.delegate = delegate;
+            this.reserved = reserved;
+        }
+
+        @Override
+        public void insert(AEKey what, long amount, Actionable mode) {
+            delegate.insert(what, amount, mode);
+        }
+
+        @Override
+        public long extract(AEKey what, long amount, Actionable mode) {
+            long held = delegate.extract(what, Long.MAX_VALUE, Actionable.SIMULATE);
+            long available = Math.max(0L, held - reserved.getOrDefault(what, 0L));
+            long requested = Math.min(Math.max(0L, amount), available);
+            return requested > 0 ? delegate.extract(what, requested, mode) : 0L;
+        }
+
+        @Override
+        public Iterable<AEKey> findFuzzyTemplates(AEKey input) {
+            return delegate.findFuzzyTemplates(input);
+        }
+    }
+
     private static final class TimeWheelJob {
         private final CraftingLink link;
         private final ListCraftingInventory waitingFor;
@@ -1465,6 +2500,8 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
         @Nullable
         private Integer playerId;
         private boolean suspended;
+        private boolean softCancelling;
+        private boolean closedLoopJob;
 
         private TimeWheelJob(ICraftingPlan plan,
                              Consumer<AEKey> postCraftingDifference,
@@ -1488,13 +2525,22 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
                 addMaxItems(timeTracker, entry.getLongValue(), entry.getKey().getType());
             }
             for (var entry : plan.patternTimes().entrySet()) {
-                tasks.computeIfAbsent(entry.getKey(), ignored -> new TaskProgress()).value += entry.getValue();
-                addPendingOutputs(entry.getKey(), entry.getValue());
-                for (var output : entry.getKey().getOutputs()) {
+                if (entry.getKey() instanceof ReusableSeedPattern) closedLoopJob = true;
+                var expanded = entry.getKey() instanceof PatternFiringExpander expander
+                        ? expander.expandPatternFirings(entry.getValue())
+                        : Map.of(entry.getKey(), entry.getValue());
+                for (var concrete : expanded.entrySet()) {
+                    var task = tasks.computeIfAbsent(
+                            concrete.getKey(), ignored -> new TaskProgress());
+                    task.value = com.moakiee.thunderbolt.core.planner.Sat.add(
+                            task.value, concrete.getValue());
+                    addPendingOutputs(concrete.getKey(), concrete.getValue());
+                    for (var output : concrete.getKey().getOutputs()) {
                     var amount = multiplySaturated(
-                            multiplySaturated(output.amount(), entry.getValue()),
+                            multiplySaturated(output.amount(), concrete.getValue()),
                             output.what().getAmountPerUnit());
                     addMaxItems(timeTracker, amount, output.what().getType());
+                    }
                 }
             }
             this.link = link;
@@ -1521,6 +2567,8 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
                     new ElapsedTimeTracker(data.getCompound(NBT_TIME_TRACKER)));
             job.remainingAmount = data.getLong(NBT_REMAINING_AMOUNT);
             job.suspended = data.getBoolean(NBT_SUSPENDED);
+            job.softCancelling = data.getBoolean(NBT_SOFT_CANCELLING);
+            job.closedLoopJob = job.softCancelling;
             job.waitingFor.readFromNBT(data.getList(NBT_WAITING_FOR, Tag.TAG_COMPOUND), registries);
             job.rebuildWaitingKeys();
             job.tasks.clear();
@@ -1541,10 +2589,45 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
                 if (pattern == null) {
                     continue;
                 }
-                var details = PatternDetailsHelper.decodePattern(pattern, level);
+                IPatternDetails details = PatternDetailsHelper.decodePattern(pattern, level);
                 var remaining = item.getLong(NBT_CRAFTING_PROGRESS);
                 if (details != null && remaining > 0) {
-                    tasks.computeIfAbsent(details, ignored -> new TaskProgress()).value += remaining;
+                    var inputSeed = readCounter(
+                            item.getList(NBT_INPUT_SEED, Tag.TAG_COMPOUND), registries);
+                    var initialSeed = readCounter(
+                            item.getList(NBT_INITIAL_SEED, Tag.TAG_COMPOUND), registries);
+                    var outputSeed = readCounter(
+                            item.getList(NBT_OUTPUT_SEED, Tag.TAG_COMPOUND), registries);
+                    var consumerId = item.hasUUID(NBT_SEED_CONSUMER)
+                            ? item.getUUID(NBT_SEED_CONSUMER) : null;
+                    var outputCredits = readSeedCredits(
+                            item.getList(NBT_OUTPUT_SEED_CREDITS, Tag.TAG_COMPOUND), registries);
+                    var sharedOutputCredits = readSeedCredits(
+                            item.getList(
+                                    NBT_SHARED_OUTPUT_SEED_CREDITS, Tag.TAG_COMPOUND),
+                            registries);
+                    boolean hasRoutedCreditTags = item.contains(
+                            NBT_OUTPUT_SEED_CREDITS, Tag.TAG_LIST)
+                            || item.contains(NBT_SHARED_OUTPUT_SEED_CREDITS, Tag.TAG_LIST);
+                    if (consumerId == null && details instanceof ISeedPreservingCraftingTask seeded) {
+                        consumerId = seeded.reusableSeedGroupId();
+                    }
+                    if (!hasRoutedCreditTags && outputCredits.isEmpty()
+                            && consumerId != null && !outputSeed.isEmpty()) {
+                        outputCredits = Map.of(consumerId, outputSeed);
+                    }
+                    if (consumerId != null
+                            && (!inputSeed.isEmpty() || !initialSeed.isEmpty()
+                                    || !outputCredits.isEmpty()
+                                    || !sharedOutputCredits.isEmpty())
+                            && details instanceof ISeedPreservingCraftingTask) {
+                        details = new ExecuteLoopPattern(
+                                details, consumerId, initialSeed, inputSeed,
+                                outputCredits, sharedOutputCredits);
+                    }
+                    var task = tasks.computeIfAbsent(details, ignored -> new TaskProgress());
+                    task.value = com.moakiee.thunderbolt.core.planner.Sat.add(
+                            task.value, remaining);
                 }
             }
         }
@@ -1637,8 +2720,36 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
 
             var list = new ListTag();
             for (var entry : tasks.entrySet()) {
-                var item = entry.getKey().getDefinition().toTag(registries);
+                var definition = entry.getKey() instanceof TimeWheelTaskPersistenceDefinition persistent
+                        ? persistent.timeWheelPersistenceDefinition()
+                        : entry.getKey().getDefinition();
+                var item = definition.toTag(registries);
                 item.putLong(NBT_CRAFTING_PROGRESS, entry.getValue().value);
+                if (entry.getKey() instanceof ExecuteLoopPattern loopPattern) {
+                    item.putUUID(NBT_SEED_CONSUMER, loopPattern.seedConsumerId());
+                    var initialSeed = loopPattern.initialSeed();
+                    var inputSeed = loopPattern.inputSeed();
+                    var outputSeed = loopPattern.outputSeed();
+                    var outputCredits = loopPattern.outputSeedCredits();
+                    var sharedOutputCredits = loopPattern.sharedOutputSeedCredits();
+                    if (!initialSeed.isEmpty()) {
+                        item.put(NBT_INITIAL_SEED, writeCounter(initialSeed, registries));
+                    }
+                    if (!inputSeed.isEmpty()) {
+                        item.put(NBT_INPUT_SEED, writeCounter(inputSeed, registries));
+                    }
+                    if (!outputSeed.isEmpty()) {
+                        item.put(NBT_OUTPUT_SEED, writeCounter(outputSeed, registries));
+                    }
+                    if (!outputCredits.isEmpty()) {
+                        item.put(NBT_OUTPUT_SEED_CREDITS,
+                                writeSeedCredits(outputCredits, registries));
+                    }
+                    if (!sharedOutputCredits.isEmpty()) {
+                        item.put(NBT_SHARED_OUTPUT_SEED_CREDITS,
+                                writeSeedCredits(sharedOutputCredits, registries));
+                    }
+                }
                 list.add(item);
             }
             data.put(NBT_TASKS, list);
@@ -1648,7 +2759,16 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
                 data.putInt(NBT_PLAYER_ID, playerId);
             }
             data.putBoolean(NBT_SUSPENDED, suspended);
+            data.putBoolean(NBT_SOFT_CANCELLING, softCancelling);
             return data;
+        }
+
+        private List<ExecuteLoopPattern> loopPatterns() {
+            var result = new ArrayList<ExecuteLoopPattern>();
+            for (var details : tasks.keySet()) {
+                if (details instanceof ExecuteLoopPattern loop) result.add(loop);
+            }
+            return List.copyOf(result);
         }
     }
 
@@ -1687,6 +2807,17 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
         public Map<IPatternDetails, Long> patternTimes() {
             return Map.of();
         }
+    }
+
+    private record UsedItemsOverridePlan(ICraftingPlan delegate, KeyCounter usedItems)
+            implements ICraftingPlan {
+        @Override public GenericStack finalOutput() { return delegate.finalOutput(); }
+        @Override public long bytes() { return delegate.bytes(); }
+        @Override public boolean simulation() { return delegate.simulation(); }
+        @Override public boolean multiplePaths() { return delegate.multiplePaths(); }
+        @Override public KeyCounter emittedItems() { return delegate.emittedItems(); }
+        @Override public KeyCounter missingItems() { return delegate.missingItems(); }
+        @Override public Map<IPatternDetails, Long> patternTimes() { return delegate.patternTimes(); }
     }
 
     private final class SingleTaskBatchJobView implements BatchJobView, BatchTaskHandle, Iterator<BatchTaskHandle> {

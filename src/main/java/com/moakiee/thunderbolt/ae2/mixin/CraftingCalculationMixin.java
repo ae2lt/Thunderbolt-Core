@@ -1,5 +1,9 @@
 package com.moakiee.thunderbolt.ae2.mixin;
 
+import java.util.IdentityHashMap;
+import java.util.Map;
+
+import org.jetbrains.annotations.Nullable;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Shadow;
 import org.spongepowered.asm.mixin.Unique;
@@ -8,16 +12,18 @@ import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
 
 import appeng.api.networking.crafting.ICraftingSimulationRequester;
+import appeng.api.networking.crafting.ICraftingPlan;
 import appeng.api.stacks.AEKey;
 import appeng.crafting.CraftingCalculation;
 import appeng.crafting.CraftingPlan;
 import appeng.crafting.inv.NetworkCraftingSimulationState;
 
 import com.moakiee.thunderbolt.ThunderboltCore;
-import com.moakiee.thunderbolt.CoreConfig;
 import com.moakiee.thunderbolt.ae2.crafting.FastCraftingControl;
 import com.moakiee.thunderbolt.ae2.crafting.FastCraftingPlanner;
 import com.moakiee.thunderbolt.ae2.crafting.FastPlanningWatchdog;
+import com.moakiee.thunderbolt.ae2.crafting.LoopCraftingPlan;
+import com.moakiee.thunderbolt.core.planner.ReusableStockUsageKey;
 
 /**
  * Installs the linear-time autocrafting fast path inside AE2's per-amount attempt
@@ -28,10 +34,10 @@ import com.moakiee.thunderbolt.ae2.crafting.FastPlanningWatchdog;
  * tree simulation of each attempt. The planner is best-effort and never falls back to AE2's exhaustive
  * simulator (Policy A) — that quadratic/NBT-fuzzy path is exactly what hangs on heavy graphs.
  *
- * <p>Gating: {@link #ae2lt$fastPlanningEnabled} defaults to {@link CoreConfig#FAST_PATH_ENABLED} so the
- * lib accelerates every calculation when running standalone. A host mod (AE2 Lightning Tech) can call
- * {@link FastCraftingControl#ae2lt$setFastPlanningEnabled(boolean)} on a fresh calculation to restrict
- * the fast path to specific jobs (e.g. only when a TimeWheel CPU is active).
+ * <p>Gating: the crafting-service extension explicitly enables this optimization for a fresh
+ * calculation when at least one active time-wheel cluster is registered. The calculation itself does
+ * not expose or consult any per-CPU/UI toggle. Closed-loop results are wrapped in a
+ * {@link LoopCraftingPlan} before leaving the calculation.
  *
  * <p>Every attempt is wrapped by {@link FastPlanningWatchdog} so a hang is captured with a live stack.
  */
@@ -59,6 +65,11 @@ public abstract class CraftingCalculationMixin implements FastCraftingControl {
     @Unique
     private boolean ae2lt$fastPlanningEnabled;
 
+    @Unique
+    @Nullable
+    private Map<CraftingPlan, Map<ReusableStockUsageKey<AEKey>, Long>>
+            thunderbolt$reusableStockByAttempt;
+
     @Override
     public void ae2lt$setFastPlanningEnabled(boolean enabled) {
         this.ae2lt$fastPlanningInitialized = true;
@@ -67,13 +78,25 @@ public abstract class CraftingCalculationMixin implements FastCraftingControl {
 
     @Override
     public boolean ae2lt$isFastPlanningEnabled() {
-        return ae2lt$getFastPlanningEnabled();
+        return this.ae2lt$fastPlanningInitialized && this.ae2lt$fastPlanningEnabled;
+    }
+
+    @Inject(method = "run", at = @At("RETURN"), cancellable = true, remap = false)
+    private void thunderbolt$wrapLoopPlan(CallbackInfoReturnable<ICraftingPlan> cir) {
+        var result = cir.getReturnValue();
+        var reusableStockByAttempt = thunderbolt$getReusableStockByAttempt();
+        Map<ReusableStockUsageKey<AEKey>, Long> usedReusableStock = null;
+        if (result instanceof CraftingPlan craftingPlan) {
+            usedReusableStock = reusableStockByAttempt.get(craftingPlan);
+        }
+        cir.setReturnValue(LoopCraftingPlan.wrapIfNeeded(result, usedReusableStock));
+        reusableStockByAttempt.clear();
     }
 
     @Inject(method = "runCraftAttempt", at = @At("HEAD"), cancellable = true, remap = false)
     private void ae2ltCore$fastAttempt(boolean simulate, long amount,
                                        CallbackInfoReturnable<CraftingPlan> cir) {
-        if (!ae2lt$getFastPlanningEnabled()) {
+        if (!ae2lt$isFastPlanningEnabled()) {
             return;
         }
         var gridNode = simRequester.getGridNode();
@@ -86,11 +109,17 @@ public abstract class CraftingCalculationMixin implements FastCraftingControl {
                 "output=" + this.output + " requested=" + amount + " simulate=" + simulate + " engine=thunderbolt");
         try {
             var attempt = FastCraftingPlanner.tryAttempt(
-                    craftingService, networkInv, getLevel(), output, amount, simulate);
+                    craftingService, networkInv, getLevel(), output, amount, simulate,
+                    simRequester instanceof com.moakiee.thunderbolt.ae2.crafting.ReservedStockCraftingRequester reserved
+                            ? reserved : null);
             if (attempt.handled()) {
                 // Reproduce the side effect of the real method body we are skipping, so that
                 // CraftingCalculation#isSimulation() reflects the attempt that produced this plan.
                 this.simulate = simulate;
+                if (attempt.plan() != null) {
+                    thunderbolt$getReusableStockByAttempt().put(
+                            attempt.plan(), attempt.usedReusableStock());
+                }
                 cir.setReturnValue(attempt.plan());
             }
         } catch (Throwable t) {
@@ -105,11 +134,11 @@ public abstract class CraftingCalculationMixin implements FastCraftingControl {
     }
 
     @Unique
-    private boolean ae2lt$getFastPlanningEnabled() {
-        if (!this.ae2lt$fastPlanningInitialized) {
-            this.ae2lt$fastPlanningEnabled = CoreConfig.FAST_PATH_ENABLED;
-            this.ae2lt$fastPlanningInitialized = true;
+    private Map<CraftingPlan, Map<ReusableStockUsageKey<AEKey>, Long>>
+            thunderbolt$getReusableStockByAttempt() {
+        if (this.thunderbolt$reusableStockByAttempt == null) {
+            this.thunderbolt$reusableStockByAttempt = new IdentityHashMap<>();
         }
-        return this.ae2lt$fastPlanningEnabled;
+        return this.thunderbolt$reusableStockByAttempt;
     }
 }

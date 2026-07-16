@@ -18,6 +18,7 @@ out/
 run/
 run2/
 runs/
+/logs/
 
 # Eclipse
 bin/

@@ -2,9 +2,12 @@
   "required": true,
   "minVersion": "0.8.5",
   "package": "com.moakiee.thunderbolt.ae2.mixin",
+  "plugin": "com.moakiee.thunderbolt.ae2.mixin.ThunderboltMixinConfigPlugin",
   "compatibilityLevel": "JAVA_21",
   "mixins": [
     "CraftingCalculationMixin",
+    "EjectCapabilityMixin",
+    "EjectGhostBlockEntityMixin",
     "GridConnectionMaxChannelsMixin",
     "GridGetMachineNodesMixin",
     "GridNodeMaxChannelsMixin",
@@ -23,7 +26,7 @@
     "AaeExecutingCraftingJobAccessor",
     "AaeElapsedTimeTrackerAccessor",
     "AaeTaskProgressAccessor",
-    "TimeWheelCraftingServiceMixin",
+    "ExtendedCraftingCpuServiceMixin",
     "TimeWheelCraftingCPUMenuMixin"
   ],
   "client": [

@@ -9,7 +9,11 @@ import appeng.api.stacks.KeyCounter;
 public interface CopyAssembler {
     AssembledCopy assembleOneCopy(IPatternDetails details, KeyCounter[] oneCopyInputs);
 
-    record AssembledCopy(AEKey output, long outputCount, List<Stack> remainders) {
+    record AssembledCopy(AEKey output, long outputCount, List<Stack> remainders,
+                         List<Stack> sharedRemainders) {
+        public AssembledCopy(AEKey output, long outputCount, List<Stack> remainders) {
+            this(output, outputCount, remainders, List.of());
+        }
     }
 
     record Stack(AEKey key, long count) {

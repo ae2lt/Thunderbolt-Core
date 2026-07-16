@@ -29,7 +29,8 @@ import java.util.Objects;
  *                  firing as a byproduct, so refilling it back forms a cycle the planner resolves.
  * @param <K>       item key type (e.g. AE2's AEKey, or String in tests)
  */
-public record CraftInput<K>(K key, long amount, boolean returned, long uses, K remainder) {
+public record CraftInput<K>(K key, long amount, boolean returned, long uses, K remainder,
+                            ReusableStockSource reusableStockSource) {
 
     /** A true catalyst survives unlimited firings (one seed serves the whole batch). */
     public static final long INFINITE_USES = Long.MAX_VALUE;
@@ -42,19 +43,31 @@ public record CraftInput<K>(K key, long amount, boolean returned, long uses, K r
         if (returned && uses <= 0) {
             throw new IllegalArgumentException("returned input uses must be > 0, was " + uses);
         }
+        if (reusableStockSource != null
+                && (!returned || uses != INFINITE_USES || remainder != null)) {
+            throw new IllegalArgumentException(
+                    "host-owned reusable stock requires an unchanged, infinitely reusable input");
+        }
     }
 
     public static <K> CraftInput<K> of(K key, long amount) {
-        return new CraftInput<>(key, amount, false, INFINITE_USES, null);
+        return new CraftInput<>(key, amount, false, INFINITE_USES, null, null);
     }
 
     public static <K> CraftInput<K> returned(K key, long amount) {
-        return new CraftInput<>(key, amount, true, INFINITE_USES, null);
+        return new CraftInput<>(key, amount, true, INFINITE_USES, null, null);
+    }
+
+    /** A catalyst whose initial seed is borrowed from a host-private reusable-stock scope. */
+    public static <K> CraftInput<K> returnedFrom(
+            K key, long amount, ReusableStockSource source) {
+        return new CraftInput<>(key, amount, true, INFINITE_USES, null,
+                Objects.requireNonNull(source, "source"));
     }
 
     /** A degrading tool/finite catalyst: one {@code amount}-sized unit survives {@code uses} firings. */
     public static <K> CraftInput<K> finiteUse(K key, long amount, long uses) {
-        return new CraftInput<>(key, amount, true, uses, null);
+        return new CraftInput<>(key, amount, true, uses, null, null);
     }
 
     /**
@@ -62,7 +75,8 @@ public record CraftInput<K>(K key, long amount, boolean returned, long uses, K r
      * {@code remainder} (a different item, e.g. the empty bucket) is handed back as a byproduct.
      */
     public static <K> CraftInput<K> consumedReturning(K key, long amount, K remainder) {
-        return new CraftInput<>(key, amount, false, INFINITE_USES, Objects.requireNonNull(remainder));
+        return new CraftInput<>(key, amount, false, INFINITE_USES,
+                Objects.requireNonNull(remainder), null);
     }
 
     /** Units of {@link #key} consumed to fire the pattern {@code times} times (closed form). */

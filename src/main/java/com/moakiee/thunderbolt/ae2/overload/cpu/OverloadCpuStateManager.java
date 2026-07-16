@@ -1,11 +1,13 @@
 package com.moakiee.thunderbolt.ae2.overload.cpu;
 
+import java.math.BigInteger;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.UUID;
 import java.util.WeakHashMap;
+import java.util.function.BiPredicate;
 
 import org.jetbrains.annotations.Nullable;
 
@@ -17,6 +19,7 @@ import appeng.api.config.Actionable;
 import appeng.api.stacks.AEItemKey;
 import appeng.api.stacks.AEKey;
 import appeng.api.stacks.GenericStack;
+import appeng.api.stacks.KeyCounter;
 import appeng.crafting.execution.CraftingCpuLogic;
 
 import com.moakiee.thunderbolt.ae2.overload.model.MatchMode;
@@ -97,11 +100,24 @@ public final class OverloadCpuStateManager {
                                                      List<GenericStack> actualOutputs,
                                                      @Nullable AEKey finalOutputKey,
                                                      long pushedCopies) {
+        registerExpectedOutputs(logic, craftingId, patternReference, patternDetails,
+                actualOutputs, finalOutputKey, pushedCopies, Map.of());
+    }
+
+    public synchronized void registerExpectedOutputs(Object logic,
+                                                     UUID craftingId,
+                                                     OverloadPatternReference patternReference,
+                                                     OverloadPatternDetails patternDetails,
+                                                     List<GenericStack> actualOutputs,
+                                                     @Nullable AEKey finalOutputKey,
+                                                     long pushedCopies,
+                                                     Map<Integer, OverloadReusableSeedMetadata> reusableSeeds) {
         Objects.requireNonNull(logic, "logic");
         Objects.requireNonNull(craftingId, "craftingId");
         Objects.requireNonNull(patternReference, "patternReference");
         Objects.requireNonNull(patternDetails, "patternDetails");
         Objects.requireNonNull(actualOutputs, "actualOutputs");
+        Objects.requireNonNull(reusableSeeds, "reusableSeeds");
         if (pushedCopies <= 0) {
             throw new IllegalArgumentException("pushedCopies must be > 0");
         }
@@ -111,17 +127,18 @@ public final class OverloadCpuStateManager {
                 patternDetails,
                 actualOutputs,
                 finalOutputKey,
-                pushedCopies);
+                pushedCopies,
+                reusableSeeds);
     }
 
     /**
      * Detects whether registering the given pattern would create ambiguous
      * concurrent ID_ONLY pending outputs for the same item id.
      * <p>
-     * CPU-side claim only sees returned item id. If multiple unresolved outputs
-     * with the same item id coexist, the CPU cannot reliably decide which one a
-     * returned stack belongs to. In that case, the caller should defer the push
-     * until the older pending output has been resolved.
+     * CPU-side claim only sees returned item id. If multiple distinct ID_ONLY outputs with the
+     * same item id coexist, the CPU cannot reliably decide which pending slot a returned stack
+     * belongs to. STRICT outputs are mirrored only in native waiting and are partitioned there
+     * before an exact ID_ONLY claim; they do not create a second overload identity.
      */
     public synchronized boolean hasAmbiguousOutputRegistration(CraftingCpuLogic logic,
                                                                OverloadPatternReference patternReference,
@@ -140,14 +157,12 @@ public final class OverloadCpuStateManager {
         var batch = new java.util.LinkedHashMap<ResourceLocation, OutputRegistrationCandidate>();
 
         for (var output : patternDetails.outputs()) {
-            if (output.matchMode() != MatchMode.ID_ONLY) {
-                continue;
-            }
-
+            if (output.matchMode() != MatchMode.ID_ONLY) continue;
             var itemId = itemIdOf(output);
             var candidate = new OutputRegistrationCandidate(
                     patternReference.patternIdentity(),
-                    output.slotIndex());
+                    output.slotIndex(),
+                    true);
 
             var batchExisting = batch.putIfAbsent(itemId, candidate);
             if (batchExisting != null && !batchExisting.equals(candidate)) {
@@ -181,9 +196,23 @@ public final class OverloadCpuStateManager {
 
     public synchronized OverloadClaimResult claim(Object logic, AEKey incoming, long amount,
                                                   Actionable actionable) {
+        return claim(logic, incoming, amount, actionable, (consumer, expected) -> true);
+    }
+
+    /**
+     * Claims ID_ONLY output while retaining consumer credits that cannot use the concrete
+     * returned component variant.
+     */
+    public synchronized OverloadClaimResult claim(
+            Object logic,
+            AEKey incoming,
+            long amount,
+            Actionable actionable,
+            BiPredicate<UUID, AEKey> acceptsConsumerVariant) {
         Objects.requireNonNull(logic, "logic");
         Objects.requireNonNull(incoming, "incoming");
         Objects.requireNonNull(actionable, "actionable");
+        Objects.requireNonNull(acceptsConsumerVariant, "acceptsConsumerVariant");
         if (amount <= 0) {
             return OverloadClaimResult.EMPTY;
         }
@@ -198,11 +227,25 @@ public final class OverloadCpuStateManager {
             return OverloadClaimResult.EMPTY;
         }
 
-        var result = state.claimByItemId(itemKey.getId(), amount, actionable == Actionable.MODULATE);
+        var result = state.claimByItemId(
+                itemKey.getId(), amount, actionable == Actionable.MODULATE,
+                acceptsConsumerVariant);
         if (actionable == Actionable.MODULATE && state.isEmpty()) {
             states.remove(logic);
         }
         return result;
+    }
+
+    /** Commits a previously simulated and requester-limited claim. */
+    public synchronized OverloadClaimResult commitPreview(
+            Object logic, OverloadClaimResult preview) {
+        Objects.requireNonNull(logic, "logic");
+        Objects.requireNonNull(preview, "preview");
+        var state = states.get(logic);
+        if (state == null || !preview.claimedAnything()) return OverloadClaimResult.EMPTY;
+        var committed = state.commitPreview(preview);
+        if (state.isEmpty()) states.remove(logic);
+        return committed;
     }
 
     public synchronized long getRemainingForItem(CraftingCpuLogic logic, ResourceLocation itemId) {
@@ -214,6 +257,56 @@ public final class OverloadCpuStateManager {
         Objects.requireNonNull(itemId, "itemId");
         var state = states.get(logic);
         return state != null ? state.getRemainingForItem(itemId) : 0;
+    }
+
+    /**
+     * Detects native STRICT demand that shares an item id with an ID_ONLY output. Native waiting
+     * also contains the mirrored ID_ONLY templates, so compare exact, non-saturating totals.
+     */
+    public synchronized boolean hasNativeStrictWaiting(
+            Object logic,
+            ResourceLocation itemId,
+            KeyCounter nativeWaiting) {
+        Objects.requireNonNull(logic, "logic");
+        Objects.requireNonNull(itemId, "itemId");
+        Objects.requireNonNull(nativeWaiting, "nativeWaiting");
+        var nativeAmount = BigInteger.ZERO;
+        for (var entry : nativeWaiting) {
+            if (entry != null && entry.getLongValue() > 0
+                    && entry.getKey() instanceof AEItemKey item
+                    && item.getId().equals(itemId)) {
+                nativeAmount = nativeAmount.add(BigInteger.valueOf(entry.getLongValue()));
+            }
+        }
+        var state = states.get(logic);
+        var idOnlyAmount = state != null
+                ? state.getRemainingForItemExact(itemId) : BigInteger.ZERO;
+        return hasNativeDemandBeyondIdOnly(nativeAmount, idOnlyAmount);
+    }
+
+    static boolean hasNativeDemandBeyondIdOnly(
+            BigInteger nativeAmount, BigInteger idOnlyAmount) {
+        Objects.requireNonNull(nativeAmount, "nativeAmount");
+        Objects.requireNonNull(idOnlyAmount, "idOnlyAmount");
+        return nativeAmount.compareTo(idOnlyAmount) > 0;
+    }
+
+    public synchronized boolean hasExactPending(Object logic, AEKey incoming) {
+        Objects.requireNonNull(logic, "logic");
+        Objects.requireNonNull(incoming, "incoming");
+        var state = states.get(logic);
+        return state != null && state.hasExactPending(incoming);
+    }
+
+    /** Mirrored native-waiting amount belonging to ID_ONLY slots with this exact template. */
+    public synchronized long getRemainingForExactKey(Object logic, AEKey incoming) {
+        Objects.requireNonNull(logic, "logic");
+        Objects.requireNonNull(incoming, "incoming");
+        var state = states.get(logic);
+        if (state == null) return 0L;
+        var amount = state.getRemainingForExactKey(incoming);
+        return amount.compareTo(BigInteger.valueOf(Long.MAX_VALUE)) >= 0
+                ? Long.MAX_VALUE : amount.longValue();
     }
 
     public synchronized List<PendingOverloadOutput> snapshotPending(CraftingCpuLogic logic) {
@@ -300,6 +393,7 @@ public final class OverloadCpuStateManager {
         return key.getId();
     }
 
-    private record OutputRegistrationCandidate(String patternIdentity, int outputSlotIndex) {
+    private record OutputRegistrationCandidate(
+            String patternIdentity, int outputSlotIndex, boolean idOnly) {
     }
 }

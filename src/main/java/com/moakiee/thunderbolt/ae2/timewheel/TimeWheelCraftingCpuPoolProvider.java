@@ -2,17 +2,18 @@ package com.moakiee.thunderbolt.ae2.timewheel;
 
 import org.jetbrains.annotations.Nullable;
 
-import appeng.api.networking.IGridNodeService;
+import com.moakiee.thunderbolt.ae2.crafting.ExtendedCraftingCpuCluster;
+import com.moakiee.thunderbolt.ae2.crafting.ExtendedCraftingCpuClusterProvider;
 
 /**
- * Grid-node service that dynamically exposes a time-wheel crafting CPU pool.
- *
- * <p>The provider may temporarily return {@code null}, for example while a
- * multiblock port is waiting for its controller to validate the structure.
- * The crafting service refreshes providers during the server tick and will
- * register or unregister the exposed pool when it changes.</p>
+ * Compatibility provider API for grid nodes that dynamically publish a time-wheel CPU pool.
  */
-public interface TimeWheelCraftingCpuPoolProvider extends IGridNodeService {
+public interface TimeWheelCraftingCpuPoolProvider extends ExtendedCraftingCpuClusterProvider {
     @Nullable
     TimeWheelCraftingCpuPool getTimeWheelCraftingCpuPool();
+
+    @Override
+    default ExtendedCraftingCpuCluster getExtendedCraftingCpuCluster() {
+        return getTimeWheelCraftingCpuPool();
+    }
 }

@@ -126,6 +126,283 @@ class CraftPlannerV2Test {
         assertEquals(1L, plan.usedStock().get("bucket"));
     }
 
+    @Test
+    void returnedSeedShortfallIsReportedOnceForTheWholeCalculation() {
+        CraftGraph<String> noSeed = CraftGraph.<String>builder()
+                .pattern("product", 1, List.of(
+                        CraftInput.of("material", 4), CraftInput.returned("seed", 2)))
+                .stock("material", 400)
+                .build();
+        CraftGraph<String> oneOfTwoSeeds = CraftGraph.<String>builder()
+                .pattern("product", 1, List.of(
+                        CraftInput.of("material", 4), CraftInput.returned("seed", 2)))
+                .stock("material", 400)
+                .stock("seed", 1)
+                .build();
+
+        CraftPlan<String> missingAll = CraftPlannerV2.plan(noSeed, "product", 100);
+        CraftPlan<String> missingOne = CraftPlannerV2.plan(oneOfTwoSeeds, "product", 100);
+
+        assertFalse(missingAll.feasible());
+        assertEquals(2L, missingAll.missing().get("seed"));
+        assertFalse(missingOne.feasible());
+        assertEquals(1L, missingOne.usedStock().get("seed"));
+        assertEquals(1L, missingOne.missing().get("seed"));
+        assertEquals(400L, missingOne.grossDemand().get("material"));
+    }
+
+    @Test
+    void hostReusableStockCannotLeakIntoOrdinarySiblingDemand() {
+        var source = new ReusableStockSource("host", "shared-loop-pool");
+        CraftGraph<String> graph = CraftGraph.<String>builder()
+                .pattern("result", 1, List.of(
+                        CraftInput.of("loop-output", 1), CraftInput.of("ordinary-output", 1)))
+                .pattern("loop-output", 1, List.of(CraftInput.returnedFrom("seed", 1, source)))
+                .pattern("ordinary-output", 1, List.of(CraftInput.of("seed", 1)))
+                .reusableStock("host", "seed", 1)
+                .build();
+
+        CraftPlan<String> plan = CraftPlannerV2.plan(graph, "result", 1);
+
+        assertFalse(plan.feasible(), "private seed must not satisfy an ordinary recipe");
+        assertEquals(1L, plan.missing().get("seed"));
+        assertEquals(1L, plan.usedReusableStock().get(
+                new ReusableStockUsageKey<>("host", "shared-loop-pool", "seed")));
+        assertNull(plan.usedStock().get("seed"));
+    }
+
+    @Test
+    void sharedLoopPoolReusesOnePhysicalHostSeedAcrossPatterns() {
+        var source = new ReusableStockSource("host", "shared-loop-pool");
+        CraftGraph<String> graph = CraftGraph.<String>builder()
+                .pattern("result", 1, List.of(CraftInput.of("left", 1), CraftInput.of("right", 1)))
+                .pattern("left", 1, List.of(CraftInput.returnedFrom("seed", 1, source)))
+                .pattern("right", 1, List.of(CraftInput.returnedFrom("seed", 1, source)))
+                .reusableStock("host", "seed", 1)
+                .build();
+
+        CraftPlan<String> plan = CraftPlannerV2.plan(graph, "result", 1);
+
+        assertTrue(plan.feasible());
+        assertEquals(1L, plan.usedReusableStock().get(
+                new ReusableStockUsageKey<>("host", "shared-loop-pool", "seed")));
+        assertTrue(plan.missing().isEmpty());
+    }
+
+    @Test
+    void nonExactReturnedSeedStaysPrivateToItsRoutingConsumer() {
+        var first = new ReusableStockSource("host", "shared-loop-pool", "first-route");
+        var second = new ReusableStockSource("host", "shared-loop-pool", "second-route");
+        CraftGraph<String> graph = CraftGraph.<String>builder()
+                .pattern("result", 1, List.of(
+                        CraftInput.of("first", 1), CraftInput.of("second", 1)))
+                .pattern("first", 1, List.of(CraftInput.returnedFrom("A", 1, first)))
+                .pattern("second", 1, List.of(CraftInput.returnedFrom("A", 1, second)))
+                .reusableStock("host", "X", 1)
+                .reusableStockRoute(first, "A", List.of("A", "X"))
+                .reusableStockRoute(second, "A", List.of("A", "X"))
+                .build();
+
+        CraftPlan<String> plan = CraftPlannerV2.plan(graph, "result", 1);
+
+        assertFalse(plan.feasible(), "one fuzzy X must not become a cross-consumer logical A");
+        assertEquals(1L, plan.usedReusableStock().values().stream()
+                .mapToLong(Long::longValue).sum());
+        assertEquals(1L, plan.missing().get("A"));
+    }
+
+    @Test
+    void nonExactReturnedSeedCanBeReusedInsideTheSameRoutingConsumer() {
+        var source = new ReusableStockSource("host", "shared-loop-pool", "one-route");
+        CraftGraph<String> graph = CraftGraph.<String>builder()
+                .pattern("result", 1, List.of(
+                        CraftInput.of("first", 1), CraftInput.of("second", 1)))
+                .pattern("first", 1, List.of(CraftInput.returnedFrom("A", 1, source)))
+                .pattern("second", 1, List.of(CraftInput.returnedFrom("A", 1, source)))
+                .reusableStock("host", "X", 1)
+                .reusableStockRoute(source, "A", List.of("A", "X"))
+                .build();
+
+        CraftPlan<String> plan = CraftPlannerV2.plan(graph, "result", 1);
+
+        assertTrue(plan.feasible());
+        assertEquals(1L, plan.usedReusableStock().get(
+                new ReusableStockUsageKey<>(
+                        "host", "shared-loop-pool", "one-route", "A", "X")));
+        assertTrue(plan.missing().isEmpty());
+    }
+
+    @Test
+    void exactReturnedSeedRemainsShareableAcrossRoutingConsumers() {
+        var first = new ReusableStockSource("host", "shared-loop-pool", "first-route");
+        var second = new ReusableStockSource("host", "shared-loop-pool", "second-route");
+        CraftGraph<String> graph = CraftGraph.<String>builder()
+                .pattern("result", 1, List.of(
+                        CraftInput.of("first", 1), CraftInput.of("second", 1)))
+                .pattern("first", 1, List.of(CraftInput.returnedFrom("A", 1, first)))
+                .pattern("second", 1, List.of(CraftInput.returnedFrom("A", 1, second)))
+                .reusableStock("host", "A", 1)
+                .reusableStockRoute(first, "A", List.of("A"))
+                .reusableStockRoute(second, "A", List.of("A"))
+                .build();
+
+        CraftPlan<String> plan = CraftPlannerV2.plan(graph, "result", 1);
+
+        assertTrue(plan.feasible());
+        assertEquals(1L, plan.usedReusableStock().get(
+                new ReusableStockUsageKey<>(
+                        "host", "shared-loop-pool", "first-route", "A", "A")));
+        assertTrue(plan.missing().isEmpty());
+    }
+
+    @Test
+    void sharedExactAllocationCannotBeRematchedAfterAnotherRouteConsumesItsCredit() {
+        var first = new ReusableStockSource("host", "shared-loop-pool", "first-route");
+        var second = new ReusableStockSource("host", "shared-loop-pool", "second-route");
+        var constrained = new ReusableStockSource(
+                "host", "other-shared-loop-pool", "constrained-route");
+        CraftGraph<String> graph = CraftGraph.<String>builder()
+                .pattern("result", 1, List.of(
+                        CraftInput.of("first", 1),
+                        CraftInput.of("second", 1),
+                        CraftInput.of("constrained", 1)))
+                .pattern("first", 1, List.of(CraftInput.returnedFrom("A", 1, first)))
+                .pattern("second", 1, List.of(CraftInput.returnedFrom("A", 1, second)))
+                .pattern("constrained", 1,
+                        List.of(CraftInput.returnedFrom("B", 1, constrained)))
+                .reusableStock("host", "A", 1)
+                .reusableStock("host", "X", 1)
+                .reusableStockRoute(first, "A", List.of("A", "X"))
+                .reusableStockRoute(second, "A", List.of("A", "X"))
+                .reusableStockRoute(constrained, "B", List.of("A"))
+                .build();
+
+        CraftPlan<String> plan = CraftPlannerV2.plan(graph, "result", 1);
+
+        assertFalse(plan.feasible(),
+                "the later B route must not steal exact A after A entered the shared pool");
+        assertEquals(1L, plan.missing().get("B"));
+        assertEquals(1L, plan.usedReusableStock().get(
+                new ReusableStockUsageKey<>(
+                        "host", "shared-loop-pool", "first-route", "A", "A")));
+    }
+
+    @Test
+    void dedicatedLoopPoolsCompeteForTheSamePhysicalHostSeed() {
+        var leftPool = new ReusableStockSource("host", "left-loop");
+        var rightPool = new ReusableStockSource("host", "right-loop");
+        CraftGraph<String> graph = CraftGraph.<String>builder()
+                .pattern("result", 1, List.of(CraftInput.of("left", 1), CraftInput.of("right", 1)))
+                .pattern("left", 1, List.of(CraftInput.returnedFrom("seed", 1, leftPool)))
+                .pattern("right", 1, List.of(CraftInput.returnedFrom("seed", 1, rightPool)))
+                .reusableStock("host", "seed", 1)
+                .build();
+
+        CraftPlan<String> plan = CraftPlannerV2.plan(graph, "result", 1);
+
+        assertFalse(plan.feasible(), "dedicated pools must not borrow each other's phase state");
+        assertEquals(1L, plan.missing().get("seed"));
+        assertEquals(1L, plan.usedReusableStock().values().stream()
+                .mapToLong(Long::longValue).sum());
+    }
+
+    @Test
+    void dedicatedHostBorrowRetainsItsLogicalPoolIdentity() {
+        var leftPool = new ReusableStockSource("host", "left-loop");
+        var rightPool = new ReusableStockSource("host", "right-loop");
+        CraftGraph<String> graph = CraftGraph.<String>builder()
+                .pattern("result", 1, List.of(CraftInput.of("left", 1), CraftInput.of("right", 1)))
+                .pattern("left", 1, List.of(CraftInput.returnedFrom("seed", 1, leftPool)))
+                .pattern("right", 1, List.of(CraftInput.returnedFrom("seed", 1, rightPool)))
+                .reusableStock("host", "seed", 2)
+                .build();
+
+        CraftPlan<String> plan = CraftPlannerV2.plan(graph, "result", 1);
+
+        assertTrue(plan.feasible());
+        assertEquals(1L, plan.usedReusableStock().get(
+                new ReusableStockUsageKey<>("host", "left-loop", "seed")));
+        assertEquals(1L, plan.usedReusableStock().get(
+                new ReusableStockUsageKey<>("host", "right-loop", "seed")));
+    }
+
+    @Test
+    void fuzzyReusableStockDoesNotPreallocateSharedVariantToUnrequestedPattern() {
+        var sourceA = new ReusableStockSource("host", "shared", "route-a");
+        var sourceB = new ReusableStockSource("host", "shared", "route-b");
+        CraftGraph<String> graph = CraftGraph.<String>builder()
+                .pattern("A-product", 1, List.of(CraftInput.returnedFrom("A", 1, sourceA)))
+                .pattern("B-product", 1, List.of(CraftInput.returnedFrom("B", 1, sourceB)))
+                .reusableStock("host", "X", 1)
+                .reusableStockRoute(sourceA, "A", List.of("X"))
+                .reusableStockRoute(sourceB, "B", List.of("X"))
+                .build();
+
+        CraftPlan<String> plan = CraftPlannerV2.plan(graph, "B-product", 1);
+
+        assertTrue(plan.feasible());
+        assertEquals(1L, plan.usedReusableStock().get(
+                new ReusableStockUsageKey<>("host", "shared", "route-b", "B", "X")));
+    }
+
+    @Test
+    void overlappingFuzzyReusableRoutesCannotDoubleSpendOneActualVariant() {
+        var sourceA = new ReusableStockSource("host", "shared", "route-a");
+        var sourceB = new ReusableStockSource("host", "shared", "route-b");
+        CraftGraph<String> graph = fuzzySharedVariantGraph(sourceA, sourceB, 1, 0, false);
+
+        CraftPlan<String> plan = CraftPlannerV2.plan(graph, "result", 1);
+
+        assertFalse(plan.feasible());
+        assertEquals(1L, plan.usedReusableStock().values().stream()
+                .mapToLong(Long::longValue).sum());
+    }
+
+    @Test
+    void fuzzyReusableMatchingReassignsEarlierBorrowAndIgnoresPatternOrder() {
+        var sourceA = new ReusableStockSource("host", "shared", "route-a");
+        var sourceB = new ReusableStockSource("host", "shared", "route-b");
+
+        CraftPlan<String> forward = CraftPlannerV2.plan(
+                fuzzySharedVariantGraph(sourceA, sourceB, 1, 1, false), "result", 1);
+        CraftPlan<String> reversed = CraftPlannerV2.plan(
+                fuzzySharedVariantGraph(sourceA, sourceB, 1, 1, true), "result", 1);
+
+        for (var plan : List.of(forward, reversed)) {
+            assertTrue(plan.feasible());
+            assertEquals(1L, plan.usedReusableStock().get(
+                    new ReusableStockUsageKey<>("host", "shared", "route-a", "A", "Y")));
+            assertEquals(1L, plan.usedReusableStock().get(
+                    new ReusableStockUsageKey<>("host", "shared", "route-b", "B", "X")));
+        }
+    }
+
+    private static CraftGraph<String> fuzzySharedVariantGraph(
+            ReusableStockSource sourceA,
+            ReusableStockSource sourceB,
+            long sharedX,
+            long onlyA,
+            boolean reverse) {
+        var builder = CraftGraph.<String>builder();
+        if (reverse) {
+            builder.pattern("result", 1, List.of(
+                    CraftInput.of("B-product", 1), CraftInput.of("A-product", 1)))
+                    .pattern("B-product", 1, List.of(CraftInput.returnedFrom("B", 1, sourceB)))
+                    .pattern("A-product", 1, List.of(CraftInput.returnedFrom("A", 1, sourceA)));
+        } else {
+            builder.pattern("result", 1, List.of(
+                    CraftInput.of("A-product", 1), CraftInput.of("B-product", 1)))
+                    .pattern("A-product", 1, List.of(CraftInput.returnedFrom("A", 1, sourceA)))
+                    .pattern("B-product", 1, List.of(CraftInput.returnedFrom("B", 1, sourceB)));
+        }
+        return builder
+                .reusableStock("host", "X", sharedX)
+                .reusableStock("host", "Y", onlyA)
+                .reusableStockRoute(sourceA, "A", List.of("X", "Y"))
+                .reusableStockRoute(sourceB, "B", List.of("X"))
+                .build();
+    }
+
     /**
      * Durability tool {@code 1·tool(4) + 1·B → 1·C + tool(3)}: the degradation chain is solved once
      * and reduced to the closed form {@code tools = ceil(times / uses)} — 100 crafts need ceil(100/4)
@@ -380,6 +657,85 @@ class CraftPlannerV2Test {
     }
 
     @Test
+    void conversionSccUsesResidualStockRegardlessOfParentInputOrderAtIntMaxScale() {
+        long scale = Integer.MAX_VALUE;
+        CraftPattern<String> stoneFromCobble = new CraftPattern<>(
+                "stone", 1, List.of(CraftInput.of("cobble", 1)), "stoneFromCobble");
+        CraftPattern<String> cobbleFromStone = new CraftPattern<>(
+                "cobble", 1, List.of(CraftInput.of("stone", 1)), "cobbleFromStone");
+        CraftPattern<String> ironFromStone = new CraftPattern<>(
+                "iron", 1, List.of(CraftInput.of("stone", 1)), "ironFromStone");
+
+        CraftPlan<String> stoneFirst = CraftPlannerV2.plan(
+                conversionOrderGraph(List.of(
+                        CraftInput.of("iron", 1),
+                        CraftInput.of("stone", 547),
+                        CraftInput.of("cobble", 653)),
+                        scale, stoneFromCobble, cobbleFromStone, ironFromStone),
+                "target", scale);
+        CraftPlan<String> cobbleFirst = CraftPlannerV2.plan(
+                conversionOrderGraph(List.of(
+                        CraftInput.of("cobble", 653),
+                        CraftInput.of("iron", 1),
+                        CraftInput.of("stone", 547)),
+                        scale, stoneFromCobble, cobbleFromStone, ironFromStone),
+                "target", scale);
+
+        for (CraftPlan<String> plan : List.of(stoneFirst, cobbleFirst)) {
+            assertTrue(plan.feasible(), "parent input order must not choose the wrong SCC cut");
+            assertEquals(649L * scale, plan.usedStock().get("stone"));
+            assertEquals(552L * scale, plan.usedStock().get("cobble"));
+            assertEquals(101L * scale, firingsOf(plan, cobbleFromStone));
+            assertEquals(0L, firingsOf(plan, stoneFromCobble));
+        }
+    }
+
+    @Test
+    void catalyzedConversionSccCanAlsoReorientAtIntMaxScale() {
+        long scale = Integer.MAX_VALUE;
+        CraftPattern<String> stoneFromCobble = new CraftPattern<>(
+                "stone", 1, List.of(CraftInput.of("cobble", 1)), "stoneFromCobble");
+        CraftPattern<String> cobbleFromStone = new CraftPattern<>(
+                "cobble", 1, List.of(
+                        CraftInput.of("stone", 1), CraftInput.of("tool", 1)), "cobbleFromStone");
+        CraftPattern<String> ironFromStone = new CraftPattern<>(
+                "iron", 1, List.of(CraftInput.of("stone", 1)), "ironFromStone");
+        CraftGraph.Builder<String> builder = CraftGraph.<String>builder()
+                .pattern(new CraftPattern<>("target", 1, List.of(
+                        CraftInput.of("iron", 1),
+                        CraftInput.of("stone", 547),
+                        CraftInput.of("cobble", 653)), "target"))
+                .pattern(stoneFromCobble)
+                .pattern(cobbleFromStone)
+                .pattern(ironFromStone)
+                .stock("stone", 1000L * scale)
+                .stock("cobble", 552L * scale)
+                .stock("tool", 101L * scale);
+
+        CraftPlan<String> plan = CraftPlannerV2.plan(builder.build(), "target", scale);
+
+        assertTrue(plan.feasible());
+        assertEquals(101L * scale, firingsOf(plan, cobbleFromStone));
+        assertEquals(101L * scale, plan.usedStock().get("tool"));
+    }
+
+    private static CraftGraph<String> conversionOrderGraph(
+            List<CraftInput<String>> targetInputs,
+            long scale,
+            CraftPattern<String> stoneFromCobble,
+            CraftPattern<String> cobbleFromStone,
+            CraftPattern<String> ironFromStone) {
+        return CraftGraph.<String>builder()
+                .pattern(new CraftPattern<>("target", 1, targetInputs, "target"))
+                .pattern(stoneFromCobble)
+                .pattern(cobbleFromStone)
+                .pattern(ironFromStone)
+                .stock("stone", 1000L * scale)
+                .stock("cobble", 552L * scale)
+                .build();
+    }
+
+    @Test
     void containerIsConsumedAndRefilledFromItsOwnLeftover() {
         // Container model the adapter builds for a filled bucket: making P consumes one full bucket and
         // hands back an empty one (byproduct); the empty + water refills a full bucket. With a single
@@ -403,6 +759,270 @@ class CraftPlannerV2Test {
         assertEquals(1L, plan.usedStock().get("full_bucket")); // one seed bucket, reused
         assertEquals(4L, plan.usedStock().get("water"));       // 4 refills from the 5 returned empties
         assertTrue(plan.missing().isEmpty());
+    }
+
+    @Test
+    void partialFeedbackLoopKeepsOneRecoveredBatchAsBootstrapSeed() {
+        CraftPattern<String> makeB = new CraftPattern<>(
+                "B", 2, List.of(CraftInput.of("A", 2)),
+                List.of(CraftOutput.of("C", 1)), "makeB");
+        CraftPattern<String> recoverA = new CraftPattern<>(
+                "A", 1, List.of(CraftInput.of("C", 1)), "recoverA");
+        CraftGraph<String> shortOneSeed = CraftGraph.<String>builder()
+                .pattern(makeB).pattern(recoverA).stock("A", 2).build();
+        CraftGraph<String> seeded = CraftGraph.<String>builder()
+                .pattern(makeB).pattern(recoverA).stock("A", 3).build();
+
+        CraftPlan<String> shortPlan = CraftPlannerV2.plan(shortOneSeed, "B", 4);
+        CraftPlan<String> seededPlan = CraftPlannerV2.plan(seeded, "B", 4);
+
+        assertFalse(shortPlan.feasible(), "net 2 A is not enough to start two 2-A firings");
+        assertEquals(1L, shortPlan.missing().get("A"));
+        assertTrue(seededPlan.feasible());
+        assertEquals(3L, seededPlan.usedStock().get("A"));
+        assertEquals(2L, firingsOf(seededPlan, makeB));
+        assertEquals(1L, firingsOf(seededPlan, recoverA));
+    }
+
+    @Test
+    void partialFeedbackLoopScalesAtIntMaxWithoutPerFiringSimulation() {
+        long scale = Integer.MAX_VALUE;
+        CraftPattern<String> makeB = new CraftPattern<>(
+                "B", 2, List.of(CraftInput.of("A", 2)),
+                List.of(CraftOutput.of("C", 1)), "makeB");
+        CraftPattern<String> recoverA = new CraftPattern<>(
+                "A", 1, List.of(CraftInput.of("C", 1)), "recoverA");
+        CraftGraph<String> graph = CraftGraph.<String>builder()
+                .pattern(makeB).pattern(recoverA).stock("A", scale + 1).build();
+
+        CraftPlan<String> plan = CraftPlannerV2.plan(graph, "B", 2L * scale);
+
+        assertTrue(plan.feasible());
+        assertEquals(scale + 1, plan.usedStock().get("A"));
+        assertEquals(scale, firingsOf(plan, makeB));
+        assertEquals(scale - 1, firingsOf(plan, recoverA));
+    }
+
+    @Test
+    void partialFeedbackMayBootstrapFromTheReturnedState() {
+        CraftPattern<String> makeB = new CraftPattern<>(
+                "B", 2, List.of(CraftInput.of("A", 2)),
+                List.of(CraftOutput.of("C", 1)), "makeB");
+        CraftPattern<String> recoverA = new CraftPattern<>(
+                "A", 1, List.of(CraftInput.of("C", 1)), "recoverA");
+        CraftGraph<String> graph = CraftGraph.<String>builder()
+                .pattern(makeB).pattern(recoverA).stock("A", 2).stock("C", 1).build();
+
+        CraftPlan<String> plan = CraftPlannerV2.plan(graph, "B", 4);
+
+        assertTrue(plan.feasible());
+        assertEquals(2L, plan.usedStock().get("A"));
+        assertEquals(1L, plan.usedStock().get("C"));
+    }
+
+    @Test
+    void partialFeedbackRequestSmallerThanRatioCycleNeedsOnlyItsActualInputBatch() {
+        CraftPattern<String> makeB = new CraftPattern<>(
+                "B", 2, List.of(CraftInput.of("A", 1)),
+                List.of(CraftOutput.of("C", 2)), "makeB");
+        CraftPattern<String> recoverA = new CraftPattern<>(
+                "A", 1, List.of(CraftInput.of("C", 3)), "recoverA");
+        CraftGraph<String> graph = CraftGraph.<String>builder()
+                .pattern(makeB).pattern(recoverA).stock("C", 3).build();
+
+        CraftPlan<String> plan = CraftPlannerV2.plan(graph, "B", 2);
+
+        assertTrue(plan.feasible());
+        assertEquals(3L, plan.usedStock().get("C"));
+        assertEquals(1L, firingsOf(plan, makeB));
+        assertEquals(1L, firingsOf(plan, recoverA));
+    }
+
+    @Test
+    void balancedRawFeedbackRemainsAnOrdinaryFinitePlan() {
+        CraftPattern<String> makeB = new CraftPattern<>(
+                "B", 1, List.of(CraftInput.of("A", 1)),
+                List.of(CraftOutput.of("C", 1)), "makeB");
+        CraftPattern<String> recoverA = new CraftPattern<>(
+                "A", 1, List.of(CraftInput.of("C", 1)), "recoverA");
+        CraftGraph<String> graph = CraftGraph.<String>builder()
+                .pattern(makeB).pattern(recoverA).stock("A", 1).build();
+
+        CraftPlan<String> plan = CraftPlannerV2.plan(graph, "B", 100);
+
+        assertTrue(plan.feasible());
+        assertEquals(1L, plan.usedStock().get("A"));
+        assertEquals(100L, firingsOf(plan, makeB));
+        assertEquals(99L, firingsOf(plan, recoverA));
+    }
+
+    @Test
+    void positiveRawFeedbackIsNotSolvedOutsideAContractedLoopPattern() {
+        CraftPattern<String> makeB = new CraftPattern<>(
+                "B", 1, List.of(CraftInput.of("A", 1)),
+                List.of(CraftOutput.of("C", 1)), "makeB");
+        CraftPattern<String> duplicateA = new CraftPattern<>(
+                "A", 2, List.of(CraftInput.of("C", 1)), "duplicateA");
+        CraftGraph<String> graph = CraftGraph.<String>builder()
+                .pattern(makeB).pattern(duplicateA).stock("A", 1).build();
+
+        CraftPlan<String> plan = CraftPlannerV2.plan(graph, "B", 3);
+
+        assertFalse(plan.feasible(), "raw gain feedback must be compiled into a closed-loop macro");
+        assertEquals(1L, plan.missing().get("C"));
+    }
+
+    @Test
+    void positiveFeedbackRefillStillWorksFromIndependentFiniteStock() {
+        CraftPattern<String> makeB = new CraftPattern<>(
+                "B", 1, List.of(CraftInput.of("A", 1)),
+                List.of(CraftOutput.of("C", 1)), "makeB");
+        CraftPattern<String> duplicateA = new CraftPattern<>(
+                "A", 2, List.of(CraftInput.of("C", 1)), "duplicateA");
+        CraftGraph<String> graph = CraftGraph.<String>builder()
+                .pattern(makeB).pattern(duplicateA)
+                .stock("A", 1).stock("C", 1).build();
+
+        CraftPlan<String> plan = CraftPlannerV2.plan(graph, "B", 3);
+
+        assertTrue(plan.feasible(), "existing C is a finite input, not feedback from makeB");
+        assertEquals(1L, plan.usedStock().get("A"));
+        assertEquals(1L, plan.usedStock().get("C"));
+    }
+
+    @Test
+    void contractedPureGainHasUnboundedCapacityButKeepsFiniteFirings() {
+        long amount = Integer.MAX_VALUE;
+        CraftPattern<String> contracted = new CraftPattern<>(
+                "seed", 1, List.of(CraftInput.returned("seed", 1)), "contractedClosedLoop");
+        CraftGraph<String> graph = CraftGraph.<String>builder()
+                .pattern(contracted).stock("seed", 1).build();
+
+        CraftPlan<String> plan = CraftPlannerV2.plan(graph, "seed", amount);
+
+        assertTrue(plan.feasible());
+        assertEquals(amount, firingsOf(plan, contracted));
+        assertEquals(1L, plan.usedStock().get("seed"));
+        assertTrue(plan.missing().isEmpty());
+    }
+
+    @Test
+    void pureSelfGainCraftsItsCatalystWithANonLoopPatternFirst() {
+        long amount = Integer.MAX_VALUE;
+        CraftPattern<String> seedFromA = new CraftPattern<>(
+                "seed", 1, List.of(CraftInput.of("A", 1)), "A_to_seed");
+        CraftPattern<String> contracted = new CraftPattern<>(
+                "seed", 1, List.of(CraftInput.returned("seed", 1)), "contractedSelfGain");
+        CraftGraph<String> graph = CraftGraph.<String>builder()
+                .pattern(seedFromA)
+                .pattern(contracted)
+                .stock("A", 1)
+                .build();
+
+        CraftPlan<String> plan = CraftPlannerV2.plan(graph, "seed", amount);
+
+        assertTrue(plan.feasible());
+        assertEquals(1L, plan.usedStock().get("A"));
+        assertEquals(1L, firingsOf(plan, seedFromA));
+        assertEquals(amount, firingsOf(plan, contracted));
+        assertTrue(plan.missing().isEmpty());
+    }
+
+    @Test
+    void contractedGainCannotUseItsOwnSecondaryOutputAsTheSeed() {
+        CraftPattern<String> contracted = new CraftPattern<>(
+                "product", 1, List.of(CraftInput.returned("seed", 1)),
+                List.of(CraftOutput.of("seed", 1)), "contractedClosedLoop");
+        CraftGraph<String> unseeded = CraftGraph.<String>builder().pattern(contracted).build();
+        CraftGraph<String> seeded = CraftGraph.<String>builder()
+                .pattern(contracted).stock("seed", 1).build();
+
+        CraftPlan<String> missingSeed = CraftPlannerV2.plan(unseeded, "product", Integer.MAX_VALUE);
+        CraftPlan<String> availableSeed = CraftPlannerV2.plan(seeded, "product", Integer.MAX_VALUE);
+
+        assertFalse(missingSeed.feasible());
+        assertEquals(1L, missingSeed.missing().get("seed"));
+        assertTrue(availableSeed.feasible());
+        assertEquals(1L, availableSeed.usedStock().get("seed"));
+        assertEquals(Integer.MAX_VALUE, firingsOf(availableSeed, contracted));
+    }
+
+    @Test
+    void emptySeedPoolCraftsOneSeedBeforeRunningContractedGainLoop() {
+        CraftPattern<String> seedFromA = new CraftPattern<>(
+                "B", 1, List.of(CraftInput.of("A", 1)), "A_to_B_seed");
+        // Contracted form of (B -> 2C; C -> B): one reusable B seed yields net +1 C.
+        CraftPattern<String> contractedGain = new CraftPattern<>(
+                "C", 1, List.of(CraftInput.returned("B", 1)), "contracted_B_C_loop");
+        CraftPattern<String> makeD = new CraftPattern<>(
+                "D", 1, List.of(CraftInput.of("C", 2)), "2C_to_D");
+        CraftGraph<String> graph = CraftGraph.<String>builder()
+                .pattern(seedFromA)
+                .pattern(contractedGain)
+                .pattern(makeD)
+                .stock("A", 1)
+                .build();
+
+        CraftPlan<String> plan = CraftPlannerV2.plan(graph, "D", 1_000);
+
+        assertTrue(plan.feasible());
+        assertEquals(1L, plan.usedStock().get("A"));
+        assertEquals(1L, firingsOf(plan, seedFromA));
+        assertEquals(2_000L, firingsOf(plan, contractedGain));
+        assertEquals(1_000L, firingsOf(plan, makeD));
+        assertTrue(plan.missing().isEmpty());
+    }
+
+    @Test
+    void alternateLoopStateCanBeCraftedIntoTheDefaultSeedBeforeStartup() {
+        CraftPattern<String> bFromA = new CraftPattern<>(
+                "B", 1, List.of(CraftInput.of("A", 1)), "A_to_B");
+        CraftPattern<String> cFromB = new CraftPattern<>(
+                "C", 2, List.of(CraftInput.of("B", 1)), "B_to_2C");
+        // Same (B -> 2C; C -> B) loop, but its selected/default reusable seed is C.
+        CraftPattern<String> contractedWithCSeed = new CraftPattern<>(
+                "C", 1, List.of(CraftInput.returned("C", 1)), "contracted_C_seed_loop");
+        CraftPattern<String> makeD = new CraftPattern<>(
+                "D", 1, List.of(CraftInput.of("C", 2)), "2C_to_D");
+        CraftGraph<String> graph = CraftGraph.<String>builder()
+                .pattern(bFromA)
+                .pattern(cFromB)
+                .pattern(contractedWithCSeed)
+                .pattern(makeD)
+                .stock("A", 1)
+                .build();
+
+        CraftPlan<String> plan = CraftPlannerV2.plan(graph, "D", 1_000);
+
+        assertTrue(plan.feasible());
+        assertEquals(1L, plan.usedStock().get("A"));
+        assertEquals(1L, firingsOf(plan, bFromA));
+        assertEquals(1L, firingsOf(plan, cFromB));
+        assertEquals(2_000L, firingsOf(plan, contractedWithCSeed));
+        assertEquals(1_000L, firingsOf(plan, makeD));
+        assertTrue(plan.missing().isEmpty());
+    }
+
+    @Test
+    void containerCycleCanBootstrapFromReturnedStateButNotFromNothing() {
+        CraftPattern<String> makeP = new CraftPattern<>(
+                "P", 1, List.of(CraftInput.consumedReturning("full", 1, "empty")),
+                List.of(CraftOutput.of("empty", 1)), "makeP");
+        CraftPattern<String> refill = new CraftPattern<>(
+                "full", 1, List.of(CraftInput.of("empty", 1), CraftInput.of("water", 1)), "refill");
+
+        CraftGraph<String> withSeed = CraftGraph.<String>builder()
+                .pattern(makeP).pattern(refill).stock("empty", 1).stock("water", 100).build();
+        CraftGraph<String> withoutSeed = CraftGraph.<String>builder()
+                .pattern(makeP).pattern(refill).stock("water", 100).build();
+
+        CraftPlan<String> seeded = CraftPlannerV2.plan(withSeed, "P", 10);
+        CraftPlan<String> unseeded = CraftPlannerV2.plan(withoutSeed, "P", 10);
+
+        assertTrue(seeded.feasible());
+        assertEquals(1L, seeded.usedStock().get("empty"));
+        assertFalse(unseeded.feasible());
+        assertEquals(1L, unseeded.missing().get("full"));
     }
 
     @Test

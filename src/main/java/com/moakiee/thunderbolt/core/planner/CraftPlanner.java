@@ -45,7 +45,7 @@ public final class CraftPlanner {
 
     public static <K> CraftPlan<K> plan(CraftGraph<K> graph, K target, long amount, MissingMode mode) {
         if (amount <= 0) {
-            return new CraftPlan<>(true, true, Map.of(), Map.of(), Map.of(), Map.of(), 0, false);
+            return new CraftPlan<>(true, true, Map.of(), Map.of(), Map.of(), Map.of(), Map.of(), 0, false);
         }
 
         // 1) Reachable items from the target (deduped → DAG, not a tree).
@@ -160,7 +160,8 @@ public final class CraftPlanner {
         }
 
         boolean feasible = missing.isEmpty();
-        return new CraftPlan<>(true, feasible, firings, usedStock, missing, grossDemand, processed, false);
+        return new CraftPlan<>(true, feasible, firings, usedStock, Map.of(), missing,
+                grossDemand, processed, false);
     }
 
     /**

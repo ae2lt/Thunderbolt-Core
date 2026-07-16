@@ -21,7 +21,7 @@ public final class CraftingCorePatternDispatcher {
         this.sink = Objects.requireNonNull(sink);
     }
 
-    public int pushBatch(IPatternDetails details, KeyCounter[] scaledInputs, int maxCraft) {
+    public long pushBatch(IPatternDetails details, KeyCounter[] scaledInputs, long maxCraft) {
         if (maxCraft <= 0) return 0;
         if (!active.getAsBoolean()) return maxCraft;
         if (!loadedPattern.test(details)) return maxCraft;
@@ -31,6 +31,6 @@ public final class CraftingCorePatternDispatcher {
 
     @FunctionalInterface
     public interface BatchSink {
-        int pushBatch(IPatternDetails details, KeyCounter[] scaledInputs, int maxCraft);
+        long pushBatch(IPatternDetails details, KeyCounter[] scaledInputs, long maxCraft);
     }
 }

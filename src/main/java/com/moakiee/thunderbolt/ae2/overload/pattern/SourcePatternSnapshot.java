@@ -1,5 +1,9 @@
 package com.moakiee.thunderbolt.ae2.overload.pattern;
 
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
+import java.util.HexFormat;
 import java.util.Objects;
 
 import org.jetbrains.annotations.Nullable;
@@ -8,6 +12,7 @@ import net.minecraft.core.HolderLookup;
 import net.minecraft.core.component.DataComponents;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.nbt.CompoundTag;
+import net.minecraft.nbt.ListTag;
 import net.minecraft.nbt.Tag;
 import net.minecraft.resources.ResourceLocation;
 import net.minecraft.world.item.ItemStack;
@@ -56,6 +61,28 @@ public final class SourcePatternSnapshot {
 
     public ResourceLocation itemId() {
         return itemId;
+    }
+
+    /** Stable content fingerprint used to keep distinct source recipes in distinct pending slots. */
+    public String fingerprint() {
+        var identity = toTag();
+        if (identity.contains(TAG_STACK, Tag.TAG_COMPOUND)) {
+            // The stack count is transport state, not recipe identity. Pattern providers may hand
+            // us an otherwise identical encoded pattern as a stack of 1 or 64; keeping that count
+            // would split one recipe into unrelated overload pending queues. Only normalize the
+            // serialized stack's top-level count so recipe-internal ingredient counts remain part
+            // of the fingerprint.
+            var stack = identity.getCompound(TAG_STACK);
+            stack.remove("count");
+            stack.remove("Count"); // legacy ItemStack NBT
+        }
+        var canonical = canonicalCopy(identity).toString();
+        try {
+            return HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256")
+                    .digest(canonical.getBytes(StandardCharsets.UTF_8)));
+        } catch (NoSuchAlgorithmException e) {
+            throw new IllegalStateException("SHA-256 is unavailable", e);
+        }
     }
 
     @Nullable
@@ -114,5 +141,22 @@ public final class SourcePatternSnapshot {
             customData = tag.getCompound(TAG_CUSTOM_DATA).copy();
         }
         return new SourcePatternSnapshot(itemId, serializedStack, customData);
+    }
+
+    private static Tag canonicalCopy(Tag source) {
+        if (source instanceof CompoundTag compound) {
+            var result = new CompoundTag();
+            compound.getAllKeys().stream().sorted().forEach(key -> {
+                var value = compound.get(key);
+                if (value != null) result.put(key, canonicalCopy(value));
+            });
+            return result;
+        }
+        if (source instanceof ListTag list) {
+            var result = new ListTag();
+            for (var value : list) result.add(canonicalCopy(value));
+            return result;
+        }
+        return source.copy();
     }
 }

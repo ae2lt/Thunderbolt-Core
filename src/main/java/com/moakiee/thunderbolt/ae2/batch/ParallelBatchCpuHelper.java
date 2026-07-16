@@ -2,6 +2,7 @@ package com.moakiee.thunderbolt.ae2.batch;
 
 import java.util.Arrays;
 import java.util.HashMap;
+import java.util.Map;
 
 import org.jetbrains.annotations.Nullable;
 
@@ -10,247 +11,244 @@ import appeng.api.crafting.IPatternDetails;
 import appeng.api.stacks.AEKey;
 import appeng.api.stacks.KeyCounter;
 import appeng.crafting.inv.ListCraftingInventory;
+import com.moakiee.thunderbolt.ae2.crafting.ExecuteLoopPattern;
 
 public final class ParallelBatchCpuHelper {
     private ParallelBatchCpuHelper() {
     }
 
-    /**
-     * Extracts up to {@code maxCraft} homogeneous copies in O(input slots).
-     *
-     * <p>Each pattern input group chooses a single concrete item key. If no
-     * single variant can satisfy a slot, this returns {@code null} so the CPU
-     * can fall back to AE2's vanilla one-copy substitution path.
-     */
     @Nullable
-    public static BulkResult bulkExtract(IPatternDetails details, ListCraftingInventory inv, int maxCraft) {
+    public static BulkResult bulkExtract(IPatternDetails details, ListCraftingInventory inv, long maxCraft) {
+        return bulkExtract(details, inv, maxCraft, true, Map.of());
+    }
+
+    @Nullable
+    public static BulkResult bulkExtract(IPatternDetails details, ListCraftingInventory inv, long maxCraft,
+                                         boolean allowSharedInputs, Map<AEKey, Long> reservedStock) {
         if (maxCraft <= 0) return null;
 
         var inputs = details.getInputs();
         int slots = inputs.length;
         var chosenKeys = new AEKey[slots];
-        var perCopyUnits = new long[slots];
-        var availCache = new long[slots];
+        var units = new long[slots];
+        var available = new long[slots];
+        var shared = new boolean[slots];
+        var executionDetails = details instanceof ExecuteLoopPattern loop
+                ? loop.delegate() : details;
+        var sharedPattern = allowSharedInputs
+                && executionDetails instanceof SharedBatchInputPattern pattern ? pattern : null;
+        var reserved = reservedStock != null ? reservedStock : Map.<AEKey, Long>of();
 
-        for (int i = 0; i < slots; i++) {
-            var input = inputs[i];
-            long multiplier = input.getMultiplier();
+        for (int slot = 0; slot < slots; slot++) {
+            var input = inputs[slot];
             var possibles = input.getPossibleInputs();
-
-            if (possibles.length == 1) {
-                var only = possibles[0];
-                if (only.what() == null) return null;
-                long perCopy = only.amount() * multiplier;
-                if (perCopy <= 0) return null;
-                long avail = inv.extract(only.what(), Long.MAX_VALUE, Actionable.SIMULATE);
-                if (avail < perCopy) return null;
-                chosenKeys[i] = only.what();
-                perCopyUnits[i] = perCopy;
-                availCache[i] = avail;
-                continue;
-            }
-
             AEKey bestKey = null;
-            long bestPerCopy = 0;
-            long bestAvail = 0;
+            long bestUnits = 0;
+            long bestAvailable = 0;
             long bestCopies = 0;
+            boolean bestShared = false;
             for (var possible : possibles) {
                 if (possible.what() == null) continue;
-                long perCopy = possible.amount() * multiplier;
+                long perCopy = saturatingMultiply(possible.amount(), input.getMultiplier());
                 if (perCopy <= 0) continue;
-                long avail = inv.extract(possible.what(), Long.MAX_VALUE, Actionable.SIMULATE);
-                long canDo = avail / perCopy;
-                if (canDo > bestCopies) {
+                long inInventory = Math.max(0L,
+                        inv.extract(possible.what(), Long.MAX_VALUE, Actionable.SIMULATE)
+                                - Math.max(0L, reserved.getOrDefault(possible.what(), 0L)));
+                boolean isShared = sharedPattern != null
+                        && sharedPattern.isSharedBatchInput(slot, possible.what());
+                long copies = isShared ? (inInventory >= perCopy ? maxCraft : 0L) : inInventory / perCopy;
+                if (copies > bestCopies) {
                     bestKey = possible.what();
-                    bestPerCopy = perCopy;
-                    bestAvail = avail;
-                    bestCopies = canDo;
-                    if (bestCopies >= maxCraft) break;
+                    bestUnits = perCopy;
+                    bestAvailable = inInventory;
+                    bestCopies = copies;
+                    bestShared = isShared;
+                    if (copies >= maxCraft) break;
                 }
             }
             if (bestKey == null || bestCopies <= 0) return null;
-            chosenKeys[i] = bestKey;
-            perCopyUnits[i] = bestPerCopy;
-            availCache[i] = bestAvail;
+            chosenKeys[slot] = bestKey;
+            units[slot] = bestUnits;
+            available[slot] = bestAvailable;
+            shared[slot] = bestShared;
+        }
+
+        var fixedByKey = new HashMap<AEKey, Long>(slots * 2);
+        var variableByKey = new HashMap<AEKey, Long>(slots * 2);
+        var availableByKey = new HashMap<AEKey, Long>(slots * 2);
+        for (int slot = 0; slot < slots; slot++) {
+            availableByKey.put(chosenKeys[slot], available[slot]);
+            (shared[slot] ? fixedByKey : variableByKey)
+                    .merge(chosenKeys[slot], units[slot], ParallelBatchCpuHelper::saturatingAdd);
         }
 
         long actual = maxCraft;
-        boolean hasCollision = false;
-        outer:
-        for (int i = 1; i < slots; i++) {
-            for (int j = 0; j < i; j++) {
-                if (chosenKeys[i].equals(chosenKeys[j])) {
-                    hasCollision = true;
-                    break outer;
-                }
-            }
+        for (var entry : availableByKey.entrySet()) {
+            long fixed = fixedByKey.getOrDefault(entry.getKey(), 0L);
+            long variable = variableByKey.getOrDefault(entry.getKey(), 0L);
+            if (fixed > entry.getValue()) return null;
+            if (variable > 0) actual = Math.min(actual, (entry.getValue() - fixed) / variable);
+            if (actual <= 0) return null;
         }
-
-        HashMap<AEKey, Long> totalPerCopy = null;
-        if (!hasCollision) {
-            for (int i = 0; i < slots; i++) {
-                long canDo = availCache[i] / perCopyUnits[i];
-                if (canDo < actual) actual = canDo;
-                if (actual <= 0) return null;
-            }
-        } else {
-            totalPerCopy = new HashMap<>(slots * 2);
-            for (int i = 0; i < slots; i++) {
-                totalPerCopy.merge(chosenKeys[i], perCopyUnits[i], Long::sum);
-            }
-            boolean[] visited = new boolean[slots];
-            for (int i = 0; i < slots; i++) {
-                if (visited[i]) continue;
-                visited[i] = true;
-                long perBatch = totalPerCopy.get(chosenKeys[i]);
-                long canDo = perBatch > 0 ? availCache[i] / perBatch : 0;
-                if (canDo < actual) actual = canDo;
-                if (actual <= 0) return null;
-                for (int j = i + 1; j < slots; j++) {
-                    if (!visited[j] && chosenKeys[j].equals(chosenKeys[i])) {
-                        visited[j] = true;
+        var extractedByKey = new HashMap<AEKey, Long>(availableByKey.size() * 2);
+        for (var entry : availableByKey.entrySet()) {
+            long need = saturatingAdd(
+                    fixedByKey.getOrDefault(entry.getKey(), 0L),
+                    saturatingMultiply(variableByKey.getOrDefault(entry.getKey(), 0L), actual));
+            long got = inv.extract(entry.getKey(), need, Actionable.MODULATE);
+            extractedByKey.put(entry.getKey(), got);
+            if (got < need) {
+                for (var rollback : extractedByKey.entrySet()) {
+                    if (rollback.getValue() > 0) {
+                        inv.insert(rollback.getKey(), rollback.getValue(), Actionable.MODULATE);
                     }
                 }
-            }
-        }
-
-        if (actual <= 0 || actual > Integer.MAX_VALUE) return null;
-
-        if (!hasCollision) {
-            long[] extracted = new long[slots];
-            for (int i = 0; i < slots; i++) {
-                long need = perCopyUnits[i] * actual;
-                long got = inv.extract(chosenKeys[i], need, Actionable.MODULATE);
-                extracted[i] = got;
-                if (got < need) {
-                    for (int j = 0; j <= i; j++) {
-                        if (extracted[j] > 0) {
-                            inv.insert(chosenKeys[j], extracted[j], Actionable.MODULATE);
-                        }
-                    }
-                    return null;
-                }
-            }
-        } else {
-            var perKeyExtracted = new HashMap<AEKey, Long>(totalPerCopy.size() * 2);
-            for (var entry : totalPerCopy.entrySet()) {
-                long need = entry.getValue() * actual;
-                long got = inv.extract(entry.getKey(), need, Actionable.MODULATE);
-                perKeyExtracted.put(entry.getKey(), got);
-                if (got < need) {
-                    for (var rollback : perKeyExtracted.entrySet()) {
-                        if (rollback.getValue() > 0) {
-                            inv.insert(rollback.getKey(), rollback.getValue(), Actionable.MODULATE);
-                        }
-                    }
-                    return null;
-                }
+                return null;
             }
         }
 
         var scaled = new KeyCounter[slots];
-        for (int i = 0; i < slots; i++) {
-            scaled[i] = new KeyCounter();
-            long amount = perCopyUnits[i] * actual;
-            if (amount > 0) {
-                scaled[i].add(chosenKeys[i], amount);
-            }
+        for (int slot = 0; slot < slots; slot++) {
+            scaled[slot] = new KeyCounter();
+            long amount = shared[slot] ? units[slot] : saturatingMultiply(units[slot], actual);
+            if (amount > 0) scaled[slot].add(chosenKeys[slot], amount);
         }
-
-        return new BulkResult(scaled, (int) actual, chosenKeys, perCopyUnits);
+        return new BulkResult(scaled, actual, chosenKeys, units, shared);
     }
 
-    public static void reinject(BulkResult result, int leftoverCopies, ListCraftingInventory inv) {
+    public static void reinject(BulkResult result, long leftoverCopies, ListCraftingInventory inv) {
         if (leftoverCopies <= 0) return;
-        for (int i = 0; i < result.scaledInputs.length; i++) {
-            long amount = result.perCopyUnits[i] * leftoverCopies;
-            if (amount > 0 && result.keys[i] != null) {
-                inv.insert(result.keys[i], amount, Actionable.MODULATE);
-                result.scaledInputs[i].remove(result.keys[i], amount);
+        long returnedCopies = Math.min(leftoverCopies, result.remainingCopies);
+        for (int slot = 0; slot < result.scaledInputs.length; slot++) {
+            if (result.sharedInputs[slot]) continue;
+            long amount = saturatingMultiply(result.units[slot], returnedCopies);
+            if (amount > 0 && result.keys[slot] != null) {
+                inv.insert(result.keys[slot], amount, Actionable.MODULATE);
+                result.scaledInputs[slot].remove(result.keys[slot], amount);
             }
         }
-    }
-
-    /** Convenience overload keeping {@link BulkResult}'s chosen keys encapsulated for callers in other packages. */
-    public static void registerExpectedOutputs(BatchJobView job, IPatternDetails details,
-                                               BulkResult result, int dispatched) {
-        registerExpectedOutputs(job, details, result.keys, dispatched);
+        result.remainingCopies -= returnedCopies;
+        if (result.remainingCopies == 0 && !result.sharedDispatched) result.reinjectShared(inv);
     }
 
     public static void registerExpectedOutputs(BatchJobView job, IPatternDetails details,
-                                               AEKey[] chosenKeys, int dispatched) {
+                                               BulkResult result, long dispatched) {
+        registerExpectedOutputs(job, details, result.keys, result.sharedInputs, dispatched);
+    }
+
+    public static void registerExpectedOutputs(BatchJobView job, IPatternDetails details,
+                                               AEKey[] chosenKeys, long dispatched) {
+        registerExpectedOutputs(job, details, chosenKeys, null, dispatched);
+    }
+
+    private static void registerExpectedOutputs(BatchJobView job, IPatternDetails details,
+                                                AEKey[] chosenKeys, boolean[] shared, long dispatched) {
         if (dispatched <= 0) return;
-
+        var executionDetails = details instanceof ExecuteLoopPattern loop
+                ? loop.delegate() : details;
+        var sharedPattern = executionDetails instanceof SharedBatchInputPattern pattern
+                ? pattern : null;
+        var sharedOutputsLeft = new HashMap<AEKey, Long>();
         for (var output : details.getOutputs()) {
-            job.insertWaitingFor(output.what(), output.amount() * (long) dispatched);
+            long sharedAmount = 0L;
+            if (sharedPattern != null) {
+                long remainingShared = sharedOutputsLeft.computeIfAbsent(
+                        output.what(), sharedPattern::sharedBatchOutputAmount);
+                sharedAmount = Math.min(output.amount(), Math.max(0L, remainingShared));
+                sharedOutputsLeft.put(output.what(), remainingShared - sharedAmount);
+            }
+            long scalable = Math.max(0L, output.amount() - sharedAmount);
+            job.insertWaitingFor(output.what(), saturatingAdd(
+                    sharedAmount, saturatingMultiply(scalable, dispatched)));
         }
-
         var inputs = details.getInputs();
-        for (int i = 0; i < inputs.length; i++) {
-            var input = inputs[i];
+        for (int slot = 0; slot < inputs.length; slot++) {
+            var input = inputs[slot];
             var possibles = input.getPossibleInputs();
             if (possibles.length == 0) continue;
-            // Use the substitute actually extracted for this slot (bulkExtract's choice), not
-            // possibles[0]: a fuzzy slot's variants can hand back different leftover containers
-            // (e.g. different filled containers -> different empties), so keying the expected
-            // container off the first candidate would make the job wait for / credit the wrong
-            // leftover. chosenKeys is aligned 1:1 with details.getInputs() by bulkExtract.
-            AEKey consumedKey = (chosenKeys != null && i < chosenKeys.length && chosenKeys[i] != null)
-                    ? chosenKeys[i]
-                    : possibles[0].what();
-            AEKey containerKey = input.getRemainingKey(consumedKey);
-            if (containerKey != null) {
-                long count = input.getMultiplier() * (long) dispatched;
-                job.insertWaitingFor(containerKey, count);
-                job.addContainerMaxItems(count, containerKey.getType());
+            AEKey consumed = chosenKeys != null && slot < chosenKeys.length && chosenKeys[slot] != null
+                    ? chosenKeys[slot] : possibles[0].what();
+            AEKey remaining = input.getRemainingKey(consumed);
+            if (remaining != null) {
+                long copies = shared != null && slot < shared.length && shared[slot] ? 1L : dispatched;
+                // CraftingCpuHelper registers one remainder per completed template operation;
+                // the possible stack's physical amount only affects extraction, not return count.
+                long perCopy = input.getMultiplier();
+                long count = saturatingMultiply(perCopy, copies);
+                job.insertWaitingFor(remaining, count);
+                job.addContainerMaxItems(count, remaining.getType());
             }
         }
     }
 
     public static KeyCounter[] cloneSingleCopy(BulkResult result) {
-        var copy = new KeyCounter[result.scaledInputs.length];
-        for (int i = 0; i < copy.length; i++) {
-            copy[i] = new KeyCounter();
-            if (result.perCopyUnits[i] > 0 && result.keys[i] != null) {
-                copy[i].add(result.keys[i], result.perCopyUnits[i]);
-            }
-        }
-        return copy;
+        return copySlice(result, 1);
     }
 
-    public static KeyCounter[] copySlice(BulkResult result, int sliceCount) {
+    public static KeyCounter[] copySlice(BulkResult result, long sliceCount) {
         var slice = new KeyCounter[result.scaledInputs.length];
-        for (int i = 0; i < slice.length; i++) {
-            slice[i] = new KeyCounter();
-            long amount = Math.max(0, sliceCount) * result.perCopyUnits[i];
-            if (amount > 0 && result.keys[i] != null) {
-                slice[i].add(result.keys[i], amount);
-            }
+        for (int slot = 0; slot < slice.length; slot++) {
+            slice[slot] = new KeyCounter();
+            long amount = result.sharedInputs[slot]
+                    ? result.units[slot]
+                    : saturatingMultiply(Math.max(0, sliceCount), result.units[slot]);
+            if (amount > 0 && result.keys[slot] != null) slice[slot].add(result.keys[slot], amount);
         }
         return slice;
     }
 
-    public static void markDispatched(BulkResult result, int dispatchedCopies) {
+    public static void markDispatched(BulkResult result, long dispatchedCopies) {
         if (dispatchedCopies <= 0) return;
-        for (int i = 0; i < result.scaledInputs.length; i++) {
-            long amount = result.perCopyUnits[i] * dispatchedCopies;
-            if (amount > 0 && result.keys[i] != null) {
-                result.scaledInputs[i].remove(result.keys[i], amount);
+        long accepted = Math.min(dispatchedCopies, result.remainingCopies);
+        for (int slot = 0; slot < result.scaledInputs.length; slot++) {
+            long amount;
+            if (result.sharedInputs[slot]) {
+                amount = result.sharedDispatched ? 0L : result.units[slot];
+            } else {
+                amount = saturatingMultiply(result.units[slot], accepted);
+            }
+            if (amount > 0 && result.keys[slot] != null) {
+                result.scaledInputs[slot].remove(result.keys[slot], amount);
             }
         }
+        result.sharedDispatched = true;
+        result.remainingCopies -= accepted;
     }
 
     public static final class BulkResult {
         public final KeyCounter[] scaledInputs;
-        public final int actualCopies;
+        public final long actualCopies;
         final AEKey[] keys;
-        final long[] perCopyUnits;
+        final long[] units;
+        final boolean[] sharedInputs;
+        long remainingCopies;
+        boolean sharedDispatched;
 
-        public BulkResult(KeyCounter[] scaledInputs, int actualCopies, AEKey[] keys, long[] perCopyUnits) {
+        public BulkResult(KeyCounter[] scaledInputs, long actualCopies, AEKey[] keys,
+                          long[] units, boolean[] sharedInputs) {
             this.scaledInputs = scaledInputs;
             this.actualCopies = actualCopies;
             this.keys = Arrays.copyOf(keys, keys.length);
-            this.perCopyUnits = Arrays.copyOf(perCopyUnits, perCopyUnits.length);
+            this.units = Arrays.copyOf(units, units.length);
+            this.sharedInputs = Arrays.copyOf(sharedInputs, sharedInputs.length);
+            this.remainingCopies = actualCopies;
         }
+
+        private void reinjectShared(ListCraftingInventory inv) {
+            for (int slot = 0; slot < scaledInputs.length; slot++) {
+                if (!sharedInputs[slot] || keys[slot] == null) continue;
+                inv.insert(keys[slot], units[slot], Actionable.MODULATE);
+                scaledInputs[slot].remove(keys[slot], units[slot]);
+            }
+        }
+    }
+
+    private static long saturatingAdd(long left, long right) {
+        return left >= Long.MAX_VALUE - right ? Long.MAX_VALUE : left + right;
+    }
+
+    private static long saturatingMultiply(long left, long right) {
+        if (left <= 0 || right <= 0) return 0L;
+        return left > Long.MAX_VALUE / right ? Long.MAX_VALUE : left * right;
     }
 }

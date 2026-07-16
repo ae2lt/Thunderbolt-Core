@@ -14,6 +14,7 @@ import java.util.Map;
  * @param firings       pattern -> number of times to fire it (the compact plan). Keyed by pattern
  *                      object identity.
  * @param usedStock     item -> amount drawn directly from the inventory snapshot.
+ * @param usedReusableStock host + logical pool + item -> amount borrowed from private storage.
  * @param missing       item -> amount that could not be obtained (raw leaves under DEEP mode).
  * @param grossDemand   item -> total amount requested before drawing from stock (one entry per
  *                      visited item). Exposed so the AE2 adapter can reproduce AE2's byte accounting
@@ -32,12 +33,13 @@ public record CraftPlan<K>(
         boolean feasible,
         Map<CraftPattern<K>, Long> firings,
         Map<K, Long> usedStock,
+        Map<ReusableStockUsageKey<K>, Long> usedReusableStock,
         Map<K, Long> missing,
         Map<K, Long> grossDemand,
         int itemsProcessed,
         boolean budgetExhausted) {
 
     public static <K> CraftPlan<K> unsupported() {
-        return new CraftPlan<>(false, false, Map.of(), Map.of(), Map.of(), Map.of(), 0, false);
+        return new CraftPlan<>(false, false, Map.of(), Map.of(), Map.of(), Map.of(), Map.of(), 0, false);
     }
 }
