@@ -1,8 +1,9 @@
 package com.moakiee.thunderbolt.ae2.mixin;
 
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Comparator;
-import java.util.HashSet;
+import java.util.IdentityHashMap;
 import java.util.Set;
 import java.util.concurrent.Future;
 
@@ -47,7 +48,7 @@ import appeng.me.service.CraftingService;
 import com.moakiee.thunderbolt.ae2.crafting.FastCraftingControl;
 import com.moakiee.thunderbolt.ae2.timewheel.TimeWheelCraftingCPU;
 import com.moakiee.thunderbolt.ae2.timewheel.TimeWheelCraftingCpuPool;
-import com.moakiee.thunderbolt.ae2.timewheel.TimeWheelCraftingCpuPoolHost;
+import com.moakiee.thunderbolt.ae2.timewheel.TimeWheelCraftingCpuPoolProvider;
 import com.moakiee.thunderbolt.ae2.timewheel.TimeWheelFastPlanningGate;
 
 @Mixin(value = CraftingService.class, remap = false)
@@ -59,7 +60,16 @@ public abstract class TimeWheelCraftingServiceMixin {
             .thenComparingLong(TimeWheelCraftingCpuPool::getAvailableStorage);
 
     @Unique
-    private final Set<TimeWheelCraftingCpuPool> thunderbolt$timeWheelPools = new HashSet<>();
+    private final Set<IGridNode> thunderbolt$timeWheelProviderNodes = Collections
+            .newSetFromMap(new IdentityHashMap<>());
+
+    @Unique
+    private final Set<TimeWheelCraftingCpuPool> thunderbolt$timeWheelPools = Collections
+            .newSetFromMap(new IdentityHashMap<>());
+
+    @Unique
+    private final Set<TimeWheelCraftingCpuPool> thunderbolt$refreshedTimeWheelPools = Collections
+            .newSetFromMap(new IdentityHashMap<>());
 
     @Shadow
     @Final
@@ -105,6 +115,7 @@ public abstract class TimeWheelCraftingServiceMixin {
                     ordinal = 0))
     private void thunderbolt$tickTimeWheelPools(CallbackInfo ci,
                                                  @Local(ordinal = 0) LocalLongRef latestChange) {
+        thunderbolt$refreshTimeWheelPools();
         long latest = latestChange.get();
         for (var pool : this.thunderbolt$timeWheelPools) {
             latest = Math.max(latest, pool.tickCraftingLogic(this.energyGrid, (CraftingService) (Object) this));
@@ -130,30 +141,30 @@ public abstract class TimeWheelCraftingServiceMixin {
 
     @Inject(method = "removeNode", at = @At("TAIL"))
     private void thunderbolt$onRemoveNode(IGridNode gridNode, CallbackInfo ci) {
-        if (gridNode.getOwner() instanceof TimeWheelCraftingCpuPoolHost host) {
-            this.thunderbolt$timeWheelPools.remove(host.getTimeWheelCraftingCpuPool());
-            this.updateList = true;
+        if (this.thunderbolt$timeWheelProviderNodes.remove(gridNode)) {
+            thunderbolt$refreshTimeWheelPools();
         }
     }
 
     @Inject(method = "addNode", at = @At("TAIL"))
     private void thunderbolt$onAddNode(IGridNode gridNode, CompoundTag savedData, CallbackInfo ci) {
-        if (gridNode.getOwner() instanceof TimeWheelCraftingCpuPoolHost host) {
-            thunderbolt$addTimeWheelPool(host.getTimeWheelCraftingCpuPool());
-            this.updateList = true;
+        if (thunderbolt$getTimeWheelProvider(gridNode) != null) {
+            this.thunderbolt$timeWheelProviderNodes.add(gridNode);
+            thunderbolt$refreshTimeWheelPools();
         }
     }
 
     @Inject(method = "updateCPUClusters", at = @At("TAIL"))
     private void thunderbolt$updateTimeWheelPools(CallbackInfo ci) {
-        this.thunderbolt$timeWheelPools.clear();
+        this.thunderbolt$timeWheelProviderNodes.clear();
         for (var machineClass : this.grid.getMachineClasses()) {
             for (var node : this.grid.getMachineNodes(machineClass)) {
-                if (node.getOwner() instanceof TimeWheelCraftingCpuPoolHost host) {
-                    thunderbolt$addTimeWheelPool(host.getTimeWheelCraftingCpuPool());
+                if (thunderbolt$getTimeWheelProvider(node) != null) {
+                    this.thunderbolt$timeWheelProviderNodes.add(node);
                 }
             }
         }
+        thunderbolt$refreshTimeWheelPools();
     }
 
     @Inject(
@@ -265,6 +276,40 @@ public abstract class TimeWheelCraftingServiceMixin {
         }
         pool.resolvePendingLoad();
         pool.restoreCraftingLinks(this::addLink);
+    }
+
+    @Unique
+    private void thunderbolt$refreshTimeWheelPools() {
+        this.thunderbolt$refreshedTimeWheelPools.clear();
+        for (var node : this.thunderbolt$timeWheelProviderNodes) {
+            var provider = thunderbolt$getTimeWheelProvider(node);
+            if (provider == null) {
+                continue;
+            }
+            var pool = provider.getTimeWheelCraftingCpuPool();
+            if (pool != null) {
+                this.thunderbolt$refreshedTimeWheelPools.add(pool);
+            }
+        }
+
+        boolean changed = !this.thunderbolt$timeWheelPools.equals(this.thunderbolt$refreshedTimeWheelPools);
+        this.thunderbolt$timeWheelPools.removeIf(pool -> !this.thunderbolt$refreshedTimeWheelPools.contains(pool));
+        for (var pool : this.thunderbolt$refreshedTimeWheelPools) {
+            thunderbolt$addTimeWheelPool(pool);
+        }
+        if (changed) {
+            this.updateList = true;
+        }
+    }
+
+    @Unique
+    @Nullable
+    private static TimeWheelCraftingCpuPoolProvider thunderbolt$getTimeWheelProvider(IGridNode node) {
+        var service = node.getService(TimeWheelCraftingCpuPoolProvider.class);
+        if (service != null) {
+            return service;
+        }
+        return node.getOwner() instanceof TimeWheelCraftingCpuPoolProvider provider ? provider : null;
     }
 
     @Unique
