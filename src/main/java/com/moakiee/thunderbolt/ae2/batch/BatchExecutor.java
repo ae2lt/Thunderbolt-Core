@@ -99,6 +99,7 @@ public final class BatchExecutor {
             if (!batchEligibleRule.test(executionDetails)) {
                 continue;
             }
+            boolean hasSharedInputs = SharedBatchInputs.hasSharedInputs(details);
 
             var providerPattern = CraftingPatternDelegates.forProviderLookup(details);
             var perTaskBatched = batchedByTask.get(details);
@@ -106,8 +107,7 @@ public final class BatchExecutor {
             for (var provider : cs.getProviders(providerPattern)) {
                 if (!(provider instanceof IBatchCraftingProvider batch)) continue;
                 sawBatchProvider = true;
-                if (executionDetails instanceof SharedBatchInputPattern
-                        && !batch.supportsSingleSeedBatch()) continue;
+                if (hasSharedInputs && !batch.supportsSingleSeedBatch()) continue;
                 if (perTaskBatched != null && perTaskBatched.containsKey(provider)) continue;
                 long capacity = batch.getBatchCapacity(executionDetails);
                 if (capacity <= 0) continue;
@@ -122,7 +122,7 @@ public final class BatchExecutor {
             }
             if (eligible == null) continue;
 
-            if (executionDetails instanceof SharedBatchInputPattern && eligible.size() > 1) {
+            if (hasSharedInputs && eligible.size() > 1) {
                 // One reusable seed cannot be in multiple executing providers simultaneously.
                 eligible.sort(java.util.Comparator
                         .comparing((EligibleProvider provider) -> provider.mode() != BatchDispatchMode.UNBOUNDED)

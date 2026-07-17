@@ -1,9 +1,9 @@
 package com.moakiee.thunderbolt.core.craft;
 
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Objects;
-import java.util.HashSet;
 import java.util.function.Supplier;
 
 import net.minecraft.core.NonNullList;
@@ -12,10 +12,11 @@ import net.minecraft.world.item.crafting.CraftingInput;
 import net.minecraft.world.level.Level;
 
 import appeng.api.crafting.IPatternDetails;
+import appeng.api.stacks.AEKey;
 import appeng.api.stacks.AEItemKey;
 import appeng.api.stacks.KeyCounter;
 import appeng.blockentity.crafting.IMolecularAssemblerSupportedPattern;
-import com.moakiee.thunderbolt.ae2.batch.SharedBatchInputPattern;
+import com.moakiee.thunderbolt.ae2.batch.SharedBatchInputs;
 
 public final class MolecularCopyAssembler implements CopyAssembler {
     private final Supplier<Level> levelSupplier;
@@ -39,6 +40,9 @@ public final class MolecularCopyAssembler implements CopyAssembler {
             return null;
         }
 
+        // AECraftingPattern.fillCraftingGrid consumes entries from the supplied counters, so
+        // capture the concrete shared remainder obligations before building the grid.
+        var sharedRemaindersLeft = sharedRemainderQuotas(details, oneCopyInputs);
         CraftingInput input = buildCraftingInput(pattern, oneCopyInputs);
         ItemStack output = pattern.assemble(input, level);
         if (output.isEmpty()) {
@@ -47,31 +51,58 @@ public final class MolecularCopyAssembler implements CopyAssembler {
 
         var remainders = new ArrayList<Stack>();
         var sharedRemainders = new ArrayList<Stack>();
-        var sharedRemainderKeys = new HashSet<appeng.api.stacks.AEKey>();
-        if (details instanceof SharedBatchInputPattern shared) {
-            var inputs = details.getInputs();
-            for (int slot = 0; slot < inputs.length; slot++) {
-                for (var possible : inputs[slot].getPossibleInputs()) {
-                    if (!shared.isSharedBatchInput(slot, possible.what())) continue;
-                    var remaining = inputs[slot].getRemainingKey(possible.what());
-                    if (remaining != null) sharedRemainderKeys.add(remaining);
-                }
-            }
-        }
         NonNullList<ItemStack> remainingItems = pattern.getRemainingItems(input);
         if (remainingItems != null) {
             for (var remainder : remainingItems) {
                 if (!remainder.isEmpty()) {
                     var key = AEItemKey.of(remainder);
-                    var stack = new Stack(key, remainder.getCount());
-                    if (sharedRemainderKeys.contains(key)) sharedRemainders.add(stack);
-                    else remainders.add(stack);
+                    long count = remainder.getCount();
+                    long sharedCount = Math.min(count, Math.max(0L,
+                            sharedRemaindersLeft.getOrDefault(key, 0L)));
+                    if (sharedCount > 0) {
+                        sharedRemainders.add(new Stack(key, sharedCount));
+                        sharedRemaindersLeft.put(key,
+                                sharedRemaindersLeft.getOrDefault(key, 0L) - sharedCount);
+                    }
+                    if (count > sharedCount) {
+                        remainders.add(new Stack(key, count - sharedCount));
+                    }
                 }
             }
         }
 
         return new AssembledCopy(AEItemKey.of(output), output.getCount(),
                 List.copyOf(remainders), List.copyOf(sharedRemainders));
+    }
+
+    private static HashMap<AEKey, Long> sharedRemainderQuotas(
+            IPatternDetails details, KeyCounter[] oneCopyInputs) {
+        var result = new HashMap<AEKey, Long>();
+        var inputs = details.getInputs();
+        for (int slot = 0; slot < inputs.length && slot < oneCopyInputs.length; slot++) {
+            AEKey concreteKey = selectedKey(oneCopyInputs[slot]);
+            if (!SharedBatchInputs.isSharedInput(details, slot, concreteKey)) continue;
+            AEKey remaining = inputs[slot].getRemainingKey(concreteKey);
+            if (remaining != null) {
+                result.merge(remaining, inputs[slot].getMultiplier(),
+                        MolecularCopyAssembler::saturatingAdd);
+            }
+        }
+        return result;
+    }
+
+    private static AEKey selectedKey(KeyCounter input) {
+        if (input == null) return null;
+        for (var entry : input) {
+            if (entry.getKey() != null && entry.getLongValue() > 0) return entry.getKey();
+        }
+        return null;
+    }
+
+    private static long saturatingAdd(long left, long right) {
+        if (left <= 0) return Math.max(0L, right);
+        if (right <= 0) return left;
+        return left >= Long.MAX_VALUE - right ? Long.MAX_VALUE : left + right;
     }
 
     private static CraftingInput buildCraftingInput(IMolecularAssemblerSupportedPattern pattern,
