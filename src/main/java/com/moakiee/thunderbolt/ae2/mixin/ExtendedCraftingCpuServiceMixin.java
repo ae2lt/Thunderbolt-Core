@@ -276,9 +276,18 @@ public abstract class ExtendedCraftingCpuServiceMixin {
         }
     }
 
-    @Inject(method = "getCpus", at = @At("RETURN"), cancellable = true, order = 1500)
-    private void thunderbolt$getExtendedCpus(CallbackInfoReturnable<ImmutableSet<ICraftingCPU>> cir) {
-        var cpus = ImmutableSet.<ICraftingCPU>builder().addAll(cir.getReturnValue());
+    @Inject(
+            method = "getCpus",
+            at = @At(
+                    value = "INVOKE",
+                    target = "Lcom/google/common/collect/ImmutableSet$Builder;build()"
+                            + "Lcom/google/common/collect/ImmutableSet;"))
+    private void thunderbolt$getExtendedCpus(
+            CallbackInfoReturnable<ImmutableSet<ICraftingCPU>> cir,
+            @Local(ordinal = 0) ImmutableSet.Builder<ICraftingCPU> cpus) {
+        // Mutate AE2's shared builder before it is built. Several CPU addons replace the return
+        // value from cancellable RETURN injectors; a later RETURN injector is skipped as soon as
+        // one of those addons calls setReturnValue(), which made extended CPUs disappear.
         for (var cluster : thunderbolt$getExtendedCpuClusters()) {
             if (!cluster.isActive()) {
                 continue;
@@ -290,7 +299,6 @@ public abstract class ExtendedCraftingCpuServiceMixin {
                 cpus.add(cluster);
             }
         }
-        cir.setReturnValue(cpus.build());
     }
 
     @Inject(method = "getRequestedAmount", at = @At("RETURN"), cancellable = true, order = 1500)
