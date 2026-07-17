@@ -33,10 +33,6 @@ public final class ParallelBatchCpuHelper {
         var units = new long[slots];
         var available = new long[slots];
         var shared = new boolean[slots];
-        var executionDetails = details instanceof ExecuteLoopPattern loop
-                ? loop.delegate() : details;
-        var sharedPattern = allowSharedInputs
-                && executionDetails instanceof SharedBatchInputPattern pattern ? pattern : null;
         var reserved = reservedStock != null ? reservedStock : Map.<AEKey, Long>of();
 
         for (int slot = 0; slot < slots; slot++) {
@@ -54,8 +50,8 @@ public final class ParallelBatchCpuHelper {
                 long inInventory = Math.max(0L,
                         inv.extract(possible.what(), Long.MAX_VALUE, Actionable.SIMULATE)
                                 - Math.max(0L, reserved.getOrDefault(possible.what(), 0L)));
-                boolean isShared = sharedPattern != null
-                        && sharedPattern.isSharedBatchInput(slot, possible.what());
+                boolean isShared = allowSharedInputs
+                        && SharedBatchInputs.isSharedInput(details, slot, possible.what());
                 long copies = isShared ? (inInventory >= perCopy ? maxCraft : 0L) : inInventory / perCopy;
                 if (copies > bestCopies) {
                     bestKey = possible.what();
@@ -170,7 +166,10 @@ public final class ParallelBatchCpuHelper {
                     ? chosenKeys[slot] : possibles[0].what();
             AEKey remaining = input.getRemainingKey(consumed);
             if (remaining != null) {
-                long copies = shared != null && slot < shared.length && shared[slot] ? 1L : dispatched;
+                boolean sharedInput = shared != null && slot < shared.length
+                        ? shared[slot]
+                        : SharedBatchInputs.isSharedInput(details, slot, consumed);
+                long copies = sharedInput ? 1L : dispatched;
                 // CraftingCpuHelper registers one remainder per completed template operation;
                 // the possible stack's physical amount only affects extraction, not return count.
                 long perCopy = input.getMultiplier();

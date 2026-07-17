@@ -19,20 +19,19 @@ import appeng.blockentity.crafting.IMolecularAssemblerSupportedPattern;
 import it.unimi.dsi.fastutil.objects.Object2LongMap;
 
 /**
- * Pure batch crafting engine: a hashed time wheel that assembles one copy of a pattern and
- * schedules {@code copies} of its output to be delivered after a per-push delay.
+ * Pure batch crafting engine: assembles one copy of a pattern, aggregates all accepted outputs in
+ * one pending buffer, and flushes that buffer on a shared five-tick cadence.
  *
  * <p>This class deliberately does NOT manage thread capacity, energy or input scaling. Those are
  * the responsibility of the caller (a rate limiter that implements
  * {@link com.moakiee.thunderbolt.ae2.api.crafting.IBatchCraftingProvider}). The engine simply assembles
- * and delivers; {@link #liveThreads()} / {@link #getSize(int)} expose state so the limiter can budget.
+ * and delivers; {@link #liveThreads()} exposes state so the limiter can budget.
  */
 public final class CraftingCore implements Sweepable {
-    public static final int WHEEL_SIZE = 16;
-    public static final int WHEEL_MASK = WHEEL_SIZE - 1;
+    public static final int FLUSH_INTERVAL_TICKS = 5;
 
-    private static final String NBT_CELLS = "cells";
-    private static final String NBT_INDEX = "i";
+    private static final String NBT_PENDING = "pending";
+    private static final String NBT_NEXT_FLUSH = "nextFlush";
     private static final String NBT_COPIES = "n";
     private static final String NBT_OUTPUTS = "out";
     private static final String NBT_KEY = "k";
@@ -41,42 +40,33 @@ public final class CraftingCore implements Sweepable {
     private final CraftingCoreHost host;
     private final CopyAssembler assembler;
     private final CraftingCoreRegistry registry;
-    private final WheelCell[] wheel = new WheelCell[WHEEL_SIZE];
+    private final PendingBatch pending = new PendingBatch();
     private final Map<IPatternDetails, Map<InputSignature, CachedAssembly>> assemblyCache = new IdentityHashMap<>();
     private long threadsInFlight;
-    private long lastSweptTick;
+    private long nextFlushTick = Long.MIN_VALUE;
 
     public CraftingCore(CraftingCoreHost host, CopyAssembler assembler, CraftingCoreRegistry registry) {
         this.host = host;
         this.assembler = assembler;
         this.registry = registry;
-        for (int i = 0; i < wheel.length; i++) {
-            wheel[i] = new WheelCell();
-        }
     }
 
     /**
      * Assemble one copy of {@code details} from the single-copy input template and schedule
-     * {@code copies} of its output for delivery after {@code delay} ticks.
+     * {@code copies} of its output for delivery at the next five-tick flush boundary.
      *
      * <p>The engine does not enforce any capacity, energy or scaling: the caller (rate limiter)
-     * must have already decided {@code copies} and {@code delay}. Inputs are a single-copy
-     * template (NOT multiplied by {@code copies}); materials are assumed to have been extracted
-     * upstream already.
+     * must have already decided {@code copies}. Inputs are a single-copy template (NOT multiplied
+     * by {@code copies}); materials are assumed to have been extracted upstream already.
      */
-    public long pushBatch(IPatternDetails details, KeyCounter[] oneCopyTemplate, long copies, int delay) {
+    public long pushBatch(IPatternDetails details, KeyCounter[] oneCopyTemplate, long copies) {
         if (copies <= 0 || oneCopyTemplate == null) return 0;
         if (!(details instanceof IMolecularAssemblerSupportedPattern)) return 0;
 
-        int d = Math.max(1, Math.min(delay, WHEEL_MASK));
         long now = host.getGameTime();
-        sweepNonLive(now);
-        if (lastSweptTick < now) {
-            return 0;
-        }
+        flushIfDue(now);
 
-        WheelCell cell = wheel[(int) ((now + d) & WHEEL_MASK)];
-        long accepted = appendableCopies(cell, copies);
+        long accepted = appendableCopies(copies);
         if (accepted <= 0) {
             return 0;
         }
@@ -98,26 +88,30 @@ public final class CraftingCore implements Sweepable {
                 ? Math.min(assembled.outputCount(), Math.max(0L,
                         shared.sharedBatchOutputAmount(assembled.output())))
                 : 0L;
-        accumulate(cell, assembled.output(), saturatedAdd(
+        boolean wasEmpty = threadsInFlight == 0;
+        accumulate(pending, assembled.output(), saturatedAdd(
                 sharedOutput,
                 saturatedMultiply(assembled.outputCount() - sharedOutput, accepted)));
         if (assembled.remainders() != null) {
             for (var remainder : assembled.remainders()) {
                 if (remainder != null) {
-                    accumulate(cell, remainder.key(), saturatedMultiply(remainder.count(), accepted));
+                    accumulate(pending, remainder.key(), saturatedMultiply(remainder.count(), accepted));
                 }
             }
         }
         if (assembled.sharedRemainders() != null) {
             for (var remainder : assembled.sharedRemainders()) {
                 if (remainder != null) {
-                    accumulate(cell, remainder.key(), remainder.count());
+                    accumulate(pending, remainder.key(), remainder.count());
                 }
             }
         }
 
-        cell.copies += accepted;
-        threadsInFlight += accepted;
+        pending.copies = saturatedAdd(pending.copies, accepted);
+        threadsInFlight = saturatedAdd(threadsInFlight, accepted);
+        if (wasEmpty) {
+            nextFlushTick = nextBoundaryAfter(now);
+        }
         registry.markActive(this);
         return accepted;
     }
@@ -151,14 +145,9 @@ public final class CraftingCore implements Sweepable {
         return false;
     }
 
-    /** In-flight copies currently scheduled in the wheel cell at {@code slot} (mod wheel size). */
-    public long getSize(int slot) {
-        return wheel[slot & WHEEL_MASK].copies;
-    }
-
-    /** Sweep matured cells up to now, then report total in-flight copies (for the rate limiter). */
+    /** Flush at a due boundary, then report total buffered copies (for the rate limiter). */
     public long liveThreads() {
-        sweepNonLive(host.getGameTime());
+        flushIfDue(host.getGameTime());
         return threadsInFlight;
     }
 
@@ -172,13 +161,15 @@ public final class CraftingCore implements Sweepable {
             drainAll(true);
             return false;
         }
-        sweepNonLive(host.getGameTime());
+        flushIfDue(host.getGameTime());
         return threadsInFlight > 0;
     }
 
     public void drainAll(boolean forceSpawn) {
-        for (int i = 0; i < wheel.length; i++) {
-            drainSlot(i, forceSpawn);
+        if (drainPending(forceSpawn)) {
+            nextFlushTick = Long.MIN_VALUE;
+        } else {
+            nextFlushTick = nextBoundaryAfter(host.getGameTime());
         }
     }
 
@@ -195,96 +186,48 @@ public final class CraftingCore implements Sweepable {
     public void writeTo(CompoundTag tag, HolderLookup.Provider registries) {
         if (threadsInFlight <= 0) return;
 
-        var cells = new ListTag();
-        for (int i = 0; i < wheel.length; i++) {
-            WheelCell cell = wheel[i];
-            if (cell.copies <= 0 || cell.outputs.isEmpty()) continue;
-
-            var cellTag = new CompoundTag();
-            cellTag.putByte(NBT_INDEX, (byte) i);
-            cellTag.putLong(NBT_COPIES, cell.copies);
-            var outputs = new ListTag();
-            for (Object2LongMap.Entry<AEKey> entry : cell.outputs.object2LongEntrySet()) {
-                if (entry.getKey() == null || entry.getLongValue() <= 0) continue;
-                var outputTag = new CompoundTag();
-                outputTag.put(NBT_KEY, entry.getKey().toTagGeneric(registries));
-                outputTag.putLong(NBT_AMOUNT, entry.getLongValue());
-                outputs.add(outputTag);
-            }
-            if (outputs.isEmpty()) continue;
-            cellTag.put(NBT_OUTPUTS, outputs);
-            cells.add(cellTag);
-        }
-
-        if (!cells.isEmpty()) {
-            tag.put(NBT_CELLS, cells);
+        var pendingTag = new CompoundTag();
+        pendingTag.putLong(NBT_COPIES, pending.copies);
+        pendingTag.putLong(NBT_NEXT_FLUSH, nextFlushTick);
+        var outputs = writeOutputs(pending, registries);
+        if (!outputs.isEmpty()) {
+            pendingTag.put(NBT_OUTPUTS, outputs);
+            tag.put(NBT_PENDING, pendingTag);
         }
     }
 
     public void readFrom(CompoundTag tag, HolderLookup.Provider registries) {
         registry.markInactive(this);
         reset();
-        if (!tag.contains(NBT_CELLS, Tag.TAG_LIST)) return;
-
-        ListTag cells = tag.getList(NBT_CELLS, Tag.TAG_COMPOUND);
-        for (int i = 0; i < cells.size(); i++) {
-            CompoundTag cellTag = cells.getCompound(i);
-            int idx = cellTag.getByte(NBT_INDEX) & WHEEL_MASK;
-            long copies = cellTag.getLong(NBT_COPIES);
-            if (copies <= 0) continue;
-
-            WheelCell cell = wheel[idx];
-            ListTag outputs = cellTag.getList(NBT_OUTPUTS, Tag.TAG_COMPOUND);
-            for (int o = 0; o < outputs.size(); o++) {
-                CompoundTag outputTag = outputs.getCompound(o);
-                long amount = outputTag.getLong(NBT_AMOUNT);
-                if (amount <= 0) continue;
-                AEKey key = AEKey.fromTagGeneric(registries, outputTag.getCompound(NBT_KEY));
-                if (key != null) {
-                    cell.outputs.addTo(key, amount);
-                }
-            }
-            if (cell.outputs.isEmpty()) continue;
-            cell.copies += copies;
-            threadsInFlight += copies;
-        }
+        if (!tag.contains(NBT_PENDING, Tag.TAG_COMPOUND)) return;
+        CompoundTag pendingTag = tag.getCompound(NBT_PENDING);
+        readBatch(pendingTag, registries);
+        long restoredNextFlush = pendingTag.getLong(NBT_NEXT_FLUSH);
 
         if (threadsInFlight > 0) {
+            long now = host.getGameTime();
+            nextFlushTick = restoredNextFlush > now
+                    ? restoredNextFlush : nextBoundaryAfter(now);
             registry.markActive(this);
         }
     }
 
-    private void sweepNonLive(long now) {
-        if (threadsInFlight == 0) {
-            lastSweptTick = now;
-            return;
-        }
-
-        long from = Math.max(lastSweptTick + 1, now - WHEEL_SIZE + 1L);
-        long completedThrough = lastSweptTick;
-        for (long tick = from; tick <= now; tick++) {
-            int slot = (int) (tick & WHEEL_MASK);
-            if (!drainSlot(slot, false)) {
-                lastSweptTick = tick - 1L;
-                return;
-            }
-            completedThrough = tick;
-            if (threadsInFlight == 0) break;
-        }
-        lastSweptTick = threadsInFlight == 0 ? now : completedThrough;
+    private void flushIfDue(long now) {
+        if (threadsInFlight <= 0 || now < nextFlushTick) return;
+        nextFlushTick = drainPending(false)
+                ? Long.MIN_VALUE : nextBoundaryAfter(now);
     }
 
-    private boolean drainSlot(int idx, boolean forceSpawn) {
-        WheelCell cell = wheel[idx];
-        if (cell.copies <= 0) return true;
+    private boolean drainPending(boolean forceSpawn) {
+        if (pending.copies <= 0) return true;
 
         if (forceSpawn) {
-            for (Object2LongMap.Entry<AEKey> entry : cell.outputs.object2LongEntrySet()) {
+            for (Object2LongMap.Entry<AEKey> entry : pending.outputs.object2LongEntrySet()) {
                 if (entry.getLongValue() > 0) {
                     host.spawnToWorld(entry.getKey(), entry.getLongValue());
                 }
             }
-            releaseCell(cell);
+            releasePending();
             return true;
         }
 
@@ -293,7 +236,7 @@ public final class CraftingCore implements Sweepable {
         }
 
         boolean anyLeft = false;
-        var iter = cell.outputs.object2LongEntrySet().fastIterator();
+        var iter = pending.outputs.object2LongEntrySet().fastIterator();
         while (iter.hasNext()) {
             var entry = iter.next();
             long amount = entry.getLongValue();
@@ -312,31 +255,65 @@ public final class CraftingCore implements Sweepable {
         }
 
         if (!anyLeft) {
-            releaseCell(cell);
+            releasePending();
             return true;
         }
         return false;
     }
 
-    private void releaseCell(WheelCell cell) {
-        threadsInFlight -= cell.copies;
-        if (threadsInFlight < 0) threadsInFlight = 0;
-        cell.outputs.clear();
-        cell.copies = 0;
-    }
-
-    private void reset() {
-        for (var cell : wheel) {
-            cell.outputs.clear();
-            cell.copies = 0;
-        }
+    private void releasePending() {
+        pending.outputs.clear();
+        pending.copies = 0;
         threadsInFlight = 0;
     }
 
-    private long appendableCopies(WheelCell cell, long requested) {
-        long cellSpace = Long.MAX_VALUE - cell.copies;
+    private void reset() {
+        pending.outputs.clear();
+        pending.copies = 0;
+        threadsInFlight = 0;
+        nextFlushTick = Long.MIN_VALUE;
+    }
+
+    private long appendableCopies(long requested) {
         long globalSpace = Long.MAX_VALUE - threadsInFlight;
-        return Math.min(requested, Math.min(cellSpace, globalSpace));
+        return Math.min(requested, globalSpace);
+    }
+
+    private static long nextBoundaryAfter(long now) {
+        long delta = FLUSH_INTERVAL_TICKS - Math.floorMod(now, FLUSH_INTERVAL_TICKS);
+        return saturatedAdd(now, delta);
+    }
+
+    private static ListTag writeOutputs(PendingBatch batch, HolderLookup.Provider registries) {
+        var outputs = new ListTag();
+        for (Object2LongMap.Entry<AEKey> entry : batch.outputs.object2LongEntrySet()) {
+            if (entry.getKey() == null || entry.getLongValue() <= 0) continue;
+            var outputTag = new CompoundTag();
+            outputTag.put(NBT_KEY, entry.getKey().toTagGeneric(registries));
+            outputTag.putLong(NBT_AMOUNT, entry.getLongValue());
+            outputs.add(outputTag);
+        }
+        return outputs;
+    }
+
+    private void readBatch(CompoundTag batchTag, HolderLookup.Provider registries) {
+        long copies = batchTag.getLong(NBT_COPIES);
+        if (copies <= 0) return;
+        boolean restoredOutput = false;
+        ListTag outputs = batchTag.getList(NBT_OUTPUTS, Tag.TAG_COMPOUND);
+        for (int i = 0; i < outputs.size(); i++) {
+            CompoundTag outputTag = outputs.getCompound(i);
+            long amount = outputTag.getLong(NBT_AMOUNT);
+            if (amount <= 0) continue;
+            AEKey key = AEKey.fromTagGeneric(registries, outputTag.getCompound(NBT_KEY));
+            if (key != null) {
+                accumulate(pending, key, amount);
+                restoredOutput = true;
+            }
+        }
+        if (!restoredOutput) return;
+        pending.copies = saturatedAdd(pending.copies, copies);
+        threadsInFlight = saturatedAdd(threadsInFlight, copies);
     }
 
     private static long saturatedMultiply(long amount, long copies) {
@@ -351,9 +328,9 @@ public final class CraftingCore implements Sweepable {
         return left + right;
     }
 
-    private static void accumulate(WheelCell cell, AEKey key, long amount) {
+    private static void accumulate(PendingBatch batch, AEKey key, long amount) {
         if (key != null && amount > 0) {
-            cell.outputs.put(key, saturatedAdd(cell.outputs.getLong(key), amount));
+            batch.outputs.put(key, saturatedAdd(batch.outputs.getLong(key), amount));
         }
     }
 
