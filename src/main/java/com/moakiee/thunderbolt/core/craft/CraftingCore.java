@@ -360,9 +360,13 @@ public final class CraftingCore implements Sweepable {
     private record CachedAssembly(boolean cacheable, CopyAssembler.AssembledCopy assembled) {
         private static CachedAssembly cacheable(CopyAssembler.AssembledCopy assembled) {
             var remainders = assembled.remainders() != null ? List.copyOf(assembled.remainders()) : List.<CopyAssembler.Stack>of();
+            var sharedRemainders = assembled.sharedRemainders() != null
+                    ? List.copyOf(assembled.sharedRemainders())
+                    : List.<CopyAssembler.Stack>of();
             return new CachedAssembly(
                     true,
-                    new CopyAssembler.AssembledCopy(assembled.output(), assembled.outputCount(), remainders));
+                    new CopyAssembler.AssembledCopy(
+                            assembled.output(), assembled.outputCount(), remainders, sharedRemainders));
         }
 
         private static CachedAssembly uncacheable() {
