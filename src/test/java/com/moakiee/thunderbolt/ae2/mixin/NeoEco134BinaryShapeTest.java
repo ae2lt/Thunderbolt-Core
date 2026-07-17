@@ -37,6 +37,10 @@ class NeoEco134BinaryShapeTest {
             assertTrue(logic.methods.contains("insert(Lappeng/api/stacks/AEKey;JLappeng/api/config/Actionable;)J"));
             assertTrue(logic.methods.contains("executeCrafting(ILappeng/me/service/CraftingService;"
                     + "Lappeng/api/networking/energy/IEnergyService;Lnet/minecraft/world/level/Level;)I"));
+            assertTrue(logic.methods.contains("tickCraftingLogic(Lappeng/api/networking/energy/IEnergyService;"
+                    + "Lappeng/me/service/CraftingService;)V"));
+            assertTrue(logic.methods.contains("collectAvailableProviders(Lappeng/me/service/CraftingService;"
+                    + "Lappeng/api/crafting/IPatternDetails;)Ljava/util/List;"));
             assertTrue(logic.methods.contains("finishJob(Z)V"));
             assertTrue(logic.methods.contains("postChange(Lappeng/api/stacks/AEKey;)V"));
             assertTrue(logic.methods.contains("readFromNBT(Lnet/minecraft/nbt/CompoundTag;"
@@ -46,6 +50,28 @@ class NeoEco134BinaryShapeTest {
 
             // Keep the two WrapOperation targets pinned to the real 1.3.4 bytecode, not merely
             // to methods that happen to exist somewhere in the dependency.
+            assertInvocationCount(
+                    logic,
+                    "tickCraftingLogic(Lappeng/api/networking/energy/IEnergyService;"
+                            + "Lappeng/me/service/CraftingService;)V",
+                    Opcodes.INVOKEVIRTUAL,
+                    "cn/dancingsnow/neoecoae/api/me/ECOCraftingCPULogic",
+                    "executeCrafting",
+                    "(ILappeng/me/service/CraftingService;"
+                            + "Lappeng/api/networking/energy/IEnergyService;"
+                            + "Lnet/minecraft/world/level/Level;)I",
+                    false,
+                    1);
+            assertInvocationCount(
+                    logic,
+                    "collectAvailableProviders(Lappeng/me/service/CraftingService;"
+                            + "Lappeng/api/crafting/IPatternDetails;)Ljava/util/List;",
+                    Opcodes.INVOKEVIRTUAL,
+                    "appeng/me/service/CraftingService",
+                    "getProviders",
+                    "(Lappeng/api/crafting/IPatternDetails;)Ljava/lang/Iterable;",
+                    false,
+                    1);
             assertInvocationCount(
                     logic,
                     "executeCrafting(ILappeng/me/service/CraftingService;"
@@ -71,12 +97,18 @@ class NeoEco134BinaryShapeTest {
             var job = shape(jar, "cn/dancingsnow/neoecoae/api/me/ExecutingCraftingJob.class");
             assertTrue(job.fields.contains("link:Lappeng/crafting/CraftingLink;"));
             assertTrue(job.fields.contains("waitingFor:Lappeng/crafting/inv/ListCraftingInventory;"));
+            assertTrue(job.fields.contains("tasks:Ljava/util/Map;"));
             assertTrue(job.fields.contains("timeTracker:Lcn/dancingsnow/neoecoae/api/me/ElapsedTimeTracker;"));
             assertTrue(job.fields.contains("finalOutput:Lappeng/api/stacks/GenericStack;"));
             assertTrue(job.fields.contains("remainingAmount:J"));
 
             var tracker = shape(jar, "cn/dancingsnow/neoecoae/api/me/ElapsedTimeTracker.class");
             assertTrue(tracker.methods.contains("decrementItems(JLappeng/api/stacks/AEKeyType;)V"));
+            assertTrue(tracker.methods.contains("addMaxItems(JLappeng/api/stacks/AEKeyType;)V"));
+
+            var taskProgress = shape(
+                    jar, "cn/dancingsnow/neoecoae/api/me/ExecutingCraftingJob$TaskProgress.class");
+            assertTrue(taskProgress.fields.contains("value:J"));
 
             var cpu = shape(jar, "cn/dancingsnow/neoecoae/api/me/ECOCraftingCPU.class");
             assertTrue(cpu.methods.contains("markDirty()V"));

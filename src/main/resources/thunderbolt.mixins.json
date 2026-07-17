@@ -14,6 +14,7 @@
     "PathingCalculationCapMixin",
     "CraftingCpuLogicBatchMixin",
     "AdvCraftingCpuLogicBatchMixin",
+    "ECOCraftingCpuLogicBatchMixin",
     "CraftingCpuLogicMixin",
     "CraftingCpuLogicAccessor",
     "AdvCraftingCpuLogicMixin",
