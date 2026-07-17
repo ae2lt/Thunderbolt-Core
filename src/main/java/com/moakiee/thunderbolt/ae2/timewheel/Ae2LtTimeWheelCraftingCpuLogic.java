@@ -146,6 +146,8 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
     private long schedulerTick = Long.MIN_VALUE;
     private long batchTick = Long.MIN_VALUE;
     private int wheelCursor;
+    @Nullable
+    private IPatternDetails preferredTask;
     private boolean queueRebuildNeeded = true;
     private boolean cantStoreItems;
     private boolean batchingStatusChanges;
@@ -374,6 +376,7 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
                 var batchResult = runBatchForTask(details, remainingOps, craftingService, energyService, level);
                 if (batchResult.consumedCpuOps() > 0) {
                     usedOps += batchResult.consumedCpuOps();
+                    preferTaskWhilePending(activeJob, details);
                     rescheduleIfStillPending(activeJob, details, 0);
                     continue;
                 }
@@ -382,6 +385,9 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
                         activeJob, task, details, remainingOps, craftingService, energyService);
                 if (bulk != null) {
                     usedOps += bulk.dispatched();
+                    if (bulk.dispatched() > 0) {
+                        preferTaskWhilePending(activeJob, details);
+                    }
                     rescheduleIfStillPending(activeJob, details, bulk.retryDelayTicks());
                     continue;
                 }
@@ -390,6 +396,7 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
                 if (outcome == DispatchOutcome.PUSHED) {
                     usedOps++;
                     unparkTask(details);
+                    preferTaskWhilePending(activeJob, details);
                     rescheduleIfStillPending(activeJob, details, 0);
                 } else {
                     rescheduleFailedTask(activeJob, details, outcome);
@@ -863,8 +870,15 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
         long delivered = finalOffer > 0
                 ? activeJob.link.insert(what, finalOffer, type) : 0L;
         accepted += delivered;
-        // Keep the unaccepted part of finalOffer with the caller so it can retry when the output
-        // destination becomes available. Only the physical tail beyond that offer is seed/excess.
+        // A standalone AE2 crafting link intentionally has no requester, so link.insert always
+        // returns zero. The produced item must fall through to ordinary ME storage, but the CPU
+        // still has to count the offered final output as completed. Vanilla CraftingCpuLogic uses
+        // the same split between storage acceptance and job-progress accounting.
+        long completedFinalOutput = FinalOutputProgress.completedAmount(
+                activeJob.link.isStandalone(), finalOffer, delivered);
+        // Keep the unaccepted part of finalOffer with the caller so the remaining storage chain can
+        // place it (standalone jobs normally fall through into ME storage). Only the physical tail
+        // beyond that offer is seed/excess.
         long tail = remaining - finalOffer;
 
         // Any deterministic output beyond both the requested final amount and the one retained seed
@@ -874,8 +888,8 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
             accepted += tail;
         }
 
-        if (type == Actionable.MODULATE && delivered > 0) {
-            finishDeliveredFinalOutput(activeJob, what, delivered);
+        if (type == Actionable.MODULATE && completedFinalOutput > 0) {
+            finishCompletedFinalOutput(activeJob, what, completedFinalOutput);
         } else if (type == Actionable.MODULATE && reserved > 0) {
             wakeSchedulerForReturnedInput(what);
         }
@@ -894,9 +908,9 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
         return reserved;
     }
 
-    private void finishDeliveredFinalOutput(TimeWheelJob activeJob, AEKey what, long delivered) {
+    private void finishCompletedFinalOutput(TimeWheelJob activeJob, AEKey what, long completed) {
         postChange(what);
-        activeJob.remainingAmount = Math.max(0L, activeJob.remainingAmount - delivered);
+        activeJob.remainingAmount = Math.max(0L, activeJob.remainingAmount - completed);
         if (activeJob.remainingAmount > 0) {
             cpu.updateOutput(new GenericStack(activeJob.finalOutput.what(), activeJob.remainingAmount));
         } else {
@@ -1309,7 +1323,7 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
             }
             if (delivered > 0) {
                 removeUpTo(retainedFinalOutputs, entry.what(), delivered);
-                finishDeliveredFinalOutput(activeJob, entry.what(), delivered);
+                finishCompletedFinalOutput(activeJob, entry.what(), delivered);
                 cpu.markDirty();
             }
         }
@@ -1975,6 +1989,7 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
 
         if (task.value <= 0) {
             activeJob.tasks.remove(details);
+            clearTaskPreference(details);
         }
     }
 
@@ -1991,6 +2006,9 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
         }
 
         task.value = normalized;
+        if (normalized <= 0) {
+            clearTaskPreference(details);
+        }
         if (normalized < oldValue) {
             activeJob.removePendingOutputs(details, oldValue - normalized);
         } else {
@@ -2002,6 +2020,7 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
     private void removeTask(TimeWheelJob activeJob, IPatternDetails details) {
         unparkTask(details);
         var removed = activeJob.tasks.remove(details);
+        clearTaskPreference(details);
         if (removed != null && removed.value > 0) {
             activeJob.removePendingOutputs(details, removed.value);
         }
@@ -2148,6 +2167,7 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
         }
         queuedTasks.clear();
         clearParkedTasks();
+        preferredTask = null;
         queueRebuildNeeded = true;
     }
 
@@ -2246,9 +2266,11 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
             if (task == null || task.value <= 0) {
                 iterator.remove();
                 queuedTasks.remove(details);
+                clearTaskPreference(details);
                 continue;
             }
-            if (selected == null || CraftingTaskPriorities.compare(details, selected) < 0) {
+            if (selected == null
+                    || CraftingTaskPriorities.compare(details, selected, preferredTask) < 0) {
                 selected = details;
             }
         }
@@ -2268,6 +2290,20 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
         var task = activeJob.tasks.get(details);
         if (task != null && task.value > 0) {
             scheduleTask(details, delayTicks);
+        }
+    }
+
+    private void preferTaskWhilePending(TimeWheelJob activeJob, IPatternDetails details) {
+        if (preferredTask != null) return;
+        var task = activeJob.tasks.get(details);
+        if (task != null && task.value > 0) {
+            preferredTask = details;
+        }
+    }
+
+    private void clearTaskPreference(IPatternDetails details) {
+        if (preferredTask == details) {
+            preferredTask = null;
         }
     }
 

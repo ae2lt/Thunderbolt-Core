@@ -35,6 +35,24 @@ class TimeWheelTaskPriorityTest {
                 urgent, orderedFirstButLowerPriority) < 0);
     }
 
+    @Test
+    void activeOrdinaryTaskWinsATieUntilItFinishes() {
+        var producer = new OrdinaryPattern();
+        var downstream = new OrdinaryPattern();
+
+        assertTrue(CraftingTaskPriorities.compare(producer, downstream, producer) < 0);
+        assertTrue(CraftingTaskPriorities.compare(downstream, producer, producer) > 0);
+    }
+
+    @Test
+    void explicitPriorityStillPreemptsTheActiveOrdinaryTask() {
+        var activeOrdinary = new OrdinaryPattern();
+        var urgent = new PrioritizedPattern(1_000, 0);
+
+        assertTrue(CraftingTaskPriorities.compare(urgent, activeOrdinary, activeOrdinary) < 0);
+        assertTrue(CraftingTaskPriorities.compare(activeOrdinary, urgent, activeOrdinary) > 0);
+    }
+
     private static class OrdinaryPattern { }
 
     private static final class PrioritizedPattern extends OrdinaryPattern

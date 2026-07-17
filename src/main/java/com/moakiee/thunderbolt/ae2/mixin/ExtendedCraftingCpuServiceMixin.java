@@ -6,6 +6,7 @@ import java.util.concurrent.Future;
 
 import com.google.common.collect.ImmutableSet;
 import com.llamalad7.mixinextras.sugar.Local;
+import com.llamalad7.mixinextras.sugar.ref.LocalLongRef;
 
 import org.apache.commons.lang3.mutable.MutableObject;
 import org.objectweb.asm.Opcodes;
@@ -172,22 +173,25 @@ public abstract class ExtendedCraftingCpuServiceMixin {
 
     @Inject(
             method = "insertIntoCpus",
-            at = @At("RETURN"),
-            cancellable = true,
+            // AdvancedAE unconditionally sets the return value from a cancellable RETURN
+            // injector. A later RETURN callback is therefore skipped entirely. Mutating AE2's
+            // local accumulator before IRETURN composes with both AdvancedAE and NeoECO instead.
+            at = @At(value = "RETURN", shift = At.Shift.BY, by = -1),
             order = 1500)
     private void thunderbolt$insertIntoExtendedCpuClusters(
             AEKey what,
             long amount,
             Actionable type,
-            CallbackInfoReturnable<Long> cir) {
-        long inserted = cir.getReturnValue();
+            CallbackInfoReturnable<Long> cir,
+            @Local(ordinal = 1) LocalLongRef insertedRef) {
+        long inserted = insertedRef.get();
         for (var cluster : thunderbolt$getExtendedCpuClusters()) {
             if (inserted >= amount) {
                 break;
             }
             inserted += cluster.insert(what, amount - inserted, type);
         }
-        cir.setReturnValue(inserted);
+        insertedRef.set(inserted);
     }
 
     @Inject(method = "submitJob", at = @At("HEAD"), cancellable = true)

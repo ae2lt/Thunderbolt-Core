@@ -16,5 +16,18 @@ public final class CraftingTaskPriorities {
         return Integer.compare(leftOrder, rightOrder);
     }
 
+    /**
+     * Uses the currently active task as an identity-based tie breaker without overriding an
+     * explicit priority or order. This gives the time-wheel CPU vanilla-style task-major dispatch
+     * while still allowing higher-priority closed-loop work to preempt ordinary recipes.
+     */
+    public static int compare(Object left, Object right, Object preferred) {
+        int compared = compare(left, right);
+        if (compared != 0 || left == right) return compared;
+        if (left == preferred) return -1;
+        if (right == preferred) return 1;
+        return 0;
+    }
+
     private CraftingTaskPriorities() { }
 }
