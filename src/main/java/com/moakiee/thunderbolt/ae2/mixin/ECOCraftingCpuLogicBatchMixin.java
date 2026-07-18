@@ -107,11 +107,18 @@ public abstract class ECOCraftingCpuLogicBatchMixin {
     }
 
     @WrapOperation(
-            method = "collectAvailableProviders",
+            method = {
+                    "executeCrafting",
+                    "collectAvailableProviders"
+            },
             at = @At(
                     value = "INVOKE",
                     target = "Lappeng/me/service/CraftingService;getProviders"
-                            + "(Lappeng/api/crafting/IPatternDetails;)Ljava/lang/Iterable;"))
+                            + "(Lappeng/api/crafting/IPatternDetails;)Ljava/lang/Iterable;"),
+            remap = false,
+            require = 1,
+            expect = 1,
+            allow = 1)
     private Iterable<ICraftingProvider> ae2lt$filterEcoBatchedProviders(
             CraftingService craftingService,
             IPatternDetails details,
