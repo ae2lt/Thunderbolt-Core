@@ -69,6 +69,94 @@ public final class BatchExecutor {
                                               Map<IPatternDetails, IdentityHashMap<ICraftingProvider, Boolean>> batchedByTask,
                                               Runnable markDirty,
                                               Map<appeng.api.stacks.AEKey, Long> reservedStock) {
+        return runBatchOnly(
+                remainingOps,
+                accountingMode,
+                cs,
+                es,
+                level,
+                job,
+                inv,
+                batchedByTask,
+                markDirty,
+                reservedStock,
+                Integer.MAX_VALUE,
+                Long.MAX_VALUE);
+    }
+
+    public static BatchRunResult runBatchOnly(int remainingOps,
+                                              BatchCpuAccounting.Mode accountingMode,
+                                              CraftingService cs,
+                                              IEnergyService es,
+                                              Level level,
+                                              BatchJobView job,
+                                              ListCraftingInventory inv,
+                                              Map<IPatternDetails, IdentityHashMap<ICraftingProvider, Boolean>> batchedByTask,
+                                              Runnable markDirty,
+                                              Map<appeng.api.stacks.AEKey, Long> reservedStock,
+                                              int maxBatchOps,
+                                              long maxCopies) {
+        return runBatchOnly(
+                remainingOps,
+                accountingMode,
+                cs,
+                es,
+                level,
+                job,
+                inv,
+                batchedByTask,
+                markDirty,
+                reservedStock,
+                maxBatchOps,
+                maxCopies,
+                false,
+                null);
+    }
+
+    public static BatchRunResult runBatchOnly(int remainingOps,
+                                              BatchCpuAccounting.Mode accountingMode,
+                                              CraftingService cs,
+                                              IEnergyService es,
+                                              Level level,
+                                              BatchJobView job,
+                                              ListCraftingInventory inv,
+                                              Map<IPatternDetails, IdentityHashMap<ICraftingProvider, Boolean>> batchedByTask,
+                                              Runnable markDirty,
+                                              Map<appeng.api.stacks.AEKey, Long> reservedStock,
+                                              int maxBatchOps,
+                                              long maxCopies,
+                                              boolean unboundedCpuBatch) {
+        return runBatchOnly(
+                remainingOps,
+                accountingMode,
+                cs,
+                es,
+                level,
+                job,
+                inv,
+                batchedByTask,
+                markDirty,
+                reservedStock,
+                maxBatchOps,
+                maxCopies,
+                unboundedCpuBatch,
+                null);
+    }
+
+    public static BatchRunResult runBatchOnly(int remainingOps,
+                                              BatchCpuAccounting.Mode accountingMode,
+                                              CraftingService cs,
+                                              IEnergyService es,
+                                              Level level,
+                                              BatchJobView job,
+                                              ListCraftingInventory inv,
+                                              Map<IPatternDetails, IdentityHashMap<ICraftingProvider, Boolean>> batchedByTask,
+                                              Runnable markDirty,
+                                              Map<appeng.api.stacks.AEKey, Long> reservedStock,
+                                              int maxBatchOps,
+                                              long maxCopies,
+                                              boolean unboundedCpuBatch,
+                                              TickProviderDispatchSchedule dispatchSchedule) {
         if (job == null) return BatchRunResult.EMPTY;
 
         var taskIter = job.taskIterator();
@@ -77,7 +165,9 @@ public final class BatchExecutor {
         long totalPushed = 0;
         int consumedOps = 0;
         int opsBudget = remainingOps;
-        if (opsBudget <= 0) return BatchRunResult.EMPTY;
+        long copiesBudget = Math.max(0L, maxCopies);
+        maxBatchOps = Math.max(1, maxBatchOps);
+        if (opsBudget <= 0 || copiesBudget <= 0) return BatchRunResult.EMPTY;
         if (accountingMode == null) accountingMode = BatchCpuAccounting.Mode.LINEAR;
         boolean dirty = false;
         boolean sawBatchProvider = false;
@@ -104,14 +194,28 @@ public final class BatchExecutor {
             var providerPattern = CraftingPatternDelegates.forProviderLookup(details);
             var perTaskBatched = batchedByTask.get(details);
             java.util.ArrayList<EligibleProvider> eligible = null;
-            for (var provider : cs.getProviders(providerPattern)) {
+            var providerCandidates = dispatchSchedule != null
+                    ? dispatchSchedule.candidates(cs, providerPattern, providerPattern)
+                    : cs.getProviders(providerPattern);
+            for (var provider : providerCandidates) {
                 if (!(provider instanceof IBatchCraftingProvider batch)) continue;
                 sawBatchProvider = true;
-                if (hasSharedInputs && !batch.supportsSingleSeedBatch()) continue;
                 if (perTaskBatched != null && perTaskBatched.containsKey(provider)) continue;
-                long capacity = batch.getBatchCapacity(executionDetails);
+                long capacity;
+                BatchDispatchMode dispatchMode;
+                try {
+                    if (hasSharedInputs && !batch.supportsSingleSeedBatch()) continue;
+                    capacity = batch.getBatchCapacity(executionDetails);
+                    dispatchMode = batch.getBatchDispatchMode(executionDetails);
+                } catch (Throwable t) {
+                    appeng.core.AELog.warn("[ae2lt] IBatchCraftingProvider %s threw while reporting capacity; blocking this pattern for the current tick. %s",
+                            batch, t);
+                    if (dispatchSchedule != null) {
+                        dispatchSchedule.recordFailure(providerPattern, provider);
+                    }
+                    continue;
+                }
                 if (capacity <= 0) continue;
-                var dispatchMode = batch.getBatchDispatchMode(executionDetails);
                 if (dispatchMode == null) {
                     dispatchMode = BatchDispatchMode.NORMAL;
                 }
@@ -145,8 +249,11 @@ public final class BatchExecutor {
                     .thenComparingLong(EligibleProvider::capacity));
 
             long copyBudget = hasUnboundedProvider
-                    ? Long.MAX_VALUE
-                    : BatchCpuAccounting.maxCopiesForCpuOps(opsBudget, accountingMode);
+                    || unboundedCpuBatch
+                    || accountingMode == BatchCpuAccounting.Mode.SUCCESSFUL_DISPATCH
+                    ? copiesBudget
+                    : BatchCpuAccounting.maxCopiesForBatch(
+                            opsBudget, maxBatchOps, copiesBudget, accountingMode);
             if (copyBudget <= 0) {
                 if (dirty) markDirty.run();
                 return new BatchRunResult(totalPushed, consumedOps, sawBatchProvider);
@@ -189,10 +296,13 @@ public final class BatchExecutor {
             for (int i = 0; i < eligible.size() && leftover > 0; i++) {
                 var eligibleProvider = eligible.get(i);
                 var batch = eligibleProvider.provider();
-                boolean unbounded = eligibleProvider.mode() == BatchDispatchMode.UNBOUNDED;
+                boolean unbounded = unboundedCpuBatch
+                        || eligibleProvider.mode() == BatchDispatchMode.UNBOUNDED;
                 long sliceCap = unbounded
-                        ? Long.MAX_VALUE
-                        : BatchCpuAccounting.maxCopiesForCpuOps(opsBudget, accountingMode);
+                        || accountingMode == BatchCpuAccounting.Mode.SUCCESSFUL_DISPATCH
+                        ? copiesBudget
+                        : BatchCpuAccounting.maxCopiesForBatch(
+                                opsBudget, maxBatchOps, copiesBudget, accountingMode);
                 if (sliceCap <= 0) break;
                 long slice;
                 if (unbounded) {
@@ -220,7 +330,15 @@ public final class BatchExecutor {
                 }
 
                 long dispatched = slice - subLeftover;
-                if (dispatched <= 0) continue;
+                if (dispatched <= 0) {
+                    if (dispatchSchedule != null) {
+                        dispatchSchedule.recordFailure(providerPattern, eligibleProvider.identity());
+                    }
+                    continue;
+                }
+                if (dispatchSchedule != null) {
+                    dispatchSchedule.recordSuccess(providerPattern, eligibleProvider.identity());
+                }
 
                 ParallelBatchCpuHelper.markDispatched(result, dispatched);
                 es.extractAEPower(powerOne * dispatched, Actionable.MODULATE, PowerMultiplier.CONFIG);
@@ -228,6 +346,7 @@ public final class BatchExecutor {
                 dirty = true;
 
                 int opsCost = unbounded
+                        || accountingMode == BatchCpuAccounting.Mode.SUCCESSFUL_DISPATCH
                         ? 1
                         : BatchCpuAccounting.cpuOpsForCopies(dispatched, accountingMode);
                 consumedOps += opsCost;
@@ -236,6 +355,7 @@ public final class BatchExecutor {
                 long newValue = task.getValue() - dispatched;
                 task.setValue(newValue);
                 totalPushed = saturatingAdd(totalPushed, dispatched);
+                copiesBudget -= dispatched;
                 leftover -= dispatched;
 
                 if (initialRealCraft > 1) {
@@ -251,14 +371,14 @@ public final class BatchExecutor {
                         ParallelBatchCpuHelper.reinject(result, leftover, inv);
                         leftover = 0;
                     }
-                    if (opsBudget <= 0) {
+                    if (opsBudget <= 0 || copiesBudget <= 0) {
                         if (dirty) markDirty.run();
                         return new BatchRunResult(totalPushed, consumedOps, sawBatchProvider);
                     }
                     break;
                 }
 
-                if (opsBudget <= 0) {
+                if (opsBudget <= 0 || copiesBudget <= 0) {
                     if (leftover > 0) {
                         ParallelBatchCpuHelper.reinject(result, leftover, inv);
                         leftover = 0;
