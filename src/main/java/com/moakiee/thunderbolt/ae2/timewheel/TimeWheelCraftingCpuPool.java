@@ -61,16 +61,6 @@ public final class TimeWheelCraftingCpuPool implements ExtendedCraftingCpuCluste
     private boolean cpuListChanged;
     private final TickProviderDispatchSchedule dispatchSchedule = new TickProviderDispatchSchedule();
 
-    public TimeWheelCraftingCpuPool(TimeWheelCraftingCpuPoolHost host) {
-        this(host, 0L, 0);
-    }
-
-    public TimeWheelCraftingCpuPool(TimeWheelCraftingCpuPoolHost host,
-                                    long totalStorage,
-                                    int sharedCoProcessors) {
-        this(host, totalStorage, sharedCoProcessors, Long.MAX_VALUE, false);
-    }
-
     public TimeWheelCraftingCpuPool(TimeWheelCraftingCpuPoolHost host,
                                     long totalStorage,
                                     int sharedCoProcessors,
@@ -92,10 +82,6 @@ public final class TimeWheelCraftingCpuPool implements ExtendedCraftingCpuCluste
 
     public TimeWheelCraftingCpuPoolHost getHost() {
         return host;
-    }
-
-    public void reconfigure(long totalStorage, int sharedCoProcessors) {
-        reconfigure(totalStorage, sharedCoProcessors, Long.MAX_VALUE, false);
     }
 
     public void reconfigure(long totalStorage,

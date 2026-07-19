@@ -31,10 +31,6 @@ public final class TimeWheelCraftingCPU implements ICraftingCPU {
 
     private GenericStack finalOutput;
 
-    public TimeWheelCraftingCPU(TimeWheelCraftingCpuHost host, long storageBytes, int coProcessors) {
-        this(host, storageBytes, coProcessors, Long.MAX_VALUE, false);
-    }
-
     public TimeWheelCraftingCPU(TimeWheelCraftingCpuHost host,
                                 long storageBytes,
                                 int coProcessors,
