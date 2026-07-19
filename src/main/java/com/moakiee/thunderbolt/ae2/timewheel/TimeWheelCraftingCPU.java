@@ -25,14 +25,26 @@ public final class TimeWheelCraftingCPU implements ICraftingCPU {
     private final TimeWheelCraftingCpuHost host;
     private final long storageBytes;
     private final int coProcessors;
+    private final long maxCopiesPerTick;
+    private final boolean unboundedBatch;
     private final Ae2LtTimeWheelCraftingCpuLogic craftingLogic = new Ae2LtTimeWheelCraftingCpuLogic(this);
 
     private GenericStack finalOutput;
 
     public TimeWheelCraftingCPU(TimeWheelCraftingCpuHost host, long storageBytes, int coProcessors) {
+        this(host, storageBytes, coProcessors, Long.MAX_VALUE, false);
+    }
+
+    public TimeWheelCraftingCPU(TimeWheelCraftingCpuHost host,
+                                long storageBytes,
+                                int coProcessors,
+                                long maxCopiesPerTick,
+                                boolean unboundedBatch) {
         this.host = host;
         this.storageBytes = storageBytes;
         this.coProcessors = coProcessors;
+        this.maxCopiesPerTick = Math.max(1L, maxCopiesPerTick);
+        this.unboundedBatch = unboundedBatch;
     }
 
     public Ae2LtTimeWheelCraftingCpuLogic getCraftingLogic() {
@@ -80,6 +92,18 @@ public final class TimeWheelCraftingCPU implements ICraftingCPU {
     @Override
     public int getCoProcessors() {
         return coProcessors;
+    }
+
+    public int getSuccessfulDispatchesPerTick() {
+        return coProcessors >= Integer.MAX_VALUE - 1 ? Integer.MAX_VALUE : coProcessors + 1;
+    }
+
+    public long getMaxCopiesPerTick() {
+        return maxCopiesPerTick;
+    }
+
+    public boolean hasUnboundedBatch() {
+        return unboundedBatch;
     }
 
     @Nullable
