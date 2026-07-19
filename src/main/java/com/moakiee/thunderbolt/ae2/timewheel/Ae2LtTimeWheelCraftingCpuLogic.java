@@ -61,6 +61,7 @@ import com.moakiee.thunderbolt.ae2.batch.BatchCpuAccounting;
 import com.moakiee.thunderbolt.ae2.batch.BatchJobView;
 import com.moakiee.thunderbolt.ae2.batch.BatchTaskHandle;
 import com.moakiee.thunderbolt.ae2.batch.ParallelBatchCpuHelper;
+import com.moakiee.thunderbolt.ae2.batch.TickProviderDispatchSchedule;
 import com.moakiee.thunderbolt.ae2.api.crafting.CraftingTaskPriorities;
 import com.moakiee.thunderbolt.ae2.api.crafting.CraftingPatternDelegates;
 import com.moakiee.thunderbolt.ae2.api.crafting.ISeedPreservingCraftingTask;
@@ -131,6 +132,7 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
     // per-copy dispatch loop (it was ~7% of the CPU tick in profiling). Keyed by pattern identity;
     // cleared on every job lifecycle transition below.
     private final Map<IPatternDetails, Double> patternPowerCache = new IdentityHashMap<>();
+    private final TickProviderDispatchSchedule standaloneDispatchSchedule = new TickProviderDispatchSchedule();
     private final KeyCounter seedReturnQuota = new KeyCounter();
     private final KeyCounter retainedFinalOutputs = new KeyCounter();
     private final LoopSeedLedgerBook loopSeedLedgers = new LoopSeedLedgerBook();
@@ -288,12 +290,39 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
     }
 
     public void tickCraftingLogic(IEnergyService energyService, CraftingService craftingService) {
+        standaloneDispatchSchedule.beginTick(TickHandler.instance().getCurrentTick());
+        tickCraftingLogic(
+                energyService,
+                craftingService,
+                cpu.getSuccessfulDispatchesPerTick(),
+                cpu.hasUnboundedBatch() ? Long.MAX_VALUE : cpu.getMaxCopiesPerTick(),
+                standaloneDispatchSchedule);
+    }
+
+    public TickUsage tickCraftingLogic(IEnergyService energyService,
+                                       CraftingService craftingService,
+                                       int maxOps,
+                                       long maxCopies) {
+        standaloneDispatchSchedule.beginTick(TickHandler.instance().getCurrentTick());
+        return tickCraftingLogic(
+                energyService,
+                craftingService,
+                maxOps,
+                maxCopies,
+                standaloneDispatchSchedule);
+    }
+
+    public TickUsage tickCraftingLogic(IEnergyService energyService,
+                                       CraftingService craftingService,
+                                       int maxOps,
+                                       long maxCopies,
+                                       TickProviderDispatchSchedule dispatchSchedule) {
         resolvePendingLoad();
         if (this.pendingJobTag != null) {
-            return;
+            return TickUsage.EMPTY;
         }
         if (!cpu.isActive()) {
-            return;
+            return TickUsage.EMPTY;
         }
 
         long now = TickHandler.instance().getCurrentTick();
@@ -309,12 +338,12 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
             if (!this.inventory.list.isEmpty()) {
                 cantStoreItems = true;
             }
-            return;
+            return TickUsage.EMPTY;
         }
 
         if (job.softCancelling) {
             finishSoftCancelIfReady(job);
-            return;
+            return TickUsage.EMPTY;
         }
 
         if (job.link.isCanceled()) {
@@ -322,43 +351,73 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
                 if (hasReusableSeedPattern(job)) beginSoftCancel(job);
                 else cancel();
             }
-            return;
+            return TickUsage.EMPTY;
         }
 
         if (job.remainingAmount <= 0) {
             finishSuccessfulIfReady(job);
-            return;
+            return TickUsage.EMPTY;
         }
 
         if (job.suspended) {
-            return;
+            return TickUsage.EMPTY;
         }
 
         var level = cpu.getLevel();
         if (level == null) {
-            return;
+            return TickUsage.EMPTY;
         }
 
-        int remainingOperations = Math.max(1, cpu.getCoProcessors() + 1);
-        executeCrafting(remainingOperations, craftingService, energyService, level);
+        int remainingOperations = Math.min(
+                Math.max(0, maxOps),
+                cpu.getSuccessfulDispatchesPerTick());
+        long remainingCopies = Math.min(
+                Math.max(0L, maxCopies),
+                cpu.hasUnboundedBatch() ? Long.MAX_VALUE : cpu.getMaxCopiesPerTick());
+        return executeCraftingBudgeted(
+                remainingOperations,
+                remainingCopies,
+                craftingService,
+                energyService,
+                level,
+                dispatchSchedule);
     }
 
     public int executeCrafting(int maxOps, CraftingService craftingService, IEnergyService energyService,
                                Level level) {
+        standaloneDispatchSchedule.beginTick(TickHandler.instance().getCurrentTick());
+        return executeCraftingBudgeted(
+                maxOps,
+                cpu.hasUnboundedBatch() ? Long.MAX_VALUE : cpu.getMaxCopiesPerTick(),
+                craftingService,
+                energyService,
+                level,
+                standaloneDispatchSchedule).successfulDispatches();
+    }
+
+    private TickUsage executeCraftingBudgeted(int maxOps,
+                                              long requestedCopyLimit,
+                                              CraftingService craftingService,
+                                              IEnergyService energyService,
+                                              Level level,
+                                              TickProviderDispatchSchedule dispatchSchedule) {
         var activeJob = this.job;
-        if (activeJob == null || maxOps <= 0) {
-            return 0;
+        if (activeJob == null || maxOps <= 0 || requestedCopyLimit <= 0L) {
+            return TickUsage.EMPTY;
         }
 
         prepareScheduler(activeJob);
 
         int usedOps = 0;
+        long usedCopies = 0L;
+        long cpuCopyLimit = cpu.hasUnboundedBatch() ? Long.MAX_VALUE : cpu.getMaxCopiesPerTick();
+        long copyLimit = Math.min(cpuCopyLimit, requestedCopyLimit);
         int probes = 0;
         int probeBudget = (int) Math.min(Math.max(1024L, (long) maxOps * 2L), MAX_TASK_PROBES_PER_TICK);
 
         beginStatusChangeBatch();
         try {
-            while (usedOps < maxOps && probes < probeBudget) {
+            while (usedOps < maxOps && usedCopies < copyLimit && probes < probeBudget) {
                 var details = pollDueTask(activeJob);
                 if (details == null) {
                     break;
@@ -373,18 +432,36 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
 
                 probes++;
                 int remainingOps = maxOps - usedOps;
-                var batchResult = runBatchForTask(details, remainingOps, craftingService, energyService, level);
+                long remainingCopies = copyLimit == Long.MAX_VALUE
+                        ? Long.MAX_VALUE : copyLimit - usedCopies;
+                var batchResult = runBatchForTask(
+                        details,
+                        remainingOps,
+                        remainingCopies,
+                        craftingService,
+                        energyService,
+                        level,
+                        dispatchSchedule);
                 if (batchResult.consumedCpuOps() > 0) {
                     usedOps += batchResult.consumedCpuOps();
+                    usedCopies = saturatingAdd(usedCopies, batchResult.dispatchedCopies());
                     preferTaskWhilePending(activeJob, details);
                     rescheduleIfStillPending(activeJob, details, 0);
                     continue;
                 }
 
+                int ordinaryBudget = (int) Math.min(remainingOps, remainingCopies);
                 var bulk = pushBulkForTask(
-                        activeJob, task, details, remainingOps, craftingService, energyService);
+                        activeJob,
+                        task,
+                        details,
+                        ordinaryBudget,
+                        craftingService,
+                        energyService,
+                        dispatchSchedule);
                 if (bulk != null) {
                     usedOps += bulk.dispatched();
+                    usedCopies = saturatingAdd(usedCopies, bulk.dispatched());
                     if (bulk.dispatched() > 0) {
                         preferTaskWhilePending(activeJob, details);
                     }
@@ -392,9 +469,17 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
                     continue;
                 }
 
-                var outcome = pushOnePattern(activeJob, task, details, craftingService, energyService, level);
+                var outcome = pushOnePattern(
+                        activeJob,
+                        task,
+                        details,
+                        craftingService,
+                        energyService,
+                        level,
+                        dispatchSchedule);
                 if (outcome == DispatchOutcome.PUSHED) {
                     usedOps++;
+                    usedCopies = saturatingAdd(usedCopies, 1L);
                     unparkTask(details);
                     preferTaskWhilePending(activeJob, details);
                     rescheduleIfStillPending(activeJob, details, 0);
@@ -409,14 +494,20 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
 
         if (job == activeJob) flushUnusedRetainedFinalOutputs(activeJob);
 
-        return usedOps;
+        return new TickUsage(usedOps, usedCopies);
+    }
+
+    public record TickUsage(int successfulDispatches, long dispatchedCopies) {
+        public static final TickUsage EMPTY = new TickUsage(0, 0L);
     }
 
     private BatchExecutor.BatchRunResult runBatchForTask(IPatternDetails details,
                                                          int remainingOps,
+                                                         long remainingCopies,
                                                          CraftingService craftingService,
                                                          IEnergyService energyService,
-                                                         Level level) {
+                                                         Level level,
+                                                         TickProviderDispatchSchedule dispatchSchedule) {
         var activeJob = this.job;
         if (activeJob == null) {
             return BatchExecutor.BatchRunResult.EMPTY;
@@ -440,7 +531,7 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
 
         var result = BatchExecutor.runBatchOnly(
                 remainingOps,
-                BatchCpuAccounting.Mode.QUADRATIC,
+                BatchCpuAccounting.Mode.SUCCESSFUL_DISPATCH,
                 craftingService,
                 energyService,
                 level,
@@ -451,8 +542,16 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
                     cpu.markDirty();
                     postPatternOutputsChange(details);
                 },
-                reservedSeedStock(details));
+                reservedSeedStock(details),
+                1,
+                remainingCopies,
+                cpu.hasUnboundedBatch(),
+                dispatchSchedule);
         if (result.dispatchedCopies() > 0) {
+            // T is a per-virtual-CPU tick budget, not a per-call width. Let the time wheel revisit
+            // the task while its private T and the physical CPU's shared successful-dispatch
+            // budget remain. Reusable seeds naturally stop until their concrete key returns.
+            batchedByTask.remove(details);
             boolean sharedSeedBatch = (details instanceof ExecuteLoopPattern loop
                             ? loop.delegate() : details)
                     instanceof com.moakiee.thunderbolt.ae2.batch.SharedBatchInputPattern;
@@ -470,7 +569,8 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
                                            IPatternDetails details,
                                            CraftingService craftingService,
                                            IEnergyService energyService,
-                                           Level level) {
+                                           Level level,
+                                           TickProviderDispatchSchedule dispatchSchedule) {
         if (hasAmbiguousOverloadOutput(details)) {
             return DispatchOutcome.RETRY_LATER;
         }
@@ -513,7 +613,8 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
                 }
             }
             var patternPower = patternPowerFor(details, craftingContainer);
-            for (var resolvedProvider : providersForSinglePush(craftingService, details)) {
+            for (var resolvedProvider : providersForSinglePush(
+                    craftingService, details, dispatchSchedule)) {
                 var provider = resolvedProvider.provider();
                 if (provider.isBusy()) {
                     continue;
@@ -524,7 +625,7 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
                     return DispatchOutcome.RETRY_NO_POWER;
                 }
 
-                if (!provider.pushPattern(resolvedProvider.pattern(), craftingContainer)) {
+                if (!tryPushPattern(resolvedProvider, craftingContainer, dispatchSchedule)) {
                     continue;
                 }
 
@@ -558,8 +659,7 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
      * pre-resolved copies to the (non-batch) providers one {@code pushPattern} at a time.
      *
      * @return the visit result, or {@code null} when the pattern needs AE2's one-copy substitution
-     *         path (overload patterns, non-homogeneous/fuzzy inputs, or a variant a free provider
-     *         rejected before anything was dispatched).
+     *         path (overload patterns or non-homogeneous/fuzzy inputs).
      */
     @Nullable
     private BulkPush pushBulkForTask(TimeWheelJob activeJob,
@@ -567,7 +667,8 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
                                      IPatternDetails details,
                                      int maxCopies,
                                      CraftingService craftingService,
-                                     IEnergyService energyService) {
+                                     IEnergyService energyService,
+                                     TickProviderDispatchSchedule dispatchSchedule) {
         if (CraftingPatternDelegates.forProviderLookup(details)
                 instanceof OverloadedProviderOnlyPatternDetails) {
             return null;
@@ -582,7 +683,8 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
         // Skip the (SIMULATE + MODULATE) extraction entirely if nothing can accept a push right
         // now. Busy providers typically free up within a tick, so retry on the next one (same
         // cadence as the vanilla path's RETRY_SOON, NOT the 4-tick energy/missing-input backoff).
-        var providers = providersForSinglePush(craftingService, details).iterator();
+        var providers = providersForSinglePush(
+                craftingService, details, dispatchSchedule).iterator();
         var firstProvider = nextFreeProvider(providers);
         if (firstProvider == null) {
             return new BulkPush(0, 1);
@@ -627,7 +729,7 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
                     if (pending == null) {
                         pending = ParallelBatchCpuHelper.cloneSingleCopy(result);
                     }
-                    if (!provider.pushPattern(resolvedProvider.pattern(), pending)) {
+                    if (!tryPushPattern(resolvedProvider, pending, dispatchSchedule)) {
                         // A rejecting provider must not consume the container, so the clone stays
                         // valid and is reused for the next provider instead of re-cloning.
                         freeProviderRejected = true;
@@ -658,10 +760,11 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
             return new BulkPush(dispatched, affordable < actual ? RETRY_DELAY_TICKS : 0);
         }
 
-        // Nothing dispatched: if a free provider actually rejected the chosen variant, let AE2's
-        // vanilla substitution path try (avoids stalling on a template the provider won't take).
+        // Every rejecting provider-pattern pair is already removed from this tick's shared
+        // schedule. Falling through to the one-copy path would only repeat extraction and scan an
+        // empty candidate set, so park this task until the next tick instead.
         if (freeProviderRejected) {
-            return null;
+            return new BulkPush(0, 1);
         }
         // Every provider turned busy since the pre-scan: plain contention, retry next tick.
         return new BulkPush(0, 1);
@@ -676,6 +779,26 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
             }
         }
         return null;
+    }
+
+    private boolean tryPushPattern(
+            ResolvedProvider resolvedProvider,
+            KeyCounter[] inputs,
+            TickProviderDispatchSchedule dispatchSchedule) {
+        var provider = resolvedProvider.provider();
+        try {
+            if (!provider.pushPattern(resolvedProvider.pattern(), inputs)) {
+                dispatchSchedule.recordFailure(resolvedProvider.pattern(), provider);
+                return false;
+            }
+        } catch (Throwable t) {
+            AELog.warn("[ae2lt] ICraftingProvider %s threw during pushPattern; blocking this pattern for the current tick. %s",
+                    provider, t);
+            dispatchSchedule.recordFailure(resolvedProvider.pattern(), provider);
+            return false;
+        }
+        dispatchSchedule.recordSuccess(resolvedProvider.pattern(), provider);
+        return true;
     }
 
     public long insert(AEKey what, long amount, Actionable type) {
@@ -1679,22 +1802,14 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
     }
 
     private Iterable<ResolvedProvider> providersForSinglePush(CraftingService craftingService,
-                                                              IPatternDetails details) {
+                                                              IPatternDetails details,
+                                                              TickProviderDispatchSchedule dispatchSchedule) {
         var providerPattern = CraftingPatternDelegates.forProviderLookup(details);
         var skipped = batchedByTask.get(details);
-        if (skipped == null || skipped.isEmpty()) {
-            return () -> new Iterator<>() {
-                private final Iterator<ICraftingProvider> raw = craftingService
-                        .getProviders(providerPattern).iterator();
-                @Override public boolean hasNext() { return raw.hasNext(); }
-                @Override public ResolvedProvider next() {
-                    return new ResolvedProvider(raw.next(), providerPattern);
-                }
-            };
-        }
         return () -> new Iterator<>() {
-            private final Iterator<ICraftingProvider> raw = craftingService
-                    .getProviders(providerPattern).iterator();
+            private final Iterator<ICraftingProvider> raw = dispatchSchedule
+                    .candidates(craftingService, providerPattern, providerPattern)
+                    .iterator();
             @Nullable
             private ResolvedProvider next;
 
@@ -1702,7 +1817,7 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
             public boolean hasNext() {
                 while (next == null && raw.hasNext()) {
                     var candidate = raw.next();
-                    if (!skipped.containsKey(candidate)) {
+                    if (skipped == null || !skipped.containsKey(candidate)) {
                         next = new ResolvedProvider(candidate, providerPattern);
                     }
                 }
@@ -2925,5 +3040,11 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
         public void addContainerMaxItems(long count, AEKeyType type) {
             addMaxItems(activeJob.timeTracker, count, type);
         }
+    }
+
+    private static long saturatingAdd(long left, long right) {
+        if (right <= 0L) return left;
+        if (left > Long.MAX_VALUE - right) return Long.MAX_VALUE;
+        return left + right;
     }
 }

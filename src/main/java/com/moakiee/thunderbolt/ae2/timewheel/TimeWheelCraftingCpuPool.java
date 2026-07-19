@@ -32,7 +32,9 @@ import appeng.api.stacks.AEKey;
 import appeng.crafting.CraftingLink;
 import appeng.crafting.execution.CraftingSubmitResult;
 import appeng.me.service.CraftingService;
+import appeng.hooks.ticking.TickHandler;
 
+import com.moakiee.thunderbolt.ae2.batch.TickProviderDispatchSchedule;
 import com.moakiee.thunderbolt.ae2.crafting.ExtendedCraftingCpuCluster;
 import com.moakiee.thunderbolt.ae2.crafting.LoopCraftingPlan;
 
@@ -40,6 +42,7 @@ import com.moakiee.thunderbolt.ae2.crafting.LoopCraftingPlan;
  * Shared-capacity time-wheel CPU that creates one virtual CPU per crafting job.
  */
 public final class TimeWheelCraftingCpuPool implements ExtendedCraftingCpuCluster {
+    private static final int PRODUCTIVE_DISPATCH_QUANTUM = 32;
     private static final int DATA_VERSION = 1;
     private static final String TAG_VERSION = "version";
     private static final String TAG_CPUS = "cpus";
@@ -52,8 +55,11 @@ public final class TimeWheelCraftingCpuPool implements ExtendedCraftingCpuCluste
 
     private long totalStorage;
     private int sharedCoProcessors;
+    private long maxCopiesPerTick;
+    private boolean unboundedBatch;
     private long remainingStorage;
     private boolean cpuListChanged;
+    private final TickProviderDispatchSchedule dispatchSchedule = new TickProviderDispatchSchedule();
 
     public TimeWheelCraftingCpuPool(TimeWheelCraftingCpuPoolHost host) {
         this(host, 0L, 0);
@@ -62,6 +68,14 @@ public final class TimeWheelCraftingCpuPool implements ExtendedCraftingCpuCluste
     public TimeWheelCraftingCpuPool(TimeWheelCraftingCpuPoolHost host,
                                     long totalStorage,
                                     int sharedCoProcessors) {
+        this(host, totalStorage, sharedCoProcessors, Long.MAX_VALUE, false);
+    }
+
+    public TimeWheelCraftingCpuPool(TimeWheelCraftingCpuPoolHost host,
+                                    long totalStorage,
+                                    int sharedCoProcessors,
+                                    long maxCopiesPerTick,
+                                    boolean unboundedBatch) {
         if (totalStorage < 0L) {
             throw new IllegalArgumentException("Total crafting storage must not be negative.");
         }
@@ -71,6 +85,8 @@ public final class TimeWheelCraftingCpuPool implements ExtendedCraftingCpuCluste
         this.host = host;
         this.totalStorage = totalStorage;
         this.sharedCoProcessors = sharedCoProcessors;
+        this.maxCopiesPerTick = Math.max(1L, maxCopiesPerTick);
+        this.unboundedBatch = unboundedBatch;
         this.remainingStorage = totalStorage;
     }
 
@@ -79,6 +95,13 @@ public final class TimeWheelCraftingCpuPool implements ExtendedCraftingCpuCluste
     }
 
     public void reconfigure(long totalStorage, int sharedCoProcessors) {
+        reconfigure(totalStorage, sharedCoProcessors, Long.MAX_VALUE, false);
+    }
+
+    public void reconfigure(long totalStorage,
+                            int sharedCoProcessors,
+                            long maxCopiesPerTick,
+                            boolean unboundedBatch) {
         if (!activeCpus.isEmpty()) {
             throw new IllegalStateException("Cannot reconfigure a time-wheel CPU pool with retained state.");
         }
@@ -90,6 +113,8 @@ public final class TimeWheelCraftingCpuPool implements ExtendedCraftingCpuCluste
         }
         this.totalStorage = totalStorage;
         this.sharedCoProcessors = sharedCoProcessors;
+        this.maxCopiesPerTick = Math.max(1L, maxCopiesPerTick);
+        this.unboundedBatch = unboundedBatch;
         this.remainingStorage = totalStorage;
         this.cpuListChanged = true;
         host.markCpuDirty();
@@ -107,14 +132,64 @@ public final class TimeWheelCraftingCpuPool implements ExtendedCraftingCpuCluste
     @Override
     public long tickCraftingLogic(IEnergyService energyService, CraftingService craftingService) {
         resolvePendingLoad();
-        long latestChange = Long.MIN_VALUE;
+        var latestChange = new long[] {Long.MIN_VALUE};
+        int successfulDispatchBudget = sharedCoProcessors >= Integer.MAX_VALUE - 1
+                ? Integer.MAX_VALUE : sharedCoProcessors + 1;
+        dispatchSchedule.beginTick(TickHandler.instance().getCurrentTick());
+
+        var scheduledCpus = new ArrayList<ScheduledCpu>(activeCpus.size());
         for (var entry : List.copyOf(activeCpus.values())) {
-            var logic = entry.cpu().getCraftingLogic();
-            logic.tickCraftingLogic(energyService, craftingService);
-            latestChange = Math.max(latestChange, logic.getWaitingKeysModifiedOnTick());
+            scheduledCpus.add(new ScheduledCpu(
+                    entry,
+                    unboundedBatch ? Long.MAX_VALUE : maxCopiesPerTick));
         }
+
+        ProductiveDispatchScheduler.run(
+                successfulDispatchBudget,
+                PRODUCTIVE_DISPATCH_QUANTUM,
+                scheduledCpus,
+                (scheduled, allowance) -> {
+                    if (scheduled.remainingCopies <= 0L) return 0;
+                    var usage = tickScheduledCpu(
+                            scheduled, allowance, energyService, craftingService);
+                    latestChange[0] = Math.max(
+                            latestChange[0],
+                            scheduled.entry.cpu().getCraftingLogic().getWaitingKeysModifiedOnTick());
+                    return usage.successfulDispatches();
+                });
+        rotateSchedulingOrder();
         removeDrainedCpus();
-        return latestChange;
+        return latestChange[0];
+    }
+
+    private Ae2LtTimeWheelCraftingCpuLogic.TickUsage tickScheduledCpu(
+            ScheduledCpu scheduled,
+            int dispatchBudget,
+            IEnergyService energyService,
+            CraftingService craftingService) {
+        var usage = scheduled.entry.cpu().getCraftingLogic().tickCraftingLogic(
+                energyService,
+                craftingService,
+                dispatchBudget,
+                scheduled.remainingCopies,
+                dispatchSchedule);
+        if (scheduled.remainingCopies != Long.MAX_VALUE) {
+            scheduled.remainingCopies = Math.max(
+                    0L,
+                    scheduled.remainingCopies - usage.dispatchedCopies());
+        }
+        return usage;
+    }
+
+    private void rotateSchedulingOrder() {
+        if (activeCpus.size() <= 1) return;
+        var iterator = activeCpus.entrySet().iterator();
+        if (!iterator.hasNext()) return;
+        var first = iterator.next();
+        UUID id = first.getKey();
+        PoolEntry entry = first.getValue();
+        iterator.remove();
+        activeCpus.put(id, entry);
     }
 
     @Override
@@ -179,7 +254,8 @@ public final class TimeWheelCraftingCpuPool implements ExtendedCraftingCpuCluste
 
         var id = UUID.randomUUID();
         long cpuStorage = infiniteStorage ? Long.MAX_VALUE : reservedBytes;
-        var cpu = new TimeWheelCraftingCPU(host, cpuStorage, sharedCoProcessors);
+        var cpu = new TimeWheelCraftingCPU(
+                host, cpuStorage, sharedCoProcessors, maxCopiesPerTick, unboundedBatch);
         var entry = new PoolEntry(id, reservedBytes, cpu);
         activeCpus.put(id, entry);
         remainingStorage -= reservedBytes;
@@ -274,7 +350,8 @@ public final class TimeWheelCraftingCpuPool implements ExtendedCraftingCpuCluste
             boolean infiniteStorage = hasInfiniteStorage();
             long reservedBytes = infiniteStorage ? 0L : Math.max(0L, entryTag.getLong(TAG_RESERVED_BYTES));
             long cpuStorage = infiniteStorage ? Long.MAX_VALUE : reservedBytes;
-            var cpu = new TimeWheelCraftingCPU(host, cpuStorage, sharedCoProcessors);
+            var cpu = new TimeWheelCraftingCPU(
+                    host, cpuStorage, sharedCoProcessors, maxCopiesPerTick, unboundedBatch);
             cpu.readFromNBT(entryTag.getCompound(TAG_STATE), registries);
             activeCpus.put(id, new PoolEntry(id, reservedBytes, cpu));
         }
@@ -348,6 +425,14 @@ public final class TimeWheelCraftingCpuPool implements ExtendedCraftingCpuCluste
         return sharedCoProcessors;
     }
 
+    public long getMaxCopiesPerTick() {
+        return maxCopiesPerTick;
+    }
+
+    public boolean hasUnboundedBatch() {
+        return unboundedBatch;
+    }
+
     @Nullable
     @Override
     public Component getName() {
@@ -402,5 +487,15 @@ public final class TimeWheelCraftingCpuPool implements ExtendedCraftingCpuCluste
     }
 
     private record PoolEntry(UUID id, long reservedBytes, TimeWheelCraftingCPU cpu) {
+    }
+
+    private static final class ScheduledCpu {
+        private final PoolEntry entry;
+        private long remainingCopies;
+
+        private ScheduledCpu(PoolEntry entry, long remainingCopies) {
+            this.entry = entry;
+            this.remainingCopies = remainingCopies;
+        }
     }
 }
