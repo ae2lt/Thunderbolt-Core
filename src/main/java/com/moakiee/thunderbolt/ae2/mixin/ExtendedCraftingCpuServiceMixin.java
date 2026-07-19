@@ -48,7 +48,6 @@ import com.moakiee.thunderbolt.ae2.crafting.ExtendedCraftingCpuCluster;
 import com.moakiee.thunderbolt.ae2.crafting.ExtendedCraftingCpuClusterProvider;
 import com.moakiee.thunderbolt.ae2.crafting.FastCraftingControl;
 import com.moakiee.thunderbolt.ae2.crafting.LoopCraftingPlan;
-import com.moakiee.thunderbolt.ae2.timewheel.TimeWheelCraftingCpuPool;
 
 @Mixin(value = CraftingService.class, remap = false)
 public abstract class ExtendedCraftingCpuServiceMixin {
@@ -99,7 +98,7 @@ public abstract class ExtendedCraftingCpuServiceMixin {
                                                                @Local CraftingCalculation job) {
         thunderbolt$refreshExtendedCpuClusters();
         boolean enabled = thunderbolt$getExtendedCpuClusters().stream()
-                .anyMatch(cluster -> cluster instanceof TimeWheelCraftingCpuPool && cluster.isActive());
+                .anyMatch(cluster -> cluster.isActive() && cluster.isFastPlanningEnabled());
         ((FastCraftingControl) job).ae2lt$setFastPlanningEnabled(enabled);
     }
 

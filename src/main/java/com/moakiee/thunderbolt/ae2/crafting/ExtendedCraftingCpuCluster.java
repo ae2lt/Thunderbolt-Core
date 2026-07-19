@@ -32,6 +32,11 @@ public interface ExtendedCraftingCpuCluster extends ICraftingCPU {
     /** Whether the physical cluster is currently online and able to craft. */
     boolean isActive();
 
+    /** Whether this active cluster opts its ME network into Thunderbolt's fast planner. */
+    default boolean isFastPlanningEnabled() {
+        return false;
+    }
+
     /** Independently visible CPUs/jobs currently owned by this cluster. */
     Collection<? extends ICraftingCPU> getActiveCpus();
 

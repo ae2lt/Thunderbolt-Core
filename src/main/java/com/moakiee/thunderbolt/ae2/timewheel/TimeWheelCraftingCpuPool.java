@@ -57,6 +57,7 @@ public final class TimeWheelCraftingCpuPool implements ExtendedCraftingCpuCluste
     private int sharedCoProcessors;
     private long maxCopiesPerTick;
     private boolean unboundedBatch;
+    private boolean fastPlanningEnabled = true;
     private long remainingStorage;
     private boolean cpuListChanged;
     private final TickProviderDispatchSchedule dispatchSchedule = new TickProviderDispatchSchedule();
@@ -82,6 +83,15 @@ public final class TimeWheelCraftingCpuPool implements ExtendedCraftingCpuCluste
 
     public TimeWheelCraftingCpuPoolHost getHost() {
         return host;
+    }
+
+    @Override
+    public boolean isFastPlanningEnabled() {
+        return fastPlanningEnabled;
+    }
+
+    public void setFastPlanningEnabled(boolean enabled) {
+        fastPlanningEnabled = enabled;
     }
 
     public void reconfigure(long totalStorage,
