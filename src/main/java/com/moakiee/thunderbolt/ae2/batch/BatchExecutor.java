@@ -242,8 +242,8 @@ public final class BatchExecutor {
             }
             if (availableBatchCapacity <= 0) continue;
 
-            // Unbounded providers must see the whole task before normal providers can consume the
-            // CPU copy budget. Normal providers retain the smaller-first balancing order.
+            // Legacy-unbounded providers get first access to the current CPU copy budget. They do
+            // not bypass copiesBudget. Normal providers retain the smaller-first balancing order.
             eligible.sort(java.util.Comparator
                     .comparing((EligibleProvider provider) -> provider.mode() != BatchDispatchMode.UNBOUNDED)
                     .thenComparingLong(EligibleProvider::capacity));

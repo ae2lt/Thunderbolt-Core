@@ -6,6 +6,7 @@
   "compatibilityLevel": "JAVA_21",
   "mixins": [
     "CraftingCalculationMixin",
+    "LoopCraftingPlanSummaryMixin",
     "EjectCapabilityMixin",
     "EjectGhostBlockEntityMixin",
     "GridConnectionMaxChannelsMixin",

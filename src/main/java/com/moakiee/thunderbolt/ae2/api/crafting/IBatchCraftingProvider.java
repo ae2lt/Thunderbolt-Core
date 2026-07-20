@@ -16,9 +16,10 @@ public interface IBatchCraftingProvider extends ICraftingProvider {
     /**
      * Controls CPU-side copy accounting for this pattern.
      *
-     * <p>{@link BatchDispatchMode#UNBOUNDED} only bypasses the CPU's copy-count budget. Input
-     * extraction, energy payment, the provider's reported capacity and the provider's own
-     * acceptance checks still apply normally.
+     * <p>{@link BatchDispatchMode#UNBOUNDED} bypasses only legacy per-call operation-to-copy
+     * accounting and gives this provider priority within the current batch. It does not bypass a
+     * finite CPU's per-tick copy budget. Input extraction, energy payment, the provider's reported
+     * capacity and the provider's own acceptance checks still apply normally.
      */
     default BatchDispatchMode getBatchDispatchMode(IPatternDetails details) {
         return BatchDispatchMode.NORMAL;
