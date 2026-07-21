@@ -6,6 +6,9 @@ package com.moakiee.thunderbolt.ae2.api.crafting;
 public enum BatchDispatchMode {
     /** Copy count is bounded by the crafting CPU's normal operation budget. */
     NORMAL,
-    /** A provider may accept up to its reported capacity for the cost of one CPU operation. */
+    /**
+     * Legacy accounting escape hatch: the provider may accept the CPU's remaining copy budget for
+     * the cost of one successful operation. This never bypasses a finite CPU's per-tick copy budget.
+     */
     UNBOUNDED
 }
