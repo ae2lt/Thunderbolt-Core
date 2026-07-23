@@ -90,6 +90,7 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
     private static final String TAG_SEED_RETURN_QUOTA = "reusableSeedReturnQuota";
     private static final String TAG_SEED_RETURN_QUOTA_FINALIZED = "reusableSeedReturnQuotaFinalized";
     private static final String TAG_RETAINED_FINAL_OUTPUTS = "retainedLoopFinalOutputs";
+    private static final String TAG_PENDING_REQUESTER_OUTPUTS = "pendingRequesterFinalOutputs";
 
     private static final String NBT_LINK = "link";
     private static final String NBT_PLAYER_ID = "playerId";
@@ -135,6 +136,7 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
     private final TickProviderDispatchSchedule standaloneDispatchSchedule = new TickProviderDispatchSchedule();
     private final KeyCounter seedReturnQuota = new KeyCounter();
     private final KeyCounter retainedFinalOutputs = new KeyCounter();
+    private final KeyCounter pendingRequesterOutputs = new KeyCounter();
     private final LoopSeedLedgerBook loopSeedLedgers = new LoopSeedLedgerBook();
 
     @Nullable
@@ -266,6 +268,7 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
         this.job = candidateJob;
         seedReturnQuota.clear();
         retainedFinalOutputs.clear();
+        pendingRequesterOutputs.clear();
         for (var entry : seedRequirements) {
             seedReturnQuota.add(entry.getKey(), entry.getLongValue());
         }
@@ -341,25 +344,37 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
             return TickUsage.EMPTY;
         }
 
-        if (job.softCancelling) {
-            finishSoftCancelIfReady(job);
+        var activeJob = this.job;
+        if (activeJob.softCancelling) {
+            finishSoftCancelIfReady(activeJob);
             return TickUsage.EMPTY;
         }
 
-        if (job.link.isCanceled()) {
-            if (!job.softCancelling) {
-                if (hasReusableSeedPattern(job)) beginSoftCancel(job);
+        if (activeJob.link.isCanceled()) {
+            if (!activeJob.softCancelling) {
+                if (hasReusableSeedPattern(activeJob)) beginSoftCancel(activeJob);
                 else cancel();
             }
             return TickUsage.EMPTY;
         }
 
-        if (job.remainingAmount <= 0) {
-            finishSuccessfulIfReady(job);
+        flushPendingRequesterOutputs(activeJob);
+        // Requester callbacks are synchronous and may cancel or otherwise finish the current link.
+        // Do not continue dispatching against the stale job object after such a callback.
+        if (this.job != activeJob) {
+            return TickUsage.EMPTY;
+        }
+        if (activeJob.link.isCanceled()) {
+            if (hasReusableSeedPattern(activeJob)) beginSoftCancel(activeJob);
+            else cancel();
+            return TickUsage.EMPTY;
+        }
+        if (activeJob.remainingAmount <= 0) {
+            finishSuccessfulIfReady(activeJob);
             return TickUsage.EMPTY;
         }
 
-        if (job.suspended) {
+        if (activeJob.suspended) {
             return TickUsage.EMPTY;
         }
 
@@ -990,8 +1005,7 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
         remaining -= retained;
 
         long finalOffer = Math.min(remaining, activeJob.remainingAmount);
-        long delivered = finalOffer > 0
-                ? activeJob.link.insert(what, finalOffer, type) : 0L;
+        long delivered = offerToRequester(activeJob, what, finalOffer, type);
         accepted += delivered;
         // A standalone AE2 crafting link intentionally has no requester, so link.insert always
         // returns zero. The produced item must fall through to ordinary ME storage, but the CPU
@@ -999,9 +1013,27 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
         // the same split between storage acceptance and job-progress accounting.
         long completedFinalOutput = FinalOutputProgress.completedAmount(
                 activeJob.link.isStandalone(), finalOffer, delivered);
-        // Keep the unaccepted part of finalOffer with the caller so the remaining storage chain can
-        // place it (standalone jobs normally fall through into ME storage). Only the physical tail
-        // beyond that offer is seed/excess.
+        long deferredRequesterOutput = FinalOutputProgress.deferredRequesterAmount(
+                activeJob.link.isStandalone(), finalOffer, delivered);
+        if (deferredRequesterOutput > 0) {
+            // Requester callbacks can legitimately accept only part of an output. In particular,
+            // a requester that writes to the same NetworkStorage is called while that storage is
+            // already iterating and receives zero from AE2's recursion guard. Keep the physical
+            // remainder in this CPU and retry it on a later tick instead of losing its waiting
+            // state. Standalone jobs deliberately retain vanilla's fall-through-to-ME behavior.
+            if (type == Actionable.MODULATE) {
+                inventory.insert(what, deferredRequesterOutput, Actionable.MODULATE);
+                // A requester may cancel the link from inside insertCraftedItems. In that case the
+                // remainder is ordinary canceled-job inventory and must not create a stale retry
+                // record after finishJob has already cleared the queue.
+                if (job == activeJob && !activeJob.link.isCanceled()) {
+                    pendingRequesterOutputs.add(what, deferredRequesterOutput);
+                }
+                cpu.markDirty();
+            }
+            accepted += deferredRequesterOutput;
+        }
+        // Only the physical tail beyond the final-output offer is seed/excess.
         long tail = remaining - finalOffer;
 
         // Any deterministic output beyond both the requested final amount and the one retained seed
@@ -1032,6 +1064,7 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
     }
 
     private void finishCompletedFinalOutput(TimeWheelJob activeJob, AEKey what, long completed) {
+        if (job != activeJob || completed <= 0) return;
         postChange(what);
         activeJob.remainingAmount = Math.max(0L, activeJob.remainingAmount - completed);
         if (activeJob.remainingAmount > 0) {
@@ -1048,6 +1081,7 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
         if (activeJob.remainingAmount > 0
                 || !activeJob.tasks.isEmpty()
                 || !activeJob.waitingKeys.isEmpty()
+                || !pendingRequesterOutputs.isEmpty()
                 || OverloadCpuStateManager.INSTANCE.hasAnyPending(this)) return;
         finalizeSeedReturnQuota();
         if (!returnReusableSeedsToHost()) return;
@@ -1093,7 +1127,7 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
                 inventory.insert(seed.what(), removed - inserted, Actionable.MODULATE);
             }
             if (inserted > 0) {
-                seedReturnQuota.remove(seed.what(), inserted);
+                removeUpTo(seedReturnQuota, seed.what(), inserted);
                 changed = true;
             }
         }
@@ -1144,6 +1178,7 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
         this.job = null;
         seedReturnQuotaFinalized = false;
         retainedFinalOutputs.clear();
+        pendingRequesterOutputs.clear();
         clearLoopSeedState();
         patternPowerCache.clear();
         clearTaskWheel();
@@ -1213,6 +1248,7 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
         this.pendingOverloadTag = null;
         OverloadCpuStateManager.INSTANCE.clear(this);
         seedReturnQuota.clear();
+        pendingRequesterOutputs.clear();
         seedReturnQuotaFinalized = false;
         clearLoopSeedState();
         clearTaskWheel();
@@ -1254,7 +1290,7 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
                     ? cpu.getHost().insertReusableSeed(entry.getKey(), intercept, Actionable.MODULATE)
                     : 0L;
             if (seedInserted > 0) {
-                seedReturnQuota.remove(entry.getKey(), seedInserted);
+                removeUpTo(seedReturnQuota, entry.getKey(), seedInserted);
                 entry.setValue(entry.getLongValue() - seedInserted);
             }
             var inserted = storage.insert(entry.getKey(), entry.getLongValue(), Actionable.MODULATE, cpu.getSrc());
@@ -1263,6 +1299,7 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
         this.inventory.list.removeZeros();
         if (this.inventory.list.isEmpty()) {
             seedReturnQuota.clear();
+            pendingRequesterOutputs.clear();
             clearLoopSeedState();
         }
         cpu.markDirty();
@@ -1299,6 +1336,10 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
             public Long get(Object key) {
                 if (!(key instanceof AEKey aeKey)) return null;
                 long reserved = ledgerReservations.getOrDefault(aeKey, 0L);
+                // Deferred requester output is already completed physical output. It must never be
+                // borrowed as another recipe input while the requester is temporarily unable to
+                // accept it; only retainedFinalOutputs is intentionally consumable by its loop.
+                reserved = addSaturated(reserved, pendingRequesterOutputs.get(aeKey));
                 if (allowedLoop == null || !allowedLoop.isInputSeedKey(aeKey)) {
                     reserved = addSaturated(reserved, retainedFinalOutputs.get(aeKey));
                 }
@@ -1314,7 +1355,9 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
 
     private appeng.crafting.inv.ICraftingInventory reservedCraftingInventory(
             IPatternDetails details) {
-        return !loopSeedLedgers.hasReservations() && retainedFinalOutputs.isEmpty()
+        return !loopSeedLedgers.hasReservations()
+                && retainedFinalOutputs.isEmpty()
+                && pendingRequesterOutputs.isEmpty()
                 ? inventory
                 : new ReservedCraftingInventory(inventory, reservedSeedStock(details));
     }
@@ -1423,6 +1466,67 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
         cpu.markDirty();
     }
 
+    private void flushPendingRequesterOutputs(TimeWheelJob activeJob) {
+        if (activeJob == null || activeJob.link.isStandalone()
+                || activeJob.softCancelling || pendingRequesterOutputs.isEmpty()) {
+            return;
+        }
+
+        var pending = new ArrayList<GenericStack>();
+        for (var entry : pendingRequesterOutputs) {
+            if (entry.getLongValue() > 0) {
+                pending.add(new GenericStack(entry.getKey(), entry.getLongValue()));
+            }
+        }
+
+        for (var entry : pending) {
+            if (job != activeJob || activeJob.link.isCanceled()) return;
+
+            long held = inventory.extract(entry.what(), Long.MAX_VALUE, Actionable.SIMULATE);
+            long reusableReserve = Math.max(
+                    seedReturnQuota.get(entry.what()),
+                    loopSeedLedgers.totalReserved(entry.what()));
+            long protectedAmount = addSaturated(
+                    reusableReserve, retainedFinalOutputs.get(entry.what()));
+            long deliverable = Math.max(0L, held - protectedAmount);
+            long offer = Math.min(
+                    entry.amount(), Math.min(deliverable, activeJob.remainingAmount));
+            if (offer <= 0) continue;
+
+            long acceptable = offerToRequester(
+                    activeJob, entry.what(), offer, Actionable.SIMULATE);
+            if (acceptable <= 0) continue;
+            if (job != activeJob || activeJob.link.isCanceled()) return;
+
+            long removed = inventory.extract(
+                    entry.what(), acceptable, Actionable.MODULATE);
+            if (removed <= 0) continue;
+
+            long delivered = offerToRequester(
+                    activeJob, entry.what(), removed, Actionable.MODULATE);
+            if (delivered < removed) {
+                inventory.insert(entry.what(), removed - delivered, Actionable.MODULATE);
+            }
+            if (job != activeJob) return;
+            if (delivered > 0) {
+                removeUpTo(pendingRequesterOutputs, entry.what(), delivered);
+                finishCompletedFinalOutput(activeJob, entry.what(), delivered);
+                cpu.markDirty();
+            }
+        }
+
+        if (!pendingRequesterOutputs.isEmpty()) {
+            cantStoreItems = true;
+        }
+    }
+
+    private static long offerToRequester(
+            TimeWheelJob activeJob, AEKey what, long amount, Actionable type) {
+        if (activeJob == null || what == null || amount <= 0) return 0L;
+        long accepted = activeJob.link.insert(what, amount, type);
+        return Math.min(amount, Math.max(0L, accepted));
+    }
+
     private void flushUnusedRetainedFinalOutputs(TimeWheelJob activeJob) {
         if (activeJob == null || retainedFinalOutputs.isEmpty()) return;
         var retained = new ArrayList<GenericStack>();
@@ -1436,14 +1540,18 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
             long free = Math.max(0L, held - loopSeedLedgers.totalReserved(entry.what()));
             long offer = Math.min(entry.amount(), Math.min(free, activeJob.remainingAmount));
             if (offer <= 0) continue;
-            long accepted = activeJob.link.insert(entry.what(), offer, Actionable.SIMULATE);
+            long accepted = offerToRequester(
+                    activeJob, entry.what(), offer, Actionable.SIMULATE);
             if (accepted <= 0) continue;
+            if (job != activeJob || activeJob.link.isCanceled()) return;
             long removed = inventory.extract(entry.what(), accepted, Actionable.MODULATE);
             if (removed <= 0) continue;
-            long delivered = activeJob.link.insert(entry.what(), removed, Actionable.MODULATE);
+            long delivered = offerToRequester(
+                    activeJob, entry.what(), removed, Actionable.MODULATE);
             if (delivered < removed) {
                 inventory.insert(entry.what(), removed - delivered, Actionable.MODULATE);
             }
+            if (job != activeJob) return;
             if (delivered > 0) {
                 removeUpTo(retainedFinalOutputs, entry.what(), delivered);
                 finishCompletedFinalOutput(activeJob, entry.what(), delivered);
@@ -1454,8 +1562,19 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
 
     private static void removeUpTo(KeyCounter counter, AEKey key, long amount) {
         if (counter == null || key == null || amount <= 0) return;
-        long removed = Math.min(counter.get(key), amount);
-        if (removed > 0) counter.remove(key, removed);
+        long current = Math.max(0L, counter.get(key));
+        if (current <= 0) {
+            // KeyCounter keeps zero-valued records unless callers remove them explicitly.
+            counter.remove(key);
+            return;
+        }
+        long remaining = Math.max(0L, current - Math.max(0L, amount));
+        if (remaining == current) return;
+        if (remaining <= 0) {
+            counter.remove(key);
+        } else {
+            counter.set(key, remaining);
+        }
     }
 
     private void clearLoopSeedState() {
@@ -1551,6 +1670,7 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
         OverloadCpuStateManager.INSTANCE.clear(this);
         seedReturnQuota.clear();
         retainedFinalOutputs.clear();
+        pendingRequesterOutputs.clear();
         seedReturnQuotaFinalized = data.getBoolean(TAG_SEED_RETURN_QUOTA_FINALIZED);
         clearLoopSeedState();
         if (data.contains(TAG_SEED_RETURN_QUOTA, Tag.TAG_LIST)) {
@@ -1568,6 +1688,10 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
                     retainedFinalOutputs.add(stack.what(), stack.amount());
                 }
             }
+        }
+        if (data.contains(TAG_PENDING_REQUESTER_OUTPUTS, Tag.TAG_LIST)) {
+            pendingRequesterOutputs.addAll(readCounter(
+                    data.getList(TAG_PENDING_REQUESTER_OUTPUTS, Tag.TAG_COMPOUND), registries));
         }
         readLoopSeedState(data, registries);
         clearTaskWheel();
@@ -1615,6 +1739,12 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
                     writeCounter(retainedFinalOutputs, registries));
         } else {
             data.remove(TAG_RETAINED_FINAL_OUTPUTS);
+        }
+        if (!pendingRequesterOutputs.isEmpty()) {
+            data.put(TAG_PENDING_REQUESTER_OUTPUTS,
+                    writeCounter(pendingRequesterOutputs, registries));
+        } else {
+            data.remove(TAG_PENDING_REQUESTER_OUTPUTS);
         }
         writeLoopSeedState(data, registries);
         if (this.job != null) {
@@ -1731,6 +1861,7 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
                 || this.pendingOverloadTag != null
                 || !this.inventory.list.isEmpty()
                 || !seedReturnQuota.isEmpty()
+                || !pendingRequesterOutputs.isEmpty()
                 || OverloadCpuStateManager.INSTANCE.hasAnyPending(this);
     }
 
