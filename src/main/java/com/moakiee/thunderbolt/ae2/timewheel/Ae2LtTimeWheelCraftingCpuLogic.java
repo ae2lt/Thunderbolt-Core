@@ -1146,12 +1146,6 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
         cpu.markDirty();
     }
 
-    private void discardHeldReusableSeeds() {
-        for (var seed : seedReturnQuota) {
-            inventory.extract(seed.getKey(), seed.getLongValue(), Actionable.MODULATE);
-        }
-    }
-
     private void finishJob(boolean success) {
         var activeJob = this.job;
         if (activeJob == null) {
@@ -1193,7 +1187,8 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
             beginSoftCancel(job);
             return;
         }
-        discardHeldReusableSeeds();
+        // Stop intercepting reusable seeds. Anything already held by the CPU is real returned
+        // content and must fall through to ordinary ME storage after the job is closed.
         seedReturnQuota.clear();
         seedReturnQuotaFinalized = false;
         clearLoopSeedState();
@@ -1237,8 +1232,7 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
         if (this.job != null) {
             // A removed CPU cannot remain in the first-stage "wait for seed" state. Removal is the
             // destructive second cancellation: stop tracking late returns, cancel the link and
-            // return/drop only content that is still physically in the CPU.
-            discardHeldReusableSeeds();
+            // return/drop all content that is already physically in the CPU.
             seedReturnQuota.clear();
             seedReturnQuotaFinalized = false;
             clearLoopSeedState();
