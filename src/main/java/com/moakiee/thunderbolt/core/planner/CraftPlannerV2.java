@@ -966,13 +966,22 @@ public final class CraftPlannerV2<K> {
         }
 
         long externalExact = 0L;
-        long unmet = 0L;
+        if (remaining > 0 && isSelfReturnedSeed(pattern, input)) {
+            // A normal-network seed is reserved before ordinary demand can consume the same key.
+            // Host stock still has priority; this path is only the fallback when the private host
+            // could not provide the complete bootstrap state.
+            long reserved = drawReservedSelfSeed(input.key(), remaining);
+            remaining -= reserved;
+            externalExact = reserved;
+        }
         if (remaining <= 0) {
             return new ReusableSeedAcquisition(
                     0L,
-                    Sat.add(fromPool, borrowedExact),
+                    Sat.add(Sat.add(fromPool, borrowedExact), externalExact),
                     Sat.add(fromPrivate, borrowedPrivate));
         }
+        long unmet;
+        long externalRequest = remaining;
         if (isSelfReturnedSeed(pattern, input)) {
             unmet = craftSelfSeedFromAlternative(input.key(), remaining, pattern);
             if (unmet > 0) addMissing(input.key(), unmet);
@@ -984,7 +993,7 @@ public final class CraftPlannerV2<K> {
                 depth--;
             }
         }
-        externalExact = remaining - unmet;
+        externalExact = Sat.add(externalExact, externalRequest - unmet);
         return new ReusableSeedAcquisition(
                 unmet,
                 Sat.add(Sat.add(fromPool, borrowedExact), externalExact),
@@ -1159,7 +1168,7 @@ public final class CraftPlannerV2<K> {
         long required = 0L;
         for (CraftPattern<K> pattern : patternsByOutput.getOrDefault(key, List.of())) {
             for (CraftInput<K> input : pattern.inputs()) {
-                if (isSelfReturnedSeed(pattern, input) && input.reusableStockSource() == null) {
+                if (isSelfReturnedSeed(pattern, input)) {
                     required = Math.max(required, input.amount());
                 }
             }

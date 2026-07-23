@@ -38,6 +38,7 @@ import com.moakiee.thunderbolt.core.planner.CraftOutput;
 import com.moakiee.thunderbolt.core.planner.CraftPattern;
 import com.moakiee.thunderbolt.core.planner.CraftPlan;
 import com.moakiee.thunderbolt.core.planner.CraftPlannerV2;
+import com.moakiee.thunderbolt.core.planner.ReusableStockFallback;
 import com.moakiee.thunderbolt.core.planner.ReusableStockUsageKey;
 import com.moakiee.thunderbolt.core.planner.DurabilityChain;
 import com.moakiee.thunderbolt.core.planner.Sat;
@@ -243,7 +244,7 @@ public final class FastCraftingPlanner {
         // Memoized "how much is already in the network" per key (SIMULATE probe), used to rank fuzzy
         // substitutes most-available-first so the bounded keep-best-32 picks the cheapest routes.
         Map<AEKey, Long> availability = new HashMap<>();
-        Map<AEKey, Long> selfSeedNetworkStock = new HashMap<>();
+        Map<AEKey, Long> supplementalSelfSeedStock = new HashMap<>();
         // Unit-system bookkeeping. A durability chain prices its links in USES (carrier pool); every
         // other node is priced in whole ITEMS. The same physical stock must never be counted under
         // both systems (or under two incompatible chains), so we track:
@@ -345,18 +346,21 @@ public final class FastCraftingPlanner {
                         builder.reusableStockRoute(source, requirement.getKey(), acceptedVariants);
                     }
                     // AE2 intentionally ignores pre-existing stock of the requested output. When a
-                    // contracted gain loop uses that same key as its catalyst, take a second,
-                    // non-ignored snapshot strictly for the seed. CraftPlannerV2 reserves it before
-                    // output demand and never lets this firing's increment bootstrap the catalyst.
+                    // contracted gain loop uses that same key as its catalyst, publish only the part
+                    // hidden by that ignore view. For a dependency key, its ordinary stock was
+                    // already published above and CraftPlannerV2 reserves the seed from that same
+                    // pool; publishing it twice would undercount loop firings by one seed batch.
                     long selfSeedRequired = seeded.totalReusableSeedRequirements()
                             .getOrDefault(key, 0L);
                     if (selfSeedRequired > 0) {
-                        long available = Math.min(selfSeedRequired,
-                                usableStock(reusableSeedSnapshot, key, reservedStock));
-                        long previous = selfSeedNetworkStock.getOrDefault(key, 0L);
-                        if (available > previous) {
-                            builder.stock(key, available - previous);
-                            selfSeedNetworkStock.put(key, available);
+                        long supplemental = ReusableStockFallback.supplementalSelfSeedStock(
+                                selfSeedRequired,
+                                usableStock(reusableSeedSnapshot, key, reservedStock),
+                                usableStock(snapshot, key, reservedStock));
+                        long previous = supplementalSelfSeedStock.getOrDefault(key, 0L);
+                        if (supplemental > previous) {
+                            builder.stock(key, supplemental - previous);
+                            supplementalSelfSeedStock.put(key, supplemental);
                         }
                     }
                 }

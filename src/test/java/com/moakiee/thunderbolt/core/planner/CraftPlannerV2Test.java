@@ -974,6 +974,66 @@ class CraftPlannerV2Test {
     }
 
     @Test
+    void normalStockBootstrapsContractedGainBeforeProducingTheRequestedAlternateState() {
+        var source = new ReusableStockSource("tianshu", "loop");
+        CraftPattern<String> aToB = new CraftPattern<>(
+                "B", 1, List.of(CraftInput.of("A", 1)), "A_to_B");
+        CraftPattern<String> rawBToTwoA = new CraftPattern<>(
+                "A", 2, List.of(CraftInput.of("B", 1)), "B_to_2A_raw");
+        CraftPattern<String> contractedGain = new CraftPattern<>(
+                "A", 1, List.of(CraftInput.returnedFrom("A", 1, source)),
+                "contracted_A_gain");
+        CraftGraph<String> graph = CraftGraph.<String>builder()
+                .pattern(aToB)
+                .pattern(rawBToTwoA)
+                .pattern(contractedGain)
+                .stock("A", 1)
+                .reusableStockRoute(source, "A", List.of("A"))
+                .build();
+
+        CraftPlan<String> plan = CraftPlannerV2.plan(graph, "B", 1_000);
+
+        assertTrue(plan.feasible());
+        assertEquals(1L, plan.usedStock().get("A"));
+        assertEquals(1_000L, firingsOf(plan, contractedGain));
+        assertEquals(1_000L, firingsOf(plan, aToB));
+        assertEquals(0L, firingsOf(plan, rawBToTwoA),
+                "the cut raw feedback edge must not bootstrap itself from the requested B");
+        assertTrue(plan.usedReusableStock().isEmpty());
+        assertTrue(plan.missing().isEmpty());
+    }
+
+    @Test
+    void hostSeedStillTakesPriorityForTheSameBidirectionalCut() {
+        var source = new ReusableStockSource("tianshu", "loop");
+        CraftPattern<String> aToB = new CraftPattern<>(
+                "B", 1, List.of(CraftInput.of("A", 1)), "A_to_B");
+        CraftPattern<String> rawBToTwoA = new CraftPattern<>(
+                "A", 2, List.of(CraftInput.of("B", 1)), "B_to_2A_raw");
+        CraftPattern<String> contractedGain = new CraftPattern<>(
+                "A", 1, List.of(CraftInput.returnedFrom("A", 1, source)),
+                "contracted_A_gain");
+        CraftGraph<String> graph = CraftGraph.<String>builder()
+                .pattern(aToB)
+                .pattern(rawBToTwoA)
+                .pattern(contractedGain)
+                .reusableStock("tianshu", "A", 1)
+                .reusableStockRoute(source, "A", List.of("A"))
+                .build();
+
+        CraftPlan<String> plan = CraftPlannerV2.plan(graph, "B", 1_000);
+
+        assertTrue(plan.feasible());
+        assertEquals(1_000L, firingsOf(plan, contractedGain));
+        assertEquals(1_000L, firingsOf(plan, aToB));
+        assertEquals(0L, firingsOf(plan, rawBToTwoA));
+        assertEquals(1L, plan.usedReusableStock().values().stream()
+                .mapToLong(Long::longValue).sum());
+        assertTrue(plan.usedStock().isEmpty());
+        assertTrue(plan.missing().isEmpty());
+    }
+
+    @Test
     void alternateLoopStateCanBeCraftedIntoTheDefaultSeedBeforeStartup() {
         CraftPattern<String> bFromA = new CraftPattern<>(
                 "B", 1, List.of(CraftInput.of("A", 1)), "A_to_B");
