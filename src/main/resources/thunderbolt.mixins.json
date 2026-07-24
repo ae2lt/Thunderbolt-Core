@@ -5,7 +5,10 @@
   "plugin": "com.moakiee.thunderbolt.ae2.mixin.ThunderboltMixinConfigPlugin",
   "compatibilityLevel": "JAVA_21",
   "mixins": [
+    "Ae2CraftingTreeCompatibilityMixin",
     "CraftingCalculationMixin",
+    "CraftingLinkNexusMixin",
+    "CraftingServiceAccessor",
     "LoopCraftingPlanSummaryMixin",
     "EjectCapabilityMixin",
     "EjectGhostBlockEntityMixin",

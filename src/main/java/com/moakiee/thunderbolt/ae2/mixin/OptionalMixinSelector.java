@@ -6,6 +6,7 @@ import java.util.function.Predicate;
 /** Pure target-to-mod mapping used by the early Mixin config plugin. */
 public final class OptionalMixinSelector {
     private static final Map<String, String> REQUIRED_MODS = Map.ofEntries(
+            Map.entry("Ae2CraftingTreeCompatibilityMixin", "ae2ct"),
             Map.entry("AdvCraftingCpuLogicBatchMixin", "advanced_ae"),
             Map.entry("AdvCraftingCpuLogicMixin", "advanced_ae"),
             Map.entry("AdvCraftingCpuAccessor", "advanced_ae"),

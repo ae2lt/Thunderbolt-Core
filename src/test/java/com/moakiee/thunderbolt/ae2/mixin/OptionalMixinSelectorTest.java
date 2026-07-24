@@ -22,6 +22,14 @@ class OptionalMixinSelectorTest {
     }
 
     @Test
+    void gatesAe2CraftingTreeCompatibilityToItsOwningAddon() {
+        assertFalse(OptionalMixinSelector.shouldApply(
+                "Ae2CraftingTreeCompatibilityMixin", ignored -> false));
+        assertTrue(OptionalMixinSelector.shouldApply(
+                "Ae2CraftingTreeCompatibilityMixin", "ae2ct"::equals));
+    }
+
+    @Test
     void appliesOptionalTargetsWhenTheirModIsLoaded() {
         assertTrue(OptionalMixinSelector.shouldApply("AdvCraftingCpuAccessor", "advanced_ae"::equals));
         assertTrue(OptionalMixinSelector.shouldApply("ECOCraftingCpuLogicBatchMixin", "neoecoae"::equals));
