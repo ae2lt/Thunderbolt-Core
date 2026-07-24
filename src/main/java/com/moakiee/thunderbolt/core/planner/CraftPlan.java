@@ -19,13 +19,13 @@ import java.util.Map;
  * @param grossDemand   item -> total amount requested before drawing from stock (one entry per
  *                      visited item). Exposed so the AE2 adapter can reproduce AE2's byte accounting
  *                      ({@code addStackBytes} is charged on the pre-extraction request amount).
- * @param itemsProcessed number of distinct items visited in the demand pass. Exposed so tests can
- *                       assert the planner is O(reachable items), never exponential.
- * @param budgetExhausted {@code true} if the bounded search hit a node's per-node visit cap and had
- *                       to commit a best-effort result instead of continuing to search. This is the
- *                       only situation in which the plan may be worse than AE2's exhaustive simulator
- *                       (the chosen exhaustion policy returns best-effort rather than declining). On
- *                       normal graphs it stays {@code false}: contention never approaches the cap.
+ * @param itemsProcessed number of items visited by the linear demand pass, or recursive node
+ *                       invocations performed by the bounded fallback. Request magnitude does not
+ *                       affect this value because every firing count is handled in closed form.
+ * @param budgetExhausted retained for result compatibility. Node-local visit exhaustion no longer
+ *                       invalidates a calculation: that node freezes to one greedy recipe, so the v2
+ *                       planner leaves this {@code false}. Depth overflow is reported as a normal
+ *                       branch-local missing input and may be recovered by a parent alternative.
  * @param <K> item key type
  */
 public record CraftPlan<K>(
