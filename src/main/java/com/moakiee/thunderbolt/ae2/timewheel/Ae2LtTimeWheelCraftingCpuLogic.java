@@ -294,12 +294,16 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
 
     public void tickCraftingLogic(IEnergyService energyService, CraftingService craftingService) {
         standaloneDispatchSchedule.beginTick(TickHandler.instance().getCurrentTick());
-        tickCraftingLogic(
-                energyService,
-                craftingService,
-                cpu.getSuccessfulDispatchesPerTick(),
-                cpu.hasUnboundedBatch() ? Long.MAX_VALUE : cpu.getMaxCopiesPerTick(),
-                standaloneDispatchSchedule);
+        try {
+            tickCraftingLogic(
+                    energyService,
+                    craftingService,
+                    cpu.getSuccessfulDispatchesPerTick(),
+                    cpu.hasUnboundedBatch() ? Long.MAX_VALUE : cpu.getMaxCopiesPerTick(),
+                    standaloneDispatchSchedule);
+        } finally {
+            finishPhysicalSchedulingTick();
+        }
     }
 
     public TickUsage tickCraftingLogic(IEnergyService energyService,
@@ -307,12 +311,16 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
                                        int maxOps,
                                        long maxCopies) {
         standaloneDispatchSchedule.beginTick(TickHandler.instance().getCurrentTick());
-        return tickCraftingLogic(
-                energyService,
-                craftingService,
-                maxOps,
-                maxCopies,
-                standaloneDispatchSchedule);
+        try {
+            return tickCraftingLogic(
+                    energyService,
+                    craftingService,
+                    maxOps,
+                    maxCopies,
+                    standaloneDispatchSchedule);
+        } finally {
+            finishPhysicalSchedulingTick();
+        }
     }
 
     public TickUsage tickCraftingLogic(IEnergyService energyService,
@@ -401,13 +409,17 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
     public int executeCrafting(int maxOps, CraftingService craftingService, IEnergyService energyService,
                                Level level) {
         standaloneDispatchSchedule.beginTick(TickHandler.instance().getCurrentTick());
-        return executeCraftingBudgeted(
-                maxOps,
-                cpu.hasUnboundedBatch() ? Long.MAX_VALUE : cpu.getMaxCopiesPerTick(),
-                craftingService,
-                energyService,
-                level,
-                standaloneDispatchSchedule).successfulDispatches();
+        try {
+            return executeCraftingBudgeted(
+                    maxOps,
+                    cpu.hasUnboundedBatch() ? Long.MAX_VALUE : cpu.getMaxCopiesPerTick(),
+                    craftingService,
+                    energyService,
+                    level,
+                    standaloneDispatchSchedule).successfulDispatches();
+        } finally {
+            finishPhysicalSchedulingTick();
+        }
     }
 
     private TickUsage executeCraftingBudgeted(int maxOps,
@@ -503,7 +515,6 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
                 }
             }
         } finally {
-            carryOverDueTasks();
             endStatusChangeBatch();
         }
 
@@ -2563,6 +2574,18 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
             case RETRY_MISSING_INPUT, RETRY_NO_POWER, RETRY_LATER -> RETRY_DELAY_TICKS;
             case PUSHED -> 0;
         };
+    }
+
+    /**
+     * Finishes the physical CPU's scheduling tick.
+     *
+     * <p>A pooled time-wheel CPU can visit this virtual CPU several times in one server tick:
+     * first with a one-dispatch discovery allowance, then with larger productive quanta. Due
+     * tasks must remain in the current bucket between those visits, otherwise a successful
+     * discovery dispatch incorrectly limits the virtual CPU to one ordinary push per tick.</p>
+     */
+    void finishPhysicalSchedulingTick() {
+        carryOverDueTasks();
     }
 
     private void carryOverDueTasks() {

@@ -140,19 +140,27 @@ public final class TimeWheelCraftingCpuPool implements ExtendedCraftingCpuCluste
                     unboundedBatch ? Long.MAX_VALUE : maxCopiesPerTick));
         }
 
-        ProductiveDispatchScheduler.run(
-                successfulDispatchBudget,
-                PRODUCTIVE_DISPATCH_QUANTUM,
-                scheduledCpus,
-                (scheduled, allowance) -> {
-                    if (scheduled.remainingCopies <= 0L) return 0;
-                    var usage = tickScheduledCpu(
-                            scheduled, allowance, energyService, craftingService);
-                    latestChange[0] = Math.max(
-                            latestChange[0],
-                            scheduled.entry.cpu().getCraftingLogic().getWaitingKeysModifiedOnTick());
-                    return usage.successfulDispatches();
-                });
+        try {
+            ProductiveDispatchScheduler.run(
+                    successfulDispatchBudget,
+                    PRODUCTIVE_DISPATCH_QUANTUM,
+                    scheduledCpus,
+                    (scheduled, allowance) -> {
+                        if (scheduled.remainingCopies <= 0L) return 0;
+                        var usage = tickScheduledCpu(
+                                scheduled, allowance, energyService, craftingService);
+                        latestChange[0] = Math.max(
+                                latestChange[0],
+                                scheduled.entry.cpu().getCraftingLogic().getWaitingKeysModifiedOnTick());
+                        return usage.successfulDispatches();
+                    });
+        } finally {
+            // ProductiveDispatchScheduler may revisit one virtual CPU several times in this
+            // physical tick. Only roll its still-due tasks forward after every visit is done.
+            for (var scheduled : scheduledCpus) {
+                scheduled.entry.cpu().getCraftingLogic().finishPhysicalSchedulingTick();
+            }
+        }
         rotateSchedulingOrder();
         removeDrainedCpus();
         return latestChange[0];
