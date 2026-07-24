@@ -1103,25 +1103,219 @@ class CraftPlannerV2Test {
     }
 
     /**
-     * A fully infeasible tree where every item has two recipes would explode to 2^depth without the
-     * per-node visit cap. With the cap, work stays bounded and it still terminates with a missing report.
+     * A fully infeasible tree where every item has several materially distinct recipes would explode
+     * without memoization. A failed child proof is reused only after trail rollback restores the exact
+     * same availability state, so work stays linear without a whole-plan cutoff.
      */
     @Test
     void boundedSearchDoesNotBlowUp() {
-        int depth = 30;
+        int depth = 100;
+        int alternatives = 4;
         CraftGraph.Builder<String> b = CraftGraph.<String>builder();
         for (int i = 0; i < depth; i++) {
-            b.pattern(new CraftPattern<>("A" + i, 1, List.of(CraftInput.of("A" + (i + 1), 1)), "A" + i + "_x"));
-            b.pattern(new CraftPattern<>("A" + i, 1, List.of(CraftInput.of("A" + (i + 1), 1)), "A" + i + "_y"));
+            for (int alternative = 0; alternative < alternatives; alternative++) {
+                b.pattern(new CraftPattern<>(
+                        "A" + i,
+                        1,
+                        List.of(CraftInput.of("A" + (i + 1), 1)),
+                        List.of(CraftOutput.of("distinct-waste-" + i + "-" + alternative, 1)),
+                        "A" + i + "_" + alternative));
+            }
         }
         // A{depth} is a raw leaf with no stock -> the whole thing is infeasible.
 
-        CraftPlan<String> plan = CraftPlannerV2.plan(b.build(), "A0", 1);
+        long requested = 1_000_000_000L;
+        CraftPlan<String> plan = CraftPlannerV2.plan(b.build(), "A0", requested);
 
         assertTrue(plan.supported());
         assertFalse(plan.feasible());
-        assertTrue(plan.itemsProcessed() < 50_000,
-                "per-node K cap must keep work bounded, got " + plan.itemsProcessed());
+        assertFalse(plan.budgetExhausted(), "node-local exhaustion must not poison the whole result");
+        assertEquals(requested, plan.missing().get("A" + depth),
+                "the final greedy route must still report its concrete raw-leaf shortfall");
+        assertTrue(plan.itemsProcessed() <= depth * alternatives,
+                "exact-state failure memo must prevent repeated subtree expansion: "
+                        + plan.itemsProcessed());
+    }
+
+    /** A cached failure cannot survive a real pool change that makes the same child craftable. */
+    @Test
+    void failedNodeIsRetriedAfterAvailabilityChanges() {
+        CraftPattern<String> bad = new CraftPattern<>(
+                "target", 1, List.of(CraftInput.of("X", 1)), "bad");
+        CraftPattern<String> good = new CraftPattern<>(
+                "target", 1, List.of(CraftInput.of("producer", 1), CraftInput.of("X", 1)), "good");
+        CraftGraph<String> graph = CraftGraph.<String>builder()
+                .pattern(bad)
+                .pattern(good)
+                .pattern("X", 1, List.of(CraftInput.of("material", 1)))
+                .pattern(new CraftPattern<>(
+                        "producer",
+                        1,
+                        List.of(CraftInput.of("raw", 1)),
+                        List.of(CraftOutput.of("material", 1)),
+                        "producer"))
+                .stock("raw", 1)
+                .build();
+
+        CraftPlan<String> plan = CraftPlannerV2.plan(graph, "target", 1);
+
+        assertTrue(plan.feasible(), "the byproduct changes X's exact availability state");
+        assertEquals(1L, firingsOf(plan, good));
+        assertEquals(0L, firingsOf(plan, bad));
+        assertEquals(1L, plan.usedStock().get("raw"));
+    }
+
+    /**
+     * A failure caused by the recursion guard is valid only at that depth. Reaching the same node from
+     * a shorter alternative must retry it instead of reusing the deep-path failure proof.
+     */
+    @Test
+    void failedNodeIsRetriedAtAShallowerDepth() {
+        int prefixLength = CraftPlannerV2.MAX_OBTAIN_DEPTH - 2;
+        CraftGraph.Builder<String> builder = CraftGraph.<String>builder()
+                .pattern("target", 1, List.of(CraftInput.of("deep0", 1)))
+                .pattern("target", 1, List.of(CraftInput.of("X", 1)))
+                .pattern("X", 1, List.of(CraftInput.of("raw", 1)))
+                .stock("raw", 1);
+        for (int i = 0; i < prefixLength; i++) {
+            String input = i + 1 == prefixLength ? "X" : "deep" + (i + 1);
+            builder.pattern("deep" + i, 1, List.of(CraftInput.of(input, 1)));
+        }
+
+        CraftPlan<String> plan = CraftPlannerV2.plan(builder.build(), "target", 1);
+
+        assertTrue(plan.feasible(), "the shallow target alternative must retry and craft X");
+        assertEquals(1L, plan.usedStock().get("raw"));
+    }
+
+    /**
+     * One hard-fuzzy AE2 pattern may contribute 64 concrete candidates. If all of them revisit the same
+     * child and lose on a shared-stock conflict, that child's local cap must switch it to greedy-tree
+     * mode without killing the parent search or hiding the first ordinary alternative after the window.
+     */
+    @Test
+    void localCapFallsBackToGreedyWithoutKillingParentSearch() {
+        int failedAlternatives = 64;
+        CraftGraph.Builder<String> builder = CraftGraph.<String>builder()
+                .pattern("X", 1, List.of(CraftInput.of("shared", 1)))
+                .stock("shared", 1)
+                .stock("good", 1);
+
+        for (int i = 0; i < failedAlternatives; i++) {
+            String sibling = "Y" + i;
+            // A unique byproduct makes these branches materially distinct, ensuring this test
+            // exercises the local visit cap rather than the equivalence proof below.
+            builder.pattern(
+                    sibling,
+                    1,
+                    List.of(CraftInput.of("shared", 1)),
+                    List.of(CraftOutput.of("waste-" + i, 1)));
+            builder.pattern(new CraftPattern<>(
+                    "target",
+                    1,
+                    List.of(CraftInput.of("X", 1), CraftInput.of(sibling, 1)),
+                    "bad-" + i));
+        }
+        CraftPattern<String> good = new CraftPattern<>(
+                "target",
+                1,
+                List.of(CraftInput.of("X", 1), CraftInput.of("good", 1)),
+                "good");
+        builder.pattern(good);
+        CraftGraph<String> graph = builder.build();
+
+        CraftPlan<String> cap64 = CraftPlannerV2.plan(graph, "target", 1, 64);
+        CraftPlan<String> defaultCap = CraftPlannerV2.plan(graph, "target", 1);
+
+        assertTrue(cap64.feasible(), "the locally capped X subtree must continue greedily");
+        assertFalse(cap64.budgetExhausted(), "local greedy degradation must not kill the whole plan");
+        assertEquals(1L, firingsOf(cap64, good));
+        assertTrue(defaultCap.feasible(), "the default must search beyond one complete fuzzy window");
+        assertFalse(defaultCap.budgetExhausted());
+        assertEquals(1L, firingsOf(defaultCap, good));
+    }
+
+    /**
+     * B accepts two concrete fuzzy variants. Their intermediate names differ, but both normalize to
+     * exactly 1 E per B, so one failed material tree proves the other equivalent for this rollback
+     * state. The amount is deliberately large to verify that proof work remains quantity-independent.
+     */
+    @Test
+    void equivalentMaterialBranchesAreSearchedOnce() {
+        CraftPattern<String> viaA1 = new CraftPattern<>(
+                "B", 1, List.of(CraftInput.of("A1", 1)), "B-via-A1");
+        CraftPattern<String> viaA2 = new CraftPattern<>(
+                "B", 1, List.of(CraftInput.of("A2", 1)), "B-via-A2");
+        CraftGraph<String> graph = CraftGraph.<String>builder()
+                .pattern(viaA1)
+                .pattern(viaA2)
+                .pattern("A1", 1, List.of(CraftInput.of("C", 1)))
+                .pattern("A2", 1, List.of(CraftInput.of("D", 1)))
+                .pattern("C", 1, List.of(CraftInput.of("E", 1)))
+                .pattern("D", 1, List.of(CraftInput.of("E", 1)))
+                .build();
+
+        CraftPlan<String> plan = CraftPlannerV2.plan(graph, "B", 1_000);
+
+        assertFalse(plan.feasible());
+        assertEquals(1_000L, plan.missing().get("E"));
+        assertEquals(1_000L, firingsOf(plan, viaA1));
+        assertEquals(0L, firingsOf(plan, viaA2));
+        assertEquals(3, plan.itemsProcessed(),
+                "the only material class is committed once without speculative re-expansion");
+    }
+
+    /** Sixty-four equivalent fuzzy branches still expand one proof tree, independent of request size. */
+    @Test
+    void manyEquivalentBranchesStayConstantInRequestAmount() {
+        CraftGraph.Builder<String> builder = CraftGraph.builder();
+        List<CraftPattern<String>> alternatives = new ArrayList<>();
+        for (int i = 0; i < 64; i++) {
+            CraftPattern<String> alternative = new CraftPattern<>(
+                    "B", 1, List.of(CraftInput.of("A" + i, 1)), "B-via-A" + i);
+            alternatives.add(alternative);
+            builder.pattern(alternative);
+            builder.pattern("A" + i, 1, List.of(CraftInput.of("C" + i, 1)));
+            builder.pattern("C" + i, 1, List.of(CraftInput.of("E", 1)));
+        }
+        CraftGraph<String> graph = builder.build();
+
+        CraftPlan<String> one = CraftPlannerV2.plan(graph, "B", 1);
+        CraftPlan<String> billion = CraftPlannerV2.plan(graph, "B", 1_000_000_000L);
+
+        assertFalse(one.feasible());
+        assertFalse(billion.feasible());
+        assertEquals(3, one.itemsProcessed());
+        assertEquals(one.itemsProcessed(), billion.itemsProcessed(),
+                "request magnitude must not multiply equivalent branch expansion");
+        assertEquals(1_000_000_000L, billion.missing().get("E"));
+        assertEquals(1_000_000_000L, firingsOf(billion, alternatives.get(0)));
+        for (int i = 1; i < alternatives.size(); i++) {
+            assertEquals(0L, firingsOf(billion, alternatives.get(i)));
+        }
+    }
+
+    /** Different terminal quantities are not equivalent and must both be searched. */
+    @Test
+    void differentMaterialRatiosAreNotPruned() {
+        CraftPattern<String> viaA1 = new CraftPattern<>(
+                "B", 1, List.of(CraftInput.of("A1", 1)), "B-via-A1");
+        CraftPattern<String> viaA2 = new CraftPattern<>(
+                "B", 1, List.of(CraftInput.of("A2", 1)), "B-via-A2");
+        CraftGraph<String> graph = CraftGraph.<String>builder()
+                .pattern(viaA1)
+                .pattern(viaA2)
+                .pattern("A1", 1, List.of(CraftInput.of("C", 1)))
+                .pattern("A2", 1, List.of(CraftInput.of("D", 1)))
+                .pattern("C", 1, List.of(CraftInput.of("E", 1)))
+                .pattern("D", 1, List.of(CraftInput.of("E", 2)))
+                .build();
+
+        CraftPlan<String> plan = CraftPlannerV2.plan(graph, "B", 1_000);
+
+        assertFalse(plan.feasible());
+        assertEquals(7, plan.itemsProcessed(),
+                "both non-equivalent proof trees plus one committed best-effort tree");
     }
 
     /**
@@ -1309,10 +1503,9 @@ class CraftPlannerV2Test {
      * double-counts one shared unit). The greedy linear pass takes the bait, fails, and the bounded
      * search must roll back and recover the witness.
      *
-     * <p>The planner MUST come back feasible across thousands of random graphs, and crucially
-     * {@link CraftPlan#budgetExhausted()} must stay {@code false}: normal random contention is
-     * recovered in a couple of backtracks and never approaches the per-node cap. That cap is only a
-     * safety net for adversarial inputs, not something realistic graphs lean on.
+     * <p>The planner MUST come back feasible across thousands of random graphs. The legacy
+     * {@link CraftPlan#budgetExhausted()} result bit also remains {@code false}: local node freezing is
+     * no longer represented as whole-plan exhaustion.
      */
     @Test
     void reverseConstructedGraphsAreAlwaysCraftable() {
@@ -1326,7 +1519,7 @@ class CraftPlannerV2Test {
                             + plan.missing() + " seed=" + seed);
             assertTrue(plan.missing().isEmpty(), "seed=" + seed);
             assertFalse(plan.budgetExhausted(),
-                    "bounded search recovered, so the per-node cap must not have been hit, seed=" + seed);
+                    "node-local search must never emit a whole-plan exhaustion flag, seed=" + seed);
             assertMassBalance(plan, rg, seed); // soundness on top of completeness
         }
     }
@@ -1454,8 +1647,8 @@ class CraftPlannerV2Test {
     /**
      * The same chain with no stock anywhere forces the recursive bounded search (the linear pass reports
      * infeasible). Without {@link CraftPlannerV2#MAX_OBTAIN_DEPTH} the descent would recurse {@code n}
-     * deep and {@code StackOverflowError}; with it, the descent degrades to a best-effort "missing" plan
-     * (Policy A) and flags {@link CraftPlan#budgetExhausted()} instead of crashing.
+     * deep and {@code StackOverflowError}; with it, only the over-deep branch degrades to a
+     * best-effort "missing" result instead of crashing or poisoning the whole calculation.
      */
     @Test
     void deepRecursiveChainDegradesInsteadOfOverflowing() {
@@ -1471,6 +1664,6 @@ class CraftPlannerV2Test {
         assertTrue(plan.supported());
         assertFalse(plan.feasible());
         assertFalse(plan.missing().isEmpty(), "shortfall reported, not crashed");
-        assertTrue(plan.budgetExhausted(), "depth guard degraded the over-deep descent to best-effort");
+        assertFalse(plan.budgetExhausted(), "depth degradation is branch-local, not a global result flag");
     }
 }

@@ -32,9 +32,12 @@ import java.util.Set;
  *       capacity ({@code stock + craftable}) is preferred, so the planner naturally balances onto the
  *       recipe current stock can actually fulfill (no scarcity metric needed).</li>
  *   <li><b>Bounded backtracking</b>: contended items (more than one recipe) are searched in
- *       capacity order with a {@code trail} for commit/rollback and a <b>per-node visit cap K</b>.
- *       The cap bounds total work to {@code O(K · edges)} — never exponential, never N². When a node's
- *       budget is exhausted it freezes (best-effort commit on its top recipe), a safe degradation.</li>
+ *       capacity order with a {@code trail} for commit/rollback. Each node has a visit cap {@code K};
+ *       after that, that node permanently freezes to its highest-capacity greedy recipe while parents,
+ *       siblings and descendants retain their own independent search budgets. Exhaustion can therefore
+ *       make one node choose a suboptimal route, but never invalidates the whole calculation. Failed
+ *       speculative subtrees are memoized only for the exact node, amount, depth and rollback-restored
+ *       availability state, preventing repeated proof work without reusing a stale inventory result.</li>
  * </ul>
  *
  * <p><b>Soundness (no false positives):</b> the pool is never overdrawn (a draw is capped by what is
@@ -46,12 +49,11 @@ public final class CraftPlannerV2<K> {
 
     /**
      * Default per-node visit cap. It is a safety net, not the workhorse: normal graphs are resolved by
-     * the linear backbone or recover via a handful of backtracks, never approaching this bound. 64 is
-     * generous enough that {@link CraftPlan#budgetExhausted()} stays false on realistic inputs while
-     * still guaranteeing {@code O(64·E)} worst-case work on adversarial contention. Callers may tier it
-     * (e.g. √n on an overloaded CPU).
+     * the linear backbone or recover via a handful of backtracks, never approaching this bound. 256
+     * lets a hot shared node participate in several rounds of parent/fuzzy backtracking before only
+     * that node freezes to its greedy choice.
      */
-    public static final int DEFAULT_VISIT_CAP = 64;
+    public static final int DEFAULT_VISIT_CAP = 256;
 
     /**
      * Maximum number of alternate roots tried for a proven conservative conversion SCC. This is a
@@ -66,8 +68,8 @@ public final class CraftPlannerV2<K> {
      * fully iterative and resolves every feasible, non-contended request without recursing — the
      * recursion is entered only when that backbone reports infeasible or hits contention. To keep a
      * pathologically deep recipe chain from overflowing the calculating thread's stack, descent past this
-     * many levels degrades to "missing" (Policy A) and sets {@link CraftPlan#budgetExhausted()}, exactly
-     * like a visit-budget freeze. 256 levels (~512 stack frames with the paired {@code fire}) is far
+     * many levels degrades only that branch to "missing" (Policy A), allowing its parent to try another
+     * route. 256 levels (~512 stack frames with the paired {@code fire}) is far
      * deeper than any real Minecraft recipe chain yet safe on a default thread stack; overridable via
      * {@code -Dthunderbolt.maxCraftDepth} for unusual {@code -Xss} setups.
      */
@@ -87,6 +89,10 @@ public final class CraftPlannerV2<K> {
     private int depth;
 
     private final Map<K, List<CraftPattern<K>>> patternsByOutput = new HashMap<>();
+    // Canonical, stock-independent material transformation for patterns whose whole downstream tree
+    // can be proven simple and deterministic. Equal ids let one obtain() call search an equivalent
+    // branch once instead of reopening the same dependency tree under a different intermediate key.
+    private final Map<CraftPattern<K>, Integer> materialFootprintByPattern = new IdentityHashMap<>();
     private Map<K, Long> capacity;
 
     // Mutable planning state (all writes go through the trail so a branch can be rolled back).
@@ -106,13 +112,16 @@ public final class CraftPlannerV2<K> {
     private final Map<K, Long> grossDemand = new HashMap<>(); // pre-extraction request totals (bytes)
     private final Map<CraftPattern<K>, Long> firings = new IdentityHashMap<>();
 
-    // Monotonic (never rolled back) — this is what bounds the search.
+    // Node-local search state is monotonic: rollback restores inventory, not knowledge already learned.
     private final Map<K, Integer> visit = new HashMap<>();
+    private final Map<K, CraftPattern<K>> frozenGreedyPattern = new HashMap<>();
+    // Exact failure memo for speculative calls. availabilityState is restored with trail rollback,
+    // so a proof is reused only when node, amount and every availability-affecting map are identical.
+    private final Set<SearchFailure<K>> failedSpeculativeSearches = new HashSet<>();
     private final Deque<Runnable> trail = new ArrayDeque<>();
+    private long availabilityState;
+    private long nextAvailabilityState;
     private int processed;
-
-    // Set once if any node hits the per-node visit cap and falls back to best-effort. Not rolled back.
-    private boolean budgetExhausted;
 
     // Running sum of all unmet (missing) amounts; trail-restored. A search branch is accepted iff it
     // introduces no new missing, so the decision survives nested single-recipe commits.
@@ -174,6 +183,7 @@ public final class CraftPlannerV2<K> {
             order.add(postOrder.get(i));
         }
         this.capacity = capacityFromOrder(order, items.size());
+        indexEquivalentMaterialFootprints(order);
 
         // Returned catalysts must be acquired before the firing's outputs enter the shared pool.
         // The recursive path already has that execution order; the aggregate linear pass does not,
@@ -192,7 +202,7 @@ public final class CraftPlannerV2<K> {
         for (K x : items) {
             stockLeft.put(x, graph.stock(x));
         }
-        obtain(target, amount);
+        obtain(target, amount, true);
         boolean feasible = missing.isEmpty();
         CraftPlan<K> fallback = new CraftPlan<>(true, feasible,
                 new IdentityHashMap<>(firings),
@@ -201,7 +211,7 @@ public final class CraftPlannerV2<K> {
                 new HashMap<>(missing),
                 new HashMap<>(grossDemand),
                 processed,
-                budgetExhausted);
+                false);
         return enforceCycleBootstrap(fallback);
     }
 
@@ -639,6 +649,108 @@ public final class CraftPlannerV2<K> {
         return cap;
     }
 
+    /**
+     * Gives simple deterministic recipe trees a canonical material-transformation id. Intermediate
+     * item names disappear from the shape, so {@code E→C→A1} and {@code E→D→A2} receive the same id,
+     * while exact batch sizes and branching structure remain part of it.
+     *
+     * <p>This is deliberately a proof, not a heuristic. A craftable intermediate with direct stock or
+     * possible dynamic pool credit keeps its own identity, and patterns with returned inputs,
+     * remainders, reusable hosts or byproducts are left unclassified. Those routes still search
+     * normally; only a pair with identical classified ids may skip a repeated failed expansion.
+     */
+    private void indexEquivalentMaterialFootprints(List<K> order) {
+        Set<K> dynamicPoolKeys = new HashSet<>();
+        for (Map.Entry<K, List<CraftPattern<K>>> entry : patternsByOutput.entrySet()) {
+            for (CraftPattern<K> pattern : entry.getValue()) {
+                if (pattern.outputAmount() > 1) {
+                    dynamicPoolKeys.add(pattern.output());
+                }
+                for (CraftOutput<K> output : pattern.byproducts()) {
+                    dynamicPoolKeys.add(output.key());
+                }
+                for (CraftInput<K> input : pattern.inputs()) {
+                    if (input.returned() || input.remainder() != null
+                            || input.reusableStockSource() != null) {
+                        dynamicPoolKeys.add(input.key());
+                        if (input.remainder() != null) {
+                            dynamicPoolKeys.add(input.remainder());
+                        }
+                    }
+                }
+            }
+        }
+
+        FootprintInterner interner = new FootprintInterner();
+        Map<K, Integer> footprintByKey = new HashMap<>();
+        for (int i = order.size() - 1; i >= 0; i--) {
+            K key = order.get(i);
+            List<CraftPattern<K>> patterns = patternsByOutput.getOrDefault(key, List.of());
+            if (patterns.isEmpty()) {
+                footprintByKey.put(key, interner.intern(new MaterialLeaf(key)));
+                continue;
+            }
+
+            Integer common = null;
+            boolean allEquivalent = true;
+            for (CraftPattern<K> pattern : patterns) {
+                Integer footprint = materialFootprint(pattern, footprintByKey, interner);
+                if (footprint != null) {
+                    materialFootprintByPattern.put(pattern, footprint);
+                }
+                if (footprint == null) {
+                    allEquivalent = false;
+                } else if (common == null) {
+                    common = footprint;
+                } else if (!common.equals(footprint)) {
+                    allEquivalent = false;
+                }
+            }
+
+            // Direct stock and dynamic surplus/byproduct credit belong to this concrete intermediate,
+            // not merely to its production tree. Keep its identity when it is used by a parent.
+            if (graph.stock(key) > 0 || dynamicPoolKeys.contains(key)
+                    || !allEquivalent || common == null) {
+                footprintByKey.put(key, interner.intern(new MaterialLeaf(key)));
+            } else {
+                footprintByKey.put(key, common);
+            }
+        }
+    }
+
+    private Integer materialFootprint(
+            CraftPattern<K> pattern,
+            Map<K, Integer> footprintByKey,
+            FootprintInterner interner) {
+        if (!pattern.byproducts().isEmpty()) {
+            return null;
+        }
+
+        Map<Integer, Long> amounts = new HashMap<>();
+        for (CraftInput<K> input : pattern.inputs()) {
+            if (input.returned() || input.remainder() != null
+                    || input.reusableStockSource() != null) {
+                return null;
+            }
+            Integer inputFootprint = footprintByKey.get(input.key());
+            if (inputFootprint == null) {
+                return null;
+            }
+            long previous = amounts.getOrDefault(inputFootprint, 0L);
+            if (Long.MAX_VALUE - previous < input.amount()) {
+                return null; // exact proof only; never merge two different saturated totals
+            }
+            amounts.put(inputFootprint, previous + input.amount());
+        }
+
+        List<MaterialTerm> terms = new ArrayList<>(amounts.size());
+        for (Map.Entry<Integer, Long> entry : amounts.entrySet()) {
+            terms.add(new MaterialTerm(entry.getKey(), entry.getValue()));
+        }
+        terms.sort((left, right) -> Integer.compare(left.footprint(), right.footprint()));
+        return interner.intern(new MaterialRecipe(pattern.outputAmount(), List.copyOf(terms)));
+    }
+
     private long producibleVia(CraftPattern<K> p, Map<K, Long> cap) {
         long bound = Sat.SAT;
         for (CraftInput<K> in : p.inputs()) {
@@ -788,8 +900,13 @@ public final class CraftPlannerV2<K> {
 
     // ---- core: obtain d units of x, consuming from pool/stock, crafting the rest ----------------
 
-    /** @return the amount of {@code x} that could NOT be obtained (also recorded in {@link #missing}). */
-    private long obtain(K x, long d) {
+    /**
+     * @param commitFailure whether an exhausted route must commit its greedy partial plan and concrete
+     *                      missing leaves. Speculative parents pass {@code false}: they only need a
+     *                      non-zero result before rolling the branch back.
+     * @return the amount of {@code x} that could not be obtained
+     */
+    private long obtain(K x, long d, boolean commitFailure) {
         if (d <= 0) {
             return 0;
         }
@@ -800,46 +917,94 @@ public final class CraftPlannerV2<K> {
             return 0;
         }
 
-        // Depth guard: refuse to recurse past MAX_OBTAIN_DEPTH. We already drew stock/byproducts above,
-        // so only the un-stocked remainder is reported missing — turning a would-be StackOverflowError
-        // into the same best-effort "missing" degradation a visit-budget freeze produces.
+        // This is a branch-local safety guard. Report only the unstocked remainder as missing so the
+        // parent may roll this branch back and try another route; never invalidate unrelated nodes.
         if (depth >= MAX_OBTAIN_DEPTH) {
-            addMissing(x, d);
-            budgetExhausted = true;
+            if (commitFailure) addMissing(x, d);
             return d;
         }
 
         List<CraftPattern<K>> ps = patternsByOutput.getOrDefault(x, List.of());
         if (ps.isEmpty()) {
-            addMissing(x, d);
+            if (commitFailure) addMissing(x, d);
             return d;
         }
 
-        processed++;
+        // Depth is part of the proof identity: a route rejected only because it reached the stack
+        // guard must remain eligible when the same node is later reached through a shorter parent path.
+        SearchFailure<K> failureKey = new SearchFailure<>(x, d, availabilityState, depth);
+        if (!commitFailure && failedSpeculativeSearches.contains(failureKey)) {
+            return d;
+        }
+
+        if (processed < Integer.MAX_VALUE) {
+            processed++;
+        }
+
+        CraftPattern<K> frozen = frozenGreedyPattern.get(x);
+        if (frozen != null) {
+            long unmet = fire(x, frozen, d, !commitFailure);
+            if (!commitFailure && unmet > 0) failedSpeculativeSearches.add(failureKey);
+            return unmet;
+        }
+
         int v = visit.getOrDefault(x, 0);
+        if (v >= visitCap) {
+            CraftPattern<K> greedy = ps.size() == 1 ? ps.get(0) : byCapacityDesc(ps).get(0);
+            frozenGreedyPattern.put(x, greedy);
+            long unmet = fire(x, greedy, d, !commitFailure);
+            if (!commitFailure && unmet > 0) failedSpeculativeSearches.add(failureKey);
+            return unmet;
+        }
         visit.put(x, v + 1);
 
-        // Single recipe, or budget exhausted: no search — best-effort commit (deficits surface as
-        // missing at the leaves). Freezing on exhaustion is the safe degradation.
-        if (ps.size() == 1 || v >= visitCap) {
-            if (v >= visitCap) {
-                budgetExhausted = true; // the per-node cap, not a clean decision, ended the search here
-            }
-            return commitBestEffort(ps, x, d);
+        // A single recipe needs no alternate search, but its descendants may still resolve their own
+        // contention normally until one of them reaches its local cap.
+        if (ps.size() == 1) {
+            long unmet = fire(x, ps.get(0), d, !commitFailure);
+            if (!commitFailure && unmet > 0) failedSpeculativeSearches.add(failureKey);
+            return unmet;
         }
 
         List<CraftPattern<K>> ordered = byCapacityDesc(ps);
-        for (CraftPattern<K> r : ordered) {
+        List<CraftPattern<K>> distinctBranches = distinctMaterialBranches(ordered);
+        if (distinctBranches.size() == 1) {
+            // There is no materially different alternative to discover. Commit the representative
+            // once instead of speculatively expanding it, rolling it back, and expanding it again.
+            long unmet = fire(x, distinctBranches.get(0), d, !commitFailure);
+            if (!commitFailure && unmet > 0) failedSpeculativeSearches.add(failureKey);
+            return unmet;
+        }
+        for (CraftPattern<K> r : distinctBranches) {
             int mark = trail.size();
             long beforeMissing = missingTotal;
             long unmet = fire(x, r, d, true);
-            if (missingTotal == beforeMissing) {
+            if (unmet == 0 && missingTotal == beforeMissing) {
                 return unmet; // this recipe satisfied d without introducing any shortfall
             }
             rollback(mark); // restores pool/firings/missing(+total); try the next recipe
         }
-        // No recipe fully worked within budget: commit the highest-capacity one (records missing).
-        return commitBestEffort(ordered, x, d);
+        if (!commitFailure) {
+            failedSpeculativeSearches.add(failureKey);
+            return d;
+        }
+        // Root/final route: commit the highest-capacity one and record its concrete missing leaves.
+        return commitBestEffort(distinctBranches, x, d);
+    }
+
+    private List<CraftPattern<K>> distinctMaterialBranches(List<CraftPattern<K>> ordered) {
+        if (ordered.size() < 2 || materialFootprintByPattern.isEmpty()) {
+            return ordered;
+        }
+        Set<Integer> seen = new HashSet<>();
+        List<CraftPattern<K>> distinct = new ArrayList<>(ordered.size());
+        for (CraftPattern<K> pattern : ordered) {
+            Integer footprint = materialFootprintByPattern.get(pattern);
+            if (footprint == null || seen.add(footprint)) {
+                distinct.add(pattern);
+            }
+        }
+        return distinct;
     }
 
     private long commitBestEffort(List<CraftPattern<K>> ps, K x, long d) {
@@ -866,7 +1031,7 @@ public final class CraftPlannerV2<K> {
             long unmet;
             ReusableSeedAcquisition reusableAcquisition = null;
             if (in.reusableStockSource() != null) {
-                reusableAcquisition = obtainReusableSeed(r, in, amt);
+                reusableAcquisition = obtainReusableSeed(r, in, amt, search);
                 unmet = reusableAcquisition.unmet();
             } else if (isSelfReturnedSeed(r, in)) {
                 long obtained = drawReservedSelfSeed(in.key(), amt);
@@ -877,11 +1042,11 @@ public final class CraftPlannerV2<K> {
                 unmet = stillNeeded > 0
                         ? craftSelfSeedFromAlternative(in.key(), stillNeeded, r)
                         : 0L;
-                if (unmet > 0) addMissing(in.key(), unmet);
+                if (!search && unmet > 0) addMissing(in.key(), unmet);
             } else {
                 depth++;
                 try {
-                    unmet = obtain(in.key(), amt);
+                    unmet = obtain(in.key(), amt, !search);
                 } finally {
                     depth--;
                 }
@@ -910,7 +1075,7 @@ public final class CraftPlannerV2<K> {
                     }
                 }
             }
-            if (search && missingTotal > entryMissing) {
+            if (search && (inputUnmet > 0 || missingTotal > entryMissing)) {
                 return inputUnmet; // a shortfall appeared; bail early, the caller will roll back
             }
         }
@@ -934,7 +1099,7 @@ public final class CraftPlannerV2<K> {
      * network stock/crafting. Ordinary recipes can never see either private layer.
      */
     private ReusableSeedAcquisition obtainReusableSeed(
-            CraftPattern<K> pattern, CraftInput<K> input, long amount) {
+            CraftPattern<K> pattern, CraftInput<K> input, long amount, boolean search) {
         var source = input.reusableStockSource();
         if (source == null || amount <= 0) {
             return new ReusableSeedAcquisition(Math.max(0L, amount), 0L, 0L);
@@ -988,7 +1153,7 @@ public final class CraftPlannerV2<K> {
         } else {
             depth++;
             try {
-                unmet = obtain(input.key(), remaining);
+                unmet = obtain(input.key(), remaining, !search);
             } finally {
                 depth--;
             }
@@ -1156,8 +1321,8 @@ public final class CraftPlannerV2<K> {
         for (CraftPattern<K> alternative : alternatives) {
             int mark = trail.size();
             long beforeMissing = missingTotal;
-            fire(key, alternative, amount, true);
-            if (missingTotal == beforeMissing) return 0L;
+            long unmet = fire(key, alternative, amount, true);
+            if (unmet == 0 && missingTotal == beforeMissing) return 0L;
             rollback(mark);
         }
         return amount;
@@ -1227,18 +1392,36 @@ public final class CraftPlannerV2<K> {
 
     private <T> void put(Map<T, Long> m, T k, long newVal) {
         Long old = m.get(k);
+        long oldAvailabilityState = availabilityState;
+        boolean tracksAvailability = tracksAvailability(m);
         trail.push(() -> {
             if (old == null) {
                 m.remove(k);
             } else {
                 m.put(k, old);
             }
+            if (tracksAvailability) {
+                availabilityState = oldAvailabilityState;
+            }
         });
+        if (tracksAvailability) {
+            availabilityState = ++nextAvailabilityState;
+        }
         if (newVal == 0) {
             m.remove(k);
         } else {
             m.put(k, newVal);
         }
+    }
+
+    private boolean tracksAvailability(Map<?, Long> map) {
+        return map == bpPool
+                || map == stockLeft
+                || map == reservedSelfSeeds
+                || map == reusableBorrowedDemand
+                || map == reusablePrivatePool
+                || map == reusablePool
+                || map == pinnedExactReusableStock;
     }
 
     private <T> void bump(Map<T, Long> m, T k, long delta) {
@@ -1273,6 +1456,32 @@ public final class CraftPlannerV2<K> {
     private void rollback(int mark) {
         while (trail.size() > mark) {
             trail.pop().run();
+        }
+    }
+
+    private record MaterialLeaf(Object key) {
+    }
+
+    private record MaterialTerm(int footprint, long amount) {
+    }
+
+    private record MaterialRecipe(long outputAmount, List<MaterialTerm> inputs) {
+    }
+
+    private record SearchFailure<K>(K key, long amount, long availabilityState, int depth) {
+    }
+
+    private static final class FootprintInterner {
+        private final Map<Object, Integer> ids = new HashMap<>();
+
+        private int intern(Object shape) {
+            Integer existing = ids.get(shape);
+            if (existing != null) {
+                return existing;
+            }
+            int id = ids.size() + 1;
+            ids.put(shape, id);
+            return id;
         }
     }
 }

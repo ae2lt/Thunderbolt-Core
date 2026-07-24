@@ -72,8 +72,9 @@ import com.moakiee.thunderbolt.ae2.timewheel.ReusableSeedPattern;
  *       byproducts and multiple recipe choices.</li>
  *   <li><b>Infeasible</b>: best-effort, never declined (Policy A). {@code simulate=false}→null,
  *       {@code simulate=true}→partial plan with missing items. We do NOT fall back to AE2's exhaustive
- *       simulator even if the bounded search hit its per-node cap — that slow path is exactly what this
- *       engine replaces; the per-node cap keeps work bounded and our result is mass-balanced/safe.</li>
+ *       simulator even if one contended node hit its local cap — that slow path is exactly what this
+ *       engine replaces. Only that node freezes to one greedy recipe; the rest of the plan continues
+ *       searching normally.</li>
  * </ul>
  *
  * <p><b>Execution-time contract (fuzzy substitution).</b> For a hard-fuzzy slot the planner commits to a
@@ -189,7 +190,6 @@ public final class FastCraftingPlanner {
         }
 
         CraftPlan<AEKey> plan = CraftPlannerV2.plan(builder.build(), output, amount);
-
         boolean multi = multiplePaths[0];
         // Emittable shortfalls are supplied by emitters, not crafted, so they don't make a plan
         // infeasible — only a non-emittable shortfall does.
@@ -201,10 +201,10 @@ public final class FastCraftingPlanner {
         }
         // Infeasible at this amount. Best-effort policy (Policy A): we never fall back to AE2's
         // exhaustive simulator for performance — that is the slow path this engine exists to avoid.
-        // Cycles are broken in-engine and the per-node visit cap bounds the search, so the result is
-        // both fast and safe: a feasible plan is always mass-balanced, and an infeasible one reports
-        // the shortfall we found (even if the bounded search hit its cap, we trust our best effort
-        // rather than risk hanging the calculator).
+        // Cycles are broken in-engine and each hot node eventually freezes to one greedy recipe, so
+        // the result remains bounded without converting a local search compromise into a whole-plan
+        // failure. A feasible plan is always mass-balanced; an infeasible one reports the shortfall
+        // found by the selected local routes.
         if (!simulate) {
             return FastAttempt.handled(null); // this amount can't be made within our bounded search
         }
