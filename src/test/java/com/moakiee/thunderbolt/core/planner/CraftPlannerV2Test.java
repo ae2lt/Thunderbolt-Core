@@ -1200,6 +1200,53 @@ class CraftPlannerV2Test {
     }
 
     @Test
+    void downstreamOutputCanConvertAnotherHostStateIntoItsMissingSeed() {
+        var source = new ReusableStockSource("tianshu", "certus_loop");
+        CraftPattern<String> crystalToDust = new CraftPattern<>(
+                "dust", 64, List.of(CraftInput.of("crystal", 64)), "crush_certus");
+        CraftPattern<String> chargeCrystal = new CraftPattern<>(
+                "charged_crystal", 64,
+                List.of(
+                        CraftInput.of("crystal", 64),
+                        CraftInput.of("water", 1_000)),
+                "charge_certus");
+        CraftPattern<String> contractedGain = new CraftPattern<>(
+                "crystal", 128,
+                List.of(
+                        CraftInput.returnedFrom("charged_crystal", 64, source),
+                        CraftInput.returnedFrom("dust", 64, source),
+                        CraftInput.of("water", 3_000)),
+                "contracted_certus_gain");
+        CraftGraph<String> graph = CraftGraph.<String>builder()
+                .pattern(crystalToDust)
+                .pattern(chargeCrystal)
+                .pattern(contractedGain)
+                .stock("water", 1_000_000)
+                .reusableStock("tianshu", "charged_crystal", 160)
+                .reusableStock("tianshu", "crystal", 192)
+                .reusableStockRoute(source, "charged_crystal", List.of("charged_crystal"))
+                .reusableStockRoute(source, "dust", List.of("dust"))
+                .build();
+
+        CraftPlan<String> plan = CraftPlannerV2.plan(graph, "charged_crystal", 19_000);
+
+        assertTrue(plan.feasible());
+        assertEquals(1L, firingsOf(plan, crystalToDust));
+        assertEquals(297L, firingsOf(plan, chargeCrystal));
+        assertEquals(149L, firingsOf(plan, contractedGain));
+        assertEquals(744_000L, plan.usedStock().get("water"));
+        assertFalse(plan.usedStock().containsKey("crystal"),
+                "private bootstrap stock must not be charged to ordinary network inventory");
+        assertEquals(128L, plan.usedReusableStock().values().stream()
+                .mapToLong(Long::longValue).sum());
+        assertTrue(plan.usedReusableStock().keySet().stream().anyMatch(
+                usage -> usage.actualKey().equals("crystal")
+                        && usage.routingScope() instanceof ReusableBootstrapRoute<?> route
+                        && route.returnedSeedKey().equals("dust")));
+        assertTrue(plan.missing().isEmpty());
+    }
+
+    @Test
     void alternateLoopStateCanBeCraftedIntoTheDefaultSeedBeforeStartup() {
         CraftPattern<String> bFromA = new CraftPattern<>(
                 "B", 1, List.of(CraftInput.of("A", 1)), "A_to_B");

@@ -197,11 +197,15 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
         boolean hostShortfall = false;
         for (var allocation : hostSeedAllocations) {
             long requested = allocation.amount();
+            AEKey extractionKey = allocation.bootstrap()
+                    ? allocation.actualKey() : allocation.plannedKey();
             var extractedVariants = cpu.getHost().extractReusableSeedVariants(
-                    allocation.plannedKey(),
+                    extractionKey,
                     requested,
-                    actual -> loopPlan != null
-                            && loopPlan.acceptsReusableSeedVariant(allocation, actual),
+                    actual -> allocation.bootstrap()
+                            ? allocation.actualKey().equals(actual)
+                            : loopPlan != null
+                                    && loopPlan.acceptsReusableSeedVariant(allocation, actual),
                     Actionable.MODULATE);
             var offered = new KeyCounter();
             long offeredAmount = 0L;
@@ -225,9 +229,11 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
                     }
                 }
             }
-            var acceptedVariants = loopSeedLedgers.assignHostVariantsForGroup(
-                    allocation.reusableSeedGroupId(), allocation.sharedPool(),
-                    allocation.plannedKey(), offered);
+            var acceptedVariants = allocation.bootstrap()
+                    ? offered
+                    : loopSeedLedgers.assignHostVariantsForGroup(
+                            allocation.reusableSeedGroupId(), allocation.sharedPool(),
+                            allocation.plannedKey(), offered);
             long extracted = 0L;
             for (var actual : offered) {
                 long accepted = Math.min(
@@ -251,7 +257,9 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
                 }
             }
             if (extracted < requested) {
-                adjustedUsedItems.add(allocation.plannedKey(), requested - extracted);
+                adjustedUsedItems.add(
+                        allocation.bootstrap() ? allocation.actualKey() : allocation.plannedKey(),
+                        requested - extracted);
                 hostShortfall = true;
             }
         }

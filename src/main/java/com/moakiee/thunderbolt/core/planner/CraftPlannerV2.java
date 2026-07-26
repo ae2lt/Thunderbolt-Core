@@ -94,6 +94,9 @@ public final class CraftPlannerV2<K> {
             new IdentityHashMap<>();
     private final Map<FeedbackSeedBootstrap<K>, Long> reservedFeedbackSeedOutputs =
             new HashMap<>();
+    /** Portion of each held feedback-output state borrowed from its private reusable-seed host. */
+    private final Map<FeedbackSeedBootstrap<K>, Long> reservedFeedbackSeedHostOutputs =
+            new HashMap<>();
     private boolean requiresSeedOrderedPlanning;
 
     // Current recursion depth of the bounded fallback search (obtain/fire). Guards against stack overflow
@@ -622,7 +625,7 @@ public final class CraftPlannerV2<K> {
                 if (in.returned() && in.uses() == CraftInput.INFINITE_USES) {
                     requiresSeedOrderedPlanning = true;
                 }
-                if (isSelfReturnedSeed(p, in)) continue;
+                if (isSelfReturnedSeed(p, in) || isHostBackedReusableSeed(in)) continue;
                 Integer col = color.get(in.key());
                 if (col != null && col == GRAY) { // input is an ancestor being made -> back-edge, cut it
                     backEdges.add(in);
@@ -652,6 +655,7 @@ public final class CraftPlannerV2<K> {
             usable.add(p);
             for (CraftInput<K> in : p.inputs()) {
                 if (isSelfReturnedSeed(p, in)
+                        || isHostBackedReusableSeed(in)
                         || isFeedbackSeed(p, in)
                         || isFeedbackConverterInput(p, in)) {
                     continue;
@@ -662,6 +666,17 @@ public final class CraftPlannerV2<K> {
         }
         patternsByOutput.put(x, usable);
         return new Frame<>(x, new ArrayList<>(children));
+    }
+
+    /**
+     * A complete private-host seed is already an acyclic startup source. It must not be treated as a
+     * graph edge back to an ancestor merely because the same state is also craftable downstream.
+     */
+    private boolean isHostBackedReusableSeed(CraftInput<K> input) {
+        return input.returned()
+                && input.uses() == CraftInput.INFINITE_USES
+                && input.reusableStockSource() != null
+                && graph.reusableStock(input.reusableStockSource(), input.key()) >= input.amount();
     }
 
     private void addFeedbackSeedBootstrap(FeedbackSeedBootstrap<K> bootstrap) {
@@ -900,14 +915,21 @@ public final class CraftPlannerV2<K> {
         List<FeedbackSeedBootstrap<K>> bootstraps = feedbackSeedBootstraps.get(pattern);
         if (bootstraps == null || bootstraps.isEmpty()) return false;
         long requiredOutput = 0L;
+        long availableOutput = graph.stock(pattern.output());
+        Set<Object> countedStorageScopes = new HashSet<>();
         for (FeedbackSeedBootstrap<K> bootstrap : bootstraps) {
             CraftInput<K> seed = bootstrap.seedInput();
             long hostAvailable = graph.reusableStock(seed.reusableStockSource(), seed.key());
             long seedShortfall = Math.max(0L, seed.amount() - hostAvailable);
             requiredOutput = Sat.add(
                     requiredOutput, bootstrap.outputUnitsFor(seedShortfall));
+            Object storageScope = seed.reusableStockSource().storageScope();
+            if (countedStorageScopes.add(storageScope)) {
+                availableOutput = Sat.add(
+                        availableOutput, graph.reusableStock(storageScope, pattern.output()));
+            }
         }
-        return graph.stock(pattern.output()) >= requiredOutput;
+        return availableOutput >= requiredOutput;
     }
 
     // ---- linear backbone: one topological aggregation pass, each item resolved once -------------
@@ -1557,15 +1579,32 @@ public final class CraftPlannerV2<K> {
             }
         }
         if (totalAdditional <= 0) return;
+        int mark = trail.size();
         long availableStock = get(stockLeft, key);
-        if (availableStock < totalAdditional) return;
-
-        put(stockLeft, key, availableStock - totalAdditional);
         for (Map.Entry<FeedbackSeedBootstrap<K>, Long> entry : additionalBySeed.entrySet()) {
             FeedbackSeedBootstrap<K> bootstrap = entry.getKey();
+            long additional = entry.getValue();
+            long ordinary = Math.min(additional, availableStock);
+            availableStock -= ordinary;
+            long hostNeeded = additional - ordinary;
+            long hostBorrowed = 0L;
+            if (hostNeeded > 0) {
+                var borrowed = borrowReusableStock(
+                        bootstrap.bootstrapSource(), key, hostNeeded);
+                hostBorrowed = borrowed.amount();
+                if (hostBorrowed < hostNeeded) {
+                    rollback(mark);
+                    return;
+                }
+            }
             put(reservedFeedbackSeedOutputs, bootstrap,
-                    Sat.add(get(reservedFeedbackSeedOutputs, bootstrap), entry.getValue()));
+                    Sat.add(get(reservedFeedbackSeedOutputs, bootstrap), additional));
+            if (hostBorrowed > 0) {
+                put(reservedFeedbackSeedHostOutputs, bootstrap,
+                        Sat.add(get(reservedFeedbackSeedHostOutputs, bootstrap), hostBorrowed));
+            }
         }
+        put(stockLeft, key, availableStock);
     }
 
     /**
@@ -1584,7 +1623,15 @@ public final class CraftPlannerV2<K> {
         if (requiredOutput > reserved) return 0L;
 
         put(reservedFeedbackSeedOutputs, bootstrap, reserved - requiredOutput);
-        bump(usedStock, pattern.output(), requiredOutput);
+        long reservedFromHost = get(reservedFeedbackSeedHostOutputs, bootstrap);
+        long fromHost = Math.min(requiredOutput, reservedFromHost);
+        if (fromHost > 0) {
+            put(reservedFeedbackSeedHostOutputs, bootstrap, reservedFromHost - fromHost);
+        }
+        long fromOrdinaryStock = requiredOutput - fromHost;
+        if (fromOrdinaryStock > 0) {
+            bump(usedStock, pattern.output(), fromOrdinaryStock);
+        }
         bump(grossDemand, pattern.output(), requiredOutput);
         bumpFiring(bootstrap.converter(), firings);
 
@@ -1657,6 +1704,7 @@ public final class CraftPlannerV2<K> {
                 || map == stockLeft
                 || map == reservedSelfSeeds
                 || map == reservedFeedbackSeedOutputs
+                || map == reservedFeedbackSeedHostOutputs
                 || map == reusableBorrowedDemand
                 || map == reusablePrivatePool
                 || map == reusablePool
@@ -1719,6 +1767,14 @@ public final class CraftPlannerV2<K> {
         long outputUnitsFor(long seedAmount) {
             long firings = Sat.ceilDiv(seedAmount, converter.outputAmount());
             return converterInput.unitsFor(firings);
+        }
+
+        ReusableStockSource bootstrapSource() {
+            ReusableStockSource owner = seedInput.reusableStockSource();
+            return new ReusableStockSource(
+                    owner.storageScope(),
+                    owner.poolScope(),
+                    new ReusableBootstrapRoute<>(owner.routingScope(), seedInput.key()));
         }
     }
 
