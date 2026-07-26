@@ -43,6 +43,12 @@ public final class ExecuteLoopPattern implements IPatternDetails, IProviderLooku
     private final Map<UUID, KeyCounter> outputSeedCredits;
     private final Map<UUID, KeyCounter> sharedOutputSeedCredits;
     private final IInput[] executionInputs;
+    // All inputs below are immutable, so every per-slot / per-planned-key query is precomputed
+    // once here instead of re-walking the delegate chain on each hot-path call.
+    private final Map<Integer, AEKey> plannedSlots;
+    private final boolean[] fuzzyInputs;
+    private final boolean[] seedSlots;
+    private final Map<AEKey, SeedVariantRule> plannedSeedRules;
 
     public ExecuteLoopPattern(
             IPatternDetails delegate,
@@ -72,7 +78,46 @@ public final class ExecuteLoopPattern implements IPatternDetails, IProviderLooku
         this.inputSeed = copy(inputSeed);
         this.outputSeedCredits = copyCredits(outputSeedCredits);
         this.sharedOutputSeedCredits = copyCredits(sharedOutputSeedCredits);
-        this.executionInputs = constrainRepeatedPlannedSeedSlots(delegate.getInputs());
+        this.plannedSlots = snapshotPlannedSeedSlots(delegate);
+        var sourceInputs = delegate.getInputs();
+        this.fuzzyInputs = computeFuzzyInputs(delegate, sourceInputs.length);
+        this.executionInputs = constrainRepeatedPlannedSeedSlots(sourceInputs);
+        this.seedSlots = computeSeedSlots();
+        this.plannedSeedRules = computePlannedSeedRules();
+    }
+
+    private static Map<Integer, AEKey> snapshotPlannedSeedSlots(IPatternDetails delegate) {
+        if (!(delegate instanceof IPlannedSeedSlotPattern mapped)) return Map.of();
+        var source = mapped.plannedSeedInputSlots();
+        if (source == null || source.isEmpty()) return Map.of();
+        return Collections.unmodifiableMap(new LinkedHashMap<>(source));
+    }
+
+    private static boolean[] computeFuzzyInputs(IPatternDetails delegate, int slotCount) {
+        var result = new boolean[slotCount];
+        if (CraftingPatternDelegates.forProviderLookup(delegate)
+                instanceof OverloadedProviderOnlyPatternDetails overload) {
+            for (int slot = 0; slot < slotCount; slot++) {
+                result[slot] = overload.isFuzzyInput(slot);
+            }
+        }
+        return result;
+    }
+
+    private boolean[] computeSeedSlots() {
+        var result = new boolean[executionInputs.length];
+        for (int slot = 0; slot < result.length; slot++) {
+            result[slot] = computeIsSeedSlot(slot);
+        }
+        return result;
+    }
+
+    private Map<AEKey, SeedVariantRule> computePlannedSeedRules() {
+        var result = new LinkedHashMap<AEKey, SeedVariantRule>();
+        for (var planned : inputSeed) {
+            result.put(planned.getKey(), computeSeedVariantRule(planned.getKey()));
+        }
+        return Collections.unmodifiableMap(result);
     }
 
     public IPatternDetails delegate() { return delegate; }
@@ -141,6 +186,12 @@ public final class ExecuteLoopPattern implements IPatternDetails, IProviderLooku
     /** Serializable acceptance rule for one logical reusable input. */
     public SeedVariantRule seedVariantRule(AEKey planned) {
         if (planned == null) return new SeedVariantRule(Set.of(), Set.of());
+        var cached = plannedSeedRules.get(planned);
+        if (cached != null) return cached;
+        return computeSeedVariantRule(planned);
+    }
+
+    private SeedVariantRule computeSeedVariantRule(AEKey planned) {
         SeedVariantRule combined = null;
         var inputs = executionInputs;
         var plannedSlots = plannedSeedInputSlots();
@@ -297,6 +348,10 @@ public final class ExecuteLoopPattern implements IPatternDetails, IProviderLooku
     }
 
     private boolean isSeedSlot(int slot) {
+        return slot >= 0 && slot < seedSlots.length && seedSlots[slot];
+    }
+
+    private boolean computeIsSeedSlot(int slot) {
         var inputs = executionInputs;
         if (slot < 0 || slot >= inputs.length) return false;
         var plannedSlots = plannedSeedInputSlots();
@@ -315,9 +370,7 @@ public final class ExecuteLoopPattern implements IPatternDetails, IProviderLooku
     }
 
     private boolean isFuzzyInput(int slot) {
-        var providerPattern = CraftingPatternDelegates.forProviderLookup(delegate);
-        return providerPattern instanceof OverloadedProviderOnlyPatternDetails overload
-                && overload.isFuzzyInput(slot);
+        return slot >= 0 && slot < fuzzyInputs.length && fuzzyInputs[slot];
     }
 
     private AEKey plannedSeedForSlot(
@@ -362,8 +415,7 @@ public final class ExecuteLoopPattern implements IPatternDetails, IProviderLooku
     }
 
     private Map<Integer, AEKey> plannedSeedInputSlots() {
-        return delegate instanceof IPlannedSeedSlotPattern mapped
-                ? mapped.plannedSeedInputSlots() : Map.of();
+        return plannedSlots;
     }
 
     /**
