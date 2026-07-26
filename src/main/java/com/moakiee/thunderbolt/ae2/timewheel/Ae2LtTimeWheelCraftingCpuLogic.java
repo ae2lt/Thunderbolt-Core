@@ -101,6 +101,7 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
     private static final String NBT_TASKS = "tasks";
     private static final String NBT_SUSPENDED = "suspended";
     private static final String NBT_SOFT_CANCELLING = "softCancelling";
+    private static final String NBT_CLOSED_LOOP_JOB = "closedLoopJob";
     private static final String NBT_CRAFTING_PROGRESS = "#craftingProgress";
     private static final String NBT_INPUT_SEED = "#inputSeed";
     private static final String NBT_INITIAL_SEED = "#initialSeed";
@@ -1061,7 +1062,12 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
         // Any deterministic output beyond both the requested final amount and the one retained seed
         // is a normal byproduct/net surplus and belongs in CPU inventory for ordinary return to ME.
         if (tail > 0) {
-            if (type == Actionable.MODULATE) inventory.insert(what, tail, Actionable.MODULATE);
+            if (type == Actionable.MODULATE) {
+                inventory.insert(what, tail, Actionable.MODULATE);
+                // Tasks parked on this exact key can consume CPU inventory; without a wake they
+                // wait out the full parked-task safety delay.
+                wakeSchedulerForReturnedInput(what);
+            }
             accepted += tail;
         }
 
@@ -2878,13 +2884,23 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
             job.remainingAmount = data.getLong(NBT_REMAINING_AMOUNT);
             job.suspended = data.getBoolean(NBT_SUSPENDED);
             job.softCancelling = data.getBoolean(NBT_SOFT_CANCELLING);
-            job.closedLoopJob = job.softCancelling;
+            job.closedLoopJob = data.getBoolean(NBT_CLOSED_LOOP_JOB) || job.softCancelling;
             job.waitingFor.readFromNBT(data.getList(NBT_WAITING_FOR, Tag.TAG_COMPOUND), registries);
             job.rebuildWaitingKeys();
             job.tasks.clear();
             job.pendingOutputs.clear();
             job.readTasks(data.getList(NBT_TASKS, Tag.TAG_COMPOUND), registries, cpu.getLevel());
             job.rebuildPendingOutputs();
+            if (!job.closedLoopJob) {
+                // Saves from before the closedLoopJob tag lack the flag for running loop jobs;
+                // loop tasks only ever come from a closed-loop macro, so infer it from them.
+                for (var details : job.tasks.keySet()) {
+                    if (details instanceof ExecuteLoopPattern) {
+                        job.closedLoopJob = true;
+                        break;
+                    }
+                }
+            }
             return job;
         }
 
@@ -3070,6 +3086,7 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
             }
             data.putBoolean(NBT_SUSPENDED, suspended);
             data.putBoolean(NBT_SOFT_CANCELLING, softCancelling);
+            data.putBoolean(NBT_CLOSED_LOOP_JOB, closedLoopJob);
             return data;
         }
 
