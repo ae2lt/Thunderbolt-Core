@@ -699,7 +699,7 @@ public final class CraftPlannerV2<K> {
     /**
      * Proves the only feedback shape handled inside the ordinary planner: a contracted loop pattern
      * with reusable seed {@code B} produces {@code A}, while an already-kept ordinary pattern converts
-     * only {@code A} back into {@code B}. This does not admit a general SCC; it merely records the
+     * {@code A} back into {@code B}. This does not admit a general SCC; it merely records the
      * executable one-step bootstrap that the target-first DAG cut would otherwise hide.
      */
     private FeedbackSeedBootstrap<K> directFeedbackSeedBootstrap(
@@ -714,14 +714,9 @@ public final class CraftPlannerV2<K> {
         CraftInput<K> converterInput = null;
         for (CraftPattern<K> candidate
                 : patternsByOutput.getOrDefault(seedInput.key(), List.of())) {
-            if (!candidate.byproducts().isEmpty() || candidate.inputs().size() != 1) continue;
-            CraftInput<K> input = candidate.inputs().get(0);
-            if (!input.key().equals(loopPattern.output())
-                    || input.returned()
-                    || input.remainder() != null
-                    || input.reusableStockSource() != null) {
-                continue;
-            }
+            CraftInput<K> input = feedbackConverterInput(
+                    candidate, loopPattern.output(), seedInput.key());
+            if (input == null) continue;
             converter = candidate;
             converterInput = input;
             break;
@@ -739,28 +734,48 @@ public final class CraftPlannerV2<K> {
      */
     private FeedbackSeedBootstrap<K> feedbackSeedBootstrapFromConverter(
             CraftPattern<K> converter, CraftInput<K> converterInput) {
-        if (!converter.byproducts().isEmpty()
-                || converter.inputs().size() != 1
-                || converter.inputs().get(0) != converterInput
-                || converterInput.returned()
-                || converterInput.remainder() != null
-                || converterInput.reusableStockSource() != null) {
-            return null;
-        }
-
         for (CraftPattern<K> loopPattern
                 : patternsByOutput.getOrDefault(converterInput.key(), List.of())) {
             for (CraftInput<K> seedInput : loopPattern.inputs()) {
                 if (seedInput.key().equals(converter.output())
                         && seedInput.returned()
                         && seedInput.uses() == CraftInput.INFINITE_USES
-                        && seedInput.reusableStockSource() != null) {
+                        && seedInput.reusableStockSource() != null
+                        && feedbackConverterInput(
+                                converter, loopPattern.output(), seedInput.key())
+                                == converterInput) {
                     return new FeedbackSeedBootstrap<>(
                             loopPattern, seedInput, converter, converterInput);
                 }
             }
         }
         return null;
+    }
+
+    /**
+     * The single loop-state input of a candidate bootstrap converter, or null when the candidate
+     * cannot serve as one. Exactly one ordinary input consumes the loop's output state; every other
+     * input must be an ordinary material from outside the cycle (e.g. the reaction chamber's water),
+     * obtained normally when the bootstrap fires. Byproducts stay excluded so the converter's only
+     * effect on the cycle is the state conversion itself.
+     */
+    private CraftInput<K> feedbackConverterInput(
+            CraftPattern<K> candidate, K loopOutput, K seedKey) {
+        if (!candidate.byproducts().isEmpty()) return null;
+        CraftInput<K> loopInput = null;
+        for (CraftInput<K> input : candidate.inputs()) {
+            if (input.returned() || input.remainder() != null
+                    || input.reusableStockSource() != null) {
+                return null;
+            }
+            if (input.key().equals(loopOutput)) {
+                if (loopInput != null) return null;
+                loopInput = input;
+            } else if (input.key().equals(seedKey)) {
+                return null;
+            }
+        }
+        return loopInput;
     }
 
     /** cap[X] = stock + max recipe-producible (reverse-topo, byproducts ignored = optimistic upper bound). */
@@ -1625,6 +1640,26 @@ public final class CraftPlannerV2<K> {
         long requiredOutput = bootstrap.converterInput().unitsFor(firings);
         long reserved = get(reservedFeedbackSeedOutputs, bootstrap);
         if (requiredOutput > reserved) return 0L;
+
+        // Auxiliary converter inputs (e.g. the reaction chamber's water) are ordinary materials
+        // from outside the cycle; obtain them for the bootstrap firings before committing, and
+        // abandon the bootstrap cleanly when any of them cannot be covered.
+        int mark = trail.size();
+        long beforeMissing = missingTotal;
+        for (CraftInput<K> auxiliary : bootstrap.converter().inputs()) {
+            if (auxiliary == bootstrap.converterInput()) continue;
+            long unmet;
+            depth++;
+            try {
+                unmet = obtain(auxiliary.key(), auxiliary.unitsFor(firings), false);
+            } finally {
+                depth--;
+            }
+            if (unmet > 0 || missingTotal > beforeMissing) {
+                rollback(mark);
+                return 0L;
+            }
+        }
 
         put(reservedFeedbackSeedOutputs, bootstrap, reserved - requiredOutput);
         long reservedFromHost = get(reservedFeedbackSeedHostOutputs, bootstrap);

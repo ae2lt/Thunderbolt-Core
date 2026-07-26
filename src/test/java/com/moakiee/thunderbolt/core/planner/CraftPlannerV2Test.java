@@ -1246,6 +1246,114 @@ class CraftPlannerV2Test {
         assertTrue(plan.missing().isEmpty());
     }
 
+    /**
+     * The AdvancedAE reaction-chamber charger consumes water next to the loop state
+     * (64 certus + 1000 water -> 64 charged). A multi-input converter must still prove the
+     * feedback-seed bootstrap when no host seed is stored; its auxiliary inputs are obtained
+     * normally for the bootstrap firing.
+     */
+    @Test
+    void multiInputConverterBootstrapsTheLoopSeed() {
+        var source = new ReusableStockSource("tianshu", "certus_loop");
+        CraftPattern<String> chargeCrystal = new CraftPattern<>(
+                "charged_crystal", 64,
+                List.of(CraftInput.of("crystal", 64), CraftInput.of("water", 1_000)),
+                "reaction_charge");
+        CraftPattern<String> contractedGain = new CraftPattern<>(
+                "crystal", 64,
+                List.of(
+                        CraftInput.returnedFrom("charged_crystal", 32, source),
+                        CraftInput.of("dust", 32),
+                        CraftInput.of("water", 2_500)),
+                List.of(CraftOutput.of("charged_crystal", 32)),
+                "contracted_certus_gain");
+        CraftGraph<String> graph = CraftGraph.<String>builder()
+                .pattern(chargeCrystal)
+                .pattern(contractedGain)
+                .stock("crystal", 128)
+                .stock("dust", 100_000)
+                .stock("water", 100_000)
+                .reusableStockRoute(source, "charged_crystal", List.of("charged_crystal"))
+                .build();
+
+        CraftPlan<String> plan = CraftPlannerV2.plan(graph, "charged_crystal", 200);
+
+        assertTrue(plan.feasible());
+        assertEquals(5L, firingsOf(plan, chargeCrystal),
+                "4 final batches plus one charged-state bootstrap batch");
+        assertEquals(3L, firingsOf(plan, contractedGain));
+        assertEquals(128L, plan.usedStock().get("crystal"));
+        assertEquals(12_500L, plan.usedStock().get("water"),
+                "bootstrap water (1000) + loop water (7500) + final batches (4000)");
+        assertEquals(96L, plan.usedStock().get("dust"));
+        assertTrue(plan.missing().isEmpty());
+    }
+
+    /** Same proof from the other DFS orientation: the multi-input converter is the cut edge. */
+    @Test
+    void multiInputConverterBootstrapsWhenConverterIsTheCutEdge() {
+        var source = new ReusableStockSource("tianshu", "certus_loop");
+        CraftPattern<String> chargeCrystal = new CraftPattern<>(
+                "charged_crystal", 64,
+                List.of(CraftInput.of("crystal", 64), CraftInput.of("water", 1_000)),
+                "reaction_charge");
+        CraftPattern<String> contractedGain = new CraftPattern<>(
+                "crystal", 64,
+                List.of(
+                        CraftInput.returnedFrom("charged_crystal", 32, source),
+                        CraftInput.of("dust", 32),
+                        CraftInput.of("water", 2_500)),
+                "contracted_certus_gain");
+        CraftGraph<String> graph = CraftGraph.<String>builder()
+                .pattern(chargeCrystal)
+                .pattern(contractedGain)
+                .stock("crystal", 128)
+                .stock("dust", 100_000)
+                .stock("water", 8_500)
+                .reusableStockRoute(source, "charged_crystal", List.of("charged_crystal"))
+                .build();
+
+        CraftPlan<String> plan = CraftPlannerV2.plan(graph, "crystal", 200);
+
+        assertTrue(plan.feasible());
+        assertEquals(1L, firingsOf(plan, chargeCrystal));
+        assertEquals(3L, firingsOf(plan, contractedGain));
+        assertEquals(8_500L, plan.usedStock().get("water"),
+                "bootstrap water (1000) + loop water (7500) exactly exhaust stock");
+        assertTrue(plan.missing().isEmpty());
+    }
+
+    /** A bootstrap whose auxiliary material cannot be covered fails closed as a missing seed. */
+    @Test
+    void multiInputConverterAuxiliaryShortfallLeavesSeedMissing() {
+        var source = new ReusableStockSource("tianshu", "certus_loop");
+        CraftPattern<String> chargeCrystal = new CraftPattern<>(
+                "charged_crystal", 64,
+                List.of(CraftInput.of("crystal", 64), CraftInput.of("water", 1_000)),
+                "reaction_charge");
+        CraftPattern<String> contractedGain = new CraftPattern<>(
+                "crystal", 64,
+                List.of(
+                        CraftInput.returnedFrom("charged_crystal", 32, source),
+                        CraftInput.of("dust", 32),
+                        CraftInput.of("water", 2_500)),
+                "contracted_certus_gain");
+        CraftGraph<String> graph = CraftGraph.<String>builder()
+                .pattern(chargeCrystal)
+                .pattern(contractedGain)
+                .stock("crystal", 128)
+                .stock("dust", 100_000)
+                .stock("water", 500)
+                .reusableStockRoute(source, "charged_crystal", List.of("charged_crystal"))
+                .build();
+
+        CraftPlan<String> plan = CraftPlannerV2.plan(graph, "crystal", 200);
+
+        assertFalse(plan.feasible());
+        assertEquals(32L, plan.missing().get("charged_crystal"),
+                "the seed itself is reported missing when its bootstrap cannot run");
+    }
+
     @Test
     void alternateLoopStateCanBeCraftedIntoTheDefaultSeedBeforeStartup() {
         CraftPattern<String> bFromA = new CraftPattern<>(
