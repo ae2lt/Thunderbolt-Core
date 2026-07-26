@@ -833,6 +833,17 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
             return 0;
         }
 
+        // Fast path: waitingKeys mirrors waitingFor's positive keys exactly, and every overload
+        // acceptance path requires a pending entry (hasAnyPending). A CPU that is not waiting on
+        // this key accepts nothing, so skip the per-path synchronized manager probes entirely.
+        if (!activeJob.waitingKeys.contains(what)
+                && !OverloadCpuStateManager.INSTANCE.hasAnyPending(this)) {
+            if (type == Actionable.MODULATE) {
+                finishSuccessfulIfReady(activeJob);
+            }
+            return 0;
+        }
+
         long returned = 0;
         long remaining = amount;
         long simulatedExactOverload = 0L;

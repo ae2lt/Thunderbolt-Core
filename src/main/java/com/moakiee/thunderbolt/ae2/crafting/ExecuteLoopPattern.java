@@ -49,6 +49,8 @@ public final class ExecuteLoopPattern implements IPatternDetails, IProviderLooku
     private final boolean[] fuzzyInputs;
     private final boolean[] seedSlots;
     private final Map<AEKey, SeedVariantRule> plannedSeedRules;
+    private final int dispatchPriority;
+    private final int dispatchOrder;
 
     public ExecuteLoopPattern(
             IPatternDetails delegate,
@@ -84,6 +86,12 @@ public final class ExecuteLoopPattern implements IPatternDetails, IProviderLooku
         this.executionInputs = constrainRepeatedPlannedSeedSlots(sourceInputs);
         this.seedSlots = computeSeedSlots();
         this.plannedSeedRules = computePlannedSeedRules();
+        // Host implementations return constants; the wheel's priority comparator queries these
+        // for every bucket entry on every poll.
+        this.dispatchPriority = delegate instanceof IPrioritizedCraftingTask prioritized
+                ? prioritized.dispatchPriority() : 0;
+        this.dispatchOrder = delegate instanceof IPrioritizedCraftingTask prioritized
+                ? prioritized.dispatchOrder() : 0;
     }
 
     private static Map<Integer, AEKey> snapshotPlannedSeedSlots(IPatternDetails delegate) {
@@ -301,14 +309,8 @@ public final class ExecuteLoopPattern implements IPatternDetails, IProviderLooku
     @Override public AEItemKey timeWheelPersistenceDefinition() {
         return ((TimeWheelTaskPersistenceDefinition) delegate).timeWheelPersistenceDefinition();
     }
-    @Override public int dispatchPriority() {
-        return delegate instanceof IPrioritizedCraftingTask prioritized
-                ? prioritized.dispatchPriority() : 0;
-    }
-    @Override public int dispatchOrder() {
-        return delegate instanceof IPrioritizedCraftingTask prioritized
-                ? prioritized.dispatchOrder() : 0;
-    }
+    @Override public int dispatchPriority() { return dispatchPriority; }
+    @Override public int dispatchOrder() { return dispatchOrder; }
     @Override public UUID reusableSeedGroupId() {
         return ((ISeedPreservingCraftingTask) delegate).reusableSeedGroupId();
     }
