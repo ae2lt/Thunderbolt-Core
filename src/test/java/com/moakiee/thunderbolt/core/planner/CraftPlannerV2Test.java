@@ -1034,6 +1034,172 @@ class CraftPlannerV2Test {
     }
 
     @Test
+    void requestedReturnedStateBootstrapsContractedGainFromOutputStock() {
+        var source = new ReusableStockSource("tianshu", "loop");
+        CraftPattern<String> aToB = new CraftPattern<>(
+                "B", 1, List.of(CraftInput.of("A", 1)), "A_to_B");
+        // The selected reusable loop state is B, while the contracted loop produces net +1 A.
+        // Requesting B must keep one A aside, convert it into the initial B seed, grow A through
+        // the loop, then run A_to_B for the requested final output.
+        CraftPattern<String> contractedGain = new CraftPattern<>(
+                "A", 1, List.of(CraftInput.returnedFrom("B", 1, source)),
+                "contracted_B_seed_A_gain");
+        CraftGraph<String> graph = CraftGraph.<String>builder()
+                .pattern(aToB)
+                .pattern(contractedGain)
+                .stock("A", 1)
+                .reusableStockRoute(source, "B", List.of("B"))
+                .build();
+
+        CraftPlan<String> plan = CraftPlannerV2.plan(graph, "B", 1_000);
+
+        assertTrue(plan.feasible());
+        assertEquals(1L, plan.usedStock().get("A"));
+        assertEquals(1_001L, firingsOf(plan, aToB),
+                "one conversion bootstraps the returned B seed before producing final B");
+        assertEquals(1_000L, firingsOf(plan, contractedGain));
+        assertEquals(1_001L, plan.grossDemand().get("A"));
+        assertTrue(plan.usedReusableStock().isEmpty());
+        assertTrue(plan.missing().isEmpty());
+    }
+
+    @Test
+    void requestedReturnedStateUsesHostSeedWithoutExtraBootstrapConversion() {
+        var source = new ReusableStockSource("tianshu", "loop");
+        CraftPattern<String> aToB = new CraftPattern<>(
+                "B", 1, List.of(CraftInput.of("A", 1)), "A_to_B");
+        CraftPattern<String> contractedGain = new CraftPattern<>(
+                "A", 1, List.of(CraftInput.returnedFrom("B", 1, source)),
+                "contracted_B_seed_A_gain");
+        CraftGraph<String> graph = CraftGraph.<String>builder()
+                .pattern(aToB)
+                .pattern(contractedGain)
+                .reusableStock("tianshu", "B", 1)
+                .reusableStockRoute(source, "B", List.of("B"))
+                .build();
+
+        CraftPlan<String> plan = CraftPlannerV2.plan(graph, "B", 1_000);
+
+        assertTrue(plan.feasible());
+        assertEquals(1_000L, firingsOf(plan, aToB));
+        assertEquals(1_000L, firingsOf(plan, contractedGain));
+        assertEquals(1L, plan.usedReusableStock().values().stream()
+                .mapToLong(Long::longValue).sum());
+        assertTrue(plan.usedStock().isEmpty());
+        assertTrue(plan.missing().isEmpty());
+    }
+
+    @Test
+    void requestedReturnedStateWithoutHostOrOutputStockRemainsMissing() {
+        var source = new ReusableStockSource("tianshu", "loop");
+        CraftPattern<String> aToB = new CraftPattern<>(
+                "B", 1, List.of(CraftInput.of("A", 1)), "A_to_B");
+        CraftPattern<String> contractedGain = new CraftPattern<>(
+                "A", 1, List.of(CraftInput.returnedFrom("B", 1, source)),
+                "contracted_B_seed_A_gain");
+        CraftGraph<String> graph = CraftGraph.<String>builder()
+                .pattern(aToB)
+                .pattern(contractedGain)
+                .reusableStockRoute(source, "B", List.of("B"))
+                .build();
+
+        CraftPlan<String> plan = CraftPlannerV2.plan(graph, "B", 1_000);
+
+        assertFalse(plan.feasible());
+        assertEquals(1L, plan.missing().get("B"));
+        assertTrue(plan.usedStock().isEmpty());
+        assertTrue(plan.usedReusableStock().isEmpty());
+    }
+
+    @Test
+    void partialOutputStockBootstrapsOnlyTheClosedLoopShortfall() {
+        var source = new ReusableStockSource("tianshu", "certus_loop");
+        CraftPattern<String> crystalToDust = new CraftPattern<>(
+                "dust", 1, List.of(CraftInput.of("crystal", 1)), "crush_certus");
+        CraftPattern<String> contractedGain = new CraftPattern<>(
+                "crystal", 1, List.of(CraftInput.returnedFrom("dust", 1, source)),
+                "contracted_certus_gain");
+        CraftGraph<String> graph = CraftGraph.<String>builder()
+                .pattern(crystalToDust)
+                .pattern(contractedGain)
+                .stock("crystal", 5_440)
+                .reusableStockRoute(source, "dust", List.of("dust"))
+                .build();
+
+        CraftPlan<String> plan = CraftPlannerV2.plan(graph, "dust", 10_048);
+
+        assertTrue(plan.feasible());
+        assertEquals(5_440L, plan.usedStock().get("crystal"));
+        assertEquals(10_049L, firingsOf(plan, crystalToDust));
+        assertEquals(4_609L, firingsOf(plan, contractedGain));
+        assertTrue(plan.missing().isEmpty());
+    }
+
+    @Test
+    void downstreamChargedOutputCanBootstrapTheLoopThroughItsCutConverter() {
+        var source = new ReusableStockSource("tianshu", "certus_loop");
+        CraftPattern<String> crystalToDust = new CraftPattern<>(
+                "dust", 1, List.of(CraftInput.of("crystal", 1)), "crush_certus");
+        CraftPattern<String> contractedGain = new CraftPattern<>(
+                "crystal", 1, List.of(CraftInput.returnedFrom("dust", 1, source)),
+                "contracted_certus_gain");
+        CraftPattern<String> chargeCrystal = new CraftPattern<>(
+                "charged_crystal", 1, List.of(CraftInput.of("crystal", 1)),
+                "charge_certus");
+        CraftGraph<String> graph = CraftGraph.<String>builder()
+                .pattern(crystalToDust)
+                .pattern(contractedGain)
+                .pattern(chargeCrystal)
+                .stock("crystal", 1)
+                .reusableStockRoute(source, "dust", List.of("dust"))
+                .build();
+
+        CraftPlan<String> plan = CraftPlannerV2.plan(graph, "charged_crystal", 1_000);
+
+        assertTrue(plan.feasible());
+        assertEquals(1L, plan.usedStock().get("crystal"));
+        assertEquals(1L, firingsOf(plan, crystalToDust));
+        assertEquals(1_000L, firingsOf(plan, contractedGain));
+        assertEquals(1_000L, firingsOf(plan, chargeCrystal));
+        assertTrue(plan.missing().isEmpty());
+    }
+
+    @Test
+    void downstreamOutputBootstrapsEveryReturnedStateOfTheSameContractedLoop() {
+        var source = new ReusableStockSource("tianshu", "certus_loop");
+        CraftPattern<String> crystalToDust = new CraftPattern<>(
+                "dust", 64, List.of(CraftInput.of("crystal", 64)), "crush_certus");
+        CraftPattern<String> chargeCrystal = new CraftPattern<>(
+                "charged_crystal", 64, List.of(CraftInput.of("crystal", 64)),
+                "charge_certus");
+        CraftPattern<String> contractedGain = new CraftPattern<>(
+                "crystal", 128,
+                List.of(
+                        CraftInput.returnedFrom("charged_crystal", 64, source),
+                        CraftInput.returnedFrom("dust", 64, source)),
+                "contracted_certus_gain");
+        CraftGraph<String> graph = CraftGraph.<String>builder()
+                .pattern(crystalToDust)
+                .pattern(chargeCrystal)
+                .pattern(contractedGain)
+                .stock("crystal", 5_120)
+                .reusableStockRoute(source, "charged_crystal", List.of("charged_crystal"))
+                .reusableStockRoute(source, "dust", List.of("dust"))
+                .build();
+
+        CraftPlan<String> plan = CraftPlannerV2.plan(graph, "charged_crystal", 11_000);
+
+        assertTrue(plan.feasible());
+        assertEquals(5_120L, plan.usedStock().get("crystal"));
+        assertEquals(1L, firingsOf(plan, crystalToDust));
+        assertEquals(173L, firingsOf(plan, chargeCrystal),
+                "172 final batches plus one charged-state bootstrap batch");
+        assertEquals(47L, firingsOf(plan, contractedGain));
+        assertTrue(plan.usedReusableStock().isEmpty());
+        assertTrue(plan.missing().isEmpty());
+    }
+
+    @Test
     void alternateLoopStateCanBeCraftedIntoTheDefaultSeedBeforeStartup() {
         CraftPattern<String> bFromA = new CraftPattern<>(
                 "B", 1, List.of(CraftInput.of("A", 1)), "A_to_B");
