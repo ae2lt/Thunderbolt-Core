@@ -225,11 +225,12 @@ final class LoopSeedLedgerBook {
         if (pattern == null || actualInputUses == null) return true;
         var mappedInputs = new KeyCounter();
         for (var use : actualInputUses) mappedInputs.add(use.planned(), use.amount());
-        for (var planned : pattern.inputSeed()) {
+        var plannedSeed = pattern.inputSeed();
+        for (var planned : plannedSeed) {
             if (mappedInputs.get(planned.getKey()) != planned.getLongValue()) return false;
         }
         for (var mapped : mappedInputs) {
-            if (mapped.getLongValue() != pattern.inputSeed().get(mapped.getKey())) return false;
+            if (mapped.getLongValue() != plannedSeed.get(mapped.getKey())) return false;
         }
 
         return planRemainderRoutes(pattern, 1L, actualInputUses) != null;

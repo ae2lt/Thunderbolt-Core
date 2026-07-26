@@ -74,6 +74,11 @@ public final class OverloadCpuState {
         return List.copyOf(pendingByKey.values());
     }
 
+    /** Zero-copy view for manager-internal scans under the manager's monitor. */
+    Collection<PendingOverloadOutput> pendingView() {
+        return pendingByKey.values();
+    }
+
     public boolean isEmpty() {
         return pendingByKey.isEmpty();
     }

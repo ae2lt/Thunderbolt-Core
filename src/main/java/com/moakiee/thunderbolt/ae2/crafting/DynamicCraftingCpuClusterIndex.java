@@ -18,6 +18,7 @@ import org.jetbrains.annotations.Nullable;
 public final class DynamicCraftingCpuClusterIndex<P, C> {
     private final Set<P> providers = Collections.newSetFromMap(new IdentityHashMap<>());
     private final Set<C> clusters = Collections.newSetFromMap(new IdentityHashMap<>());
+    private final Set<C> clustersView = Collections.unmodifiableSet(clusters);
     private final Set<C> refreshedClusters = Collections.newSetFromMap(new IdentityHashMap<>());
 
     public boolean addProvider(P provider) {
@@ -52,7 +53,11 @@ public final class DynamicCraftingCpuClusterIndex<P, C> {
         }
 
         boolean changed = !clusters.equals(refreshedClusters);
-        clusters.removeIf(cluster -> !refreshedClusters.contains(cluster));
+        for (var iterator = clusters.iterator(); iterator.hasNext(); ) {
+            if (!refreshedClusters.contains(iterator.next())) {
+                iterator.remove();
+            }
+        }
         for (var cluster : refreshedClusters) {
             if (clusters.add(cluster)) {
                 onAdded.accept(cluster);
@@ -62,6 +67,6 @@ public final class DynamicCraftingCpuClusterIndex<P, C> {
     }
 
     public Set<C> clusters() {
-        return Collections.unmodifiableSet(clusters);
+        return clustersView;
     }
 }

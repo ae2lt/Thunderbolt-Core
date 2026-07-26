@@ -57,8 +57,10 @@ public abstract class EjectCapabilityMixin<T, C> {
             BlockEntity blockEntity,
             C context,
             CallbackInfoReturnable<T> callback) {
-        if (THUNDERBOLT_PROXYING.get()
-                || EjectCapabilityRegistry.isEmpty()
+        // Registry-empty is the overwhelmingly common case on this global hot path; check it
+        // before paying the ThreadLocal lookup.
+        if (EjectCapabilityRegistry.isEmpty()
+                || THUNDERBOLT_PROXYING.get()
                 || EjectCapabilityRegistry.isBypassed()
                 || !(level instanceof ServerLevel)
                 || !(context instanceof Direction face)) {

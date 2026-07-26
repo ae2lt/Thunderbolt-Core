@@ -17,7 +17,9 @@ public abstract class EjectGhostBlockEntityMixin {
     @Inject(method = "getBlockEntity", at = @At("RETURN"), cancellable = true)
     private void thunderbolt$injectGhostBlockEntity(
             BlockPos pos, CallbackInfoReturnable<BlockEntity> callback) {
-        if (callback.getReturnValue() != null || !((Object) this instanceof ServerLevel)) return;
+        if (callback.getReturnValue() != null
+                || EjectCapabilityRegistry.isEmpty()
+                || !((Object) this instanceof ServerLevel)) return;
         var level = (Level) (Object) this;
         var entry = EjectCapabilityRegistry.lookupAny(level.dimension(), pos.asLong());
         if (entry == null) return;

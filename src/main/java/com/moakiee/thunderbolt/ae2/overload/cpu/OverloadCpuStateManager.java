@@ -173,7 +173,7 @@ public final class OverloadCpuStateManager {
                 continue;
             }
 
-            for (var pending : state.allPending()) {
+            for (var pending : state.pendingView()) {
                 if (!pending.itemId().equals(itemId)) {
                     continue;
                 }
