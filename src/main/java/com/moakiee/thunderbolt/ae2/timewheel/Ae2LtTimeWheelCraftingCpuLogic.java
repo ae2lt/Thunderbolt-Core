@@ -369,6 +369,14 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
             else cancel();
             return TickUsage.EMPTY;
         }
+        flushUnusedRetainedFinalOutputs(activeJob);
+        if (this.job != activeJob || activeJob.link.isCanceled()) {
+            return TickUsage.EMPTY;
+        }
+        recoverTerminalFinalOutputFromInventory(activeJob);
+        if (this.job != activeJob || activeJob.link.isCanceled()) {
+            return TickUsage.EMPTY;
+        }
         if (activeJob.remainingAmount <= 0) {
             finishSuccessfulIfReady(activeJob);
             return TickUsage.EMPTY;
@@ -1067,6 +1075,7 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
         if (job != activeJob || completed <= 0) return;
         postChange(what);
         activeJob.remainingAmount = Math.max(0L, activeJob.remainingAmount - completed);
+        capPendingRequesterOutputsToRemaining(activeJob.remainingAmount, what);
         if (activeJob.remainingAmount > 0) {
             cpu.updateOutput(new GenericStack(activeJob.finalOutput.what(), activeJob.remainingAmount));
         } else {
@@ -1078,6 +1087,9 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
 
     private void finishSuccessfulIfReady(TimeWheelJob activeJob) {
         if (job != activeJob || activeJob.softCancelling) return;
+        // Also repairs persisted jobs written by versions that could leave deferred credits after
+        // the final demand had already reached zero.
+        capPendingRequesterOutputsToRemaining(activeJob.remainingAmount, null);
         if (activeJob.remainingAmount > 0
                 || !activeJob.tasks.isEmpty()
                 || !activeJob.waitingKeys.isEmpty()
@@ -1462,9 +1474,11 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
 
     private void flushPendingRequesterOutputs(TimeWheelJob activeJob) {
         if (activeJob == null || activeJob.link.isStandalone()
-                || activeJob.softCancelling || pendingRequesterOutputs.isEmpty()) {
+                || activeJob.softCancelling) {
             return;
         }
+        capPendingRequesterOutputsToRemaining(activeJob.remainingAmount, null);
+        if (pendingRequesterOutputs.isEmpty()) return;
 
         var pending = new ArrayList<GenericStack>();
         for (var entry : pendingRequesterOutputs) {
@@ -1514,6 +1528,23 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
         }
     }
 
+    private void capPendingRequesterOutputsToRemaining(
+            long remainingDemand, @Nullable AEKey newlyCompletedKey) {
+        if (pendingRequesterOutputs.isEmpty()) return;
+
+        var pending = new ArrayList<PendingRequesterOutputAccounting.Credit<AEKey>>();
+        for (var entry : pendingRequesterOutputs) {
+            pending.add(new PendingRequesterOutputAccounting.Credit<>(
+                    entry.getKey(), entry.getLongValue()));
+        }
+        var reconciliation = PendingRequesterOutputAccounting.capToRemainingDemand(
+                pending, remainingDemand, newlyCompletedKey);
+        pendingRequesterOutputs.clear();
+        for (var retained : reconciliation.retained()) {
+            pendingRequesterOutputs.add(retained.key(), retained.amount());
+        }
+    }
+
     private static long offerToRequester(
             TimeWheelJob activeJob, AEKey what, long amount, Actionable type) {
         if (activeJob == null || what == null || amount <= 0) return 0L;
@@ -1551,6 +1582,65 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
                 finishCompletedFinalOutput(activeJob, entry.what(), delivered);
                 cpu.markDirty();
             }
+        }
+    }
+
+    /**
+     * Recovers an exact final-output stack that has lost its transient ownership record after all
+     * dispatched work has returned. This can happen when an overload output re-enters the same ME
+     * storage while its requester callback is guarded against recursion: the physical stack is
+     * retained by the CPU, but no task, waiting entry, or overload entry remains to retry it.
+     *
+     * <p>The recovery is deliberately terminal-only and excludes every reusable-seed and retained
+     * output reservation. It therefore cannot consume an input that a still-running pattern needs.
+     */
+    private void recoverTerminalFinalOutputFromInventory(TimeWheelJob activeJob) {
+        if (activeJob == null
+                || activeJob.softCancelling
+                || activeJob.remainingAmount <= 0
+                || activeJob.finalOutput == null
+                || !activeJob.tasks.isEmpty()
+                || !activeJob.waitingKeys.isEmpty()
+                || !activeJob.pendingOutputs.isEmpty()
+                || !pendingRequesterOutputs.isEmpty()
+                || OverloadCpuStateManager.INSTANCE.hasAnyPending(this)) {
+            return;
+        }
+
+        var finalKey = activeJob.finalOutput.what();
+        long held = inventory.extract(finalKey, Long.MAX_VALUE, Actionable.SIMULATE);
+        long reusableReserve = Math.max(
+                seedReturnQuota.get(finalKey), loopSeedLedgers.totalReserved(finalKey));
+        long recoverable = FinalOutputProgress.recoverableInventoryAmount(
+                held, reusableReserve, retainedFinalOutputs.get(finalKey),
+                activeJob.remainingAmount);
+        if (recoverable <= 0) return;
+
+        if (activeJob.link.isStandalone()) {
+            finishCompletedFinalOutput(activeJob, finalKey, recoverable);
+            cpu.markDirty();
+            return;
+        }
+
+        long acceptable = offerToRequester(
+                activeJob, finalKey, recoverable, Actionable.SIMULATE);
+        if (acceptable <= 0 || job != activeJob || activeJob.link.isCanceled()) return;
+
+        long removed = inventory.extract(finalKey, acceptable, Actionable.MODULATE);
+        if (removed <= 0) return;
+
+        long delivered = offerToRequester(
+                activeJob, finalKey, removed, Actionable.MODULATE);
+        if (delivered < removed) {
+            inventory.insert(finalKey, removed - delivered, Actionable.MODULATE);
+        }
+        if (job != activeJob) return;
+        if (delivered > 0) {
+            finishCompletedFinalOutput(activeJob, finalKey, delivered);
+            AELog.warn(
+                    "[ae2lt] Recovered %d terminal final-output units from CPU inventory for crafting job %s.",
+                    delivered, activeJob.link.getCraftingID());
+            cpu.markDirty();
         }
     }
 
@@ -2535,6 +2625,14 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
 
     private void preferTaskWhilePending(TimeWheelJob activeJob, IPatternDetails details) {
         if (preferredTask != null) return;
+        // A loop member may be split into several execution tasks with the same member order and
+        // seed consumer but different downstream output-credit routes. Pinning the first successful
+        // split here lets it consume the whole shared bootstrap seed before its siblings run. The
+        // downstream members can then return only one side of the seed cycle and the job deadlocks
+        // (large jobs expose this while a one-copy job often does not). Closed-loop tasks already
+        // carry an explicit dispatch order, so leave equal-order members in queue order and let the
+        // time wheel rotate them fairly. Ordinary AE2 tasks retain task-major preference.
+        if (details instanceof ISeedPreservingCraftingTask) return;
         var task = activeJob.tasks.get(details);
         if (task != null && task.value > 0) {
             preferredTask = details;
