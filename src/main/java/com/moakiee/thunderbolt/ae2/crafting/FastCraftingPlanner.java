@@ -46,7 +46,8 @@ import com.moakiee.thunderbolt.ae2.timewheel.ReusableSeedPattern;
 
 /**
  * Bridges one of AE2's per-amount crafting attempts ({@code CraftingCalculation#runCraftAttempt})
- * to the linear {@link CraftPlanner} fast path, producing AE2-compatible {@link CraftingPlan}s.
+ * to the {@link com.moakiee.thunderbolt.core.planner.CraftPlannerV2} fast path, producing
+ * AE2-compatible {@link CraftingPlan}s.
  *
  * <p>Hooking the per-amount attempt (rather than the whole {@code computePlan}) lets AE2 keep driving
  * its own strategy/binary-search loop while we replace only the expensive tree simulation of each

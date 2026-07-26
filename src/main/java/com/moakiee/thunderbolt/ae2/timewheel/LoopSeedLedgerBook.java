@@ -636,10 +636,6 @@ final class LoopSeedLedgerBook {
         return Map.copyOf(result);
     }
 
-    int ledgerCount() {
-        return ledgers.size();
-    }
-
     private void adjust(UUID consumer, AEKey key, long delta) {
         if (consumer == null || key == null || delta == 0) return;
         var ledger = ledgers.computeIfAbsent(consumer, ignored -> new LinkedHashMap<>());
@@ -983,15 +979,6 @@ final class LoopSeedLedgerBook {
             result.merge(use.plannedRemainder(), use.remainderAmount(), Sat::add);
         }
         return result;
-    }
-
-    /** Capacity matching with residual reassignment; avoids order-dependent fuzzy deadlocks. */
-    private static @Nullable long[][] matchCapacities(
-            long[] supply,
-            long[] capacity,
-            BiPredicate<Integer, Integer> allowed) {
-        var match = matchCapacitiesPartially(supply, capacity, allowed);
-        return match != null && match.complete ? match.flows : null;
     }
 
     private static @Nullable CapacityMatch matchCapacitiesPartially(

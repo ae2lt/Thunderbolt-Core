@@ -6,8 +6,6 @@ import java.util.stream.Collectors;
 
 import net.minecraft.world.item.ItemStack;
 
-import com.moakiee.thunderbolt.ae2.overload.model.CompareKey;
-import com.moakiee.thunderbolt.ae2.overload.model.CompareKeys;
 import com.moakiee.thunderbolt.ae2.overload.model.EncodedOverloadPattern;
 import com.moakiee.thunderbolt.ae2.overload.model.MatchMode;
 
@@ -104,24 +102,20 @@ public final class OverloadPatternDetails implements OverloadedProviderOnlyPatte
     }
 
     private static InputSlot toInputSlot(ParsedPatternInput input, MatchMode matchMode) {
-        var template = normalizedCopy(input.stack());
         return new InputSlot(
                 input.slotIndex(),
-                template,
+                normalizedCopy(input.stack()),
                 input.amountPerCraft(),
-                matchMode,
-                CompareKeys.fromStack(template, matchMode));
+                matchMode);
     }
 
     private static OutputSlot toOutputSlot(ParsedPatternOutput output, MatchMode matchMode) {
-        var template = normalizedCopy(output.stack());
         return new OutputSlot(
                 output.slotIndex(),
-                template,
+                normalizedCopy(output.stack()),
                 output.amountPerCraft(),
                 matchMode,
-                output.primaryOutput(),
-                CompareKeys.fromStack(template, matchMode));
+                output.primaryOutput());
     }
 
     private static ItemStack normalizedCopy(ItemStack stack) {
@@ -137,8 +131,7 @@ public final class OverloadPatternDetails implements OverloadedProviderOnlyPatte
             int slotIndex,
             ItemStack template,
             int amountPerCraft,
-            MatchMode matchMode,
-            CompareKey compareKey
+            MatchMode matchMode
     ) {
         public InputSlot {
             Objects.requireNonNull(template, "template");
@@ -146,7 +139,6 @@ public final class OverloadPatternDetails implements OverloadedProviderOnlyPatte
                 throw new IllegalArgumentException("amountPerCraft must be > 0");
             }
             Objects.requireNonNull(matchMode, "matchMode");
-            Objects.requireNonNull(compareKey, "compareKey");
             template = normalizedCopy(template);
         }
 
@@ -168,8 +160,7 @@ public final class OverloadPatternDetails implements OverloadedProviderOnlyPatte
             ItemStack template,
             int amountPerCraft,
             MatchMode matchMode,
-            boolean primaryOutput,
-            CompareKey compareKey
+            boolean primaryOutput
     ) {
         public OutputSlot {
             Objects.requireNonNull(template, "template");
@@ -177,7 +168,6 @@ public final class OverloadPatternDetails implements OverloadedProviderOnlyPatte
                 throw new IllegalArgumentException("amountPerCraft must be > 0");
             }
             Objects.requireNonNull(matchMode, "matchMode");
-            Objects.requireNonNull(compareKey, "compareKey");
             template = normalizedCopy(template);
         }
 

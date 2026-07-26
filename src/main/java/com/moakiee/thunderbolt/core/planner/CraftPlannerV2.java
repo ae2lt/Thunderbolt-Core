@@ -15,7 +15,7 @@ import java.util.Set;
  * v2 autocrafting planner: dynamic-capacity greedy over a shared mutable pool, with byproduct reuse
  * and bounded backtracking for contended choices.
  *
- * <p>This is the evolution of {@link CraftPlanner} (v1, closed-form two-pass). It keeps v1's strengths
+ * <p>This is the evolution of the v1 planner (closed-form two-pass, removed). It keeps v1's strengths
  * — quantity-independent batching ({@code ceil} arithmetic), {@code returned} (container/catalyst)
  * inputs in closed form, saturating arithmetic — and adds:
  *

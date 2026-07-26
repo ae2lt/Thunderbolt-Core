@@ -3,11 +3,11 @@ package com.moakiee.thunderbolt.core.planner;
 import java.util.Map;
 
 /**
- * Result of {@link CraftPlanner#plan}.
+ * Result of {@link CraftPlannerV2#plan}.
  *
  * @param supported     {@code false} means the fast path declined (e.g. recursion/cycle detected);
  *                      caller must fall back to AE2's simulator. When {@code false} all other fields
- *                      are empty/zero.
+ *                      are empty/zero. The v2 planner always plans, so it always reports {@code true}.
  * @param feasible      {@code true} if the requested amount can be fully crafted from current stock.
  *                      When {@code false}, {@link #missing} lists what is short (a partial plan is
  *                      still provided for the craftable part).
@@ -38,8 +38,4 @@ public record CraftPlan<K>(
         Map<K, Long> grossDemand,
         int itemsProcessed,
         boolean budgetExhausted) {
-
-    public static <K> CraftPlan<K> unsupported() {
-        return new CraftPlan<>(false, false, Map.of(), Map.of(), Map.of(), Map.of(), Map.of(), 0, false);
-    }
 }
