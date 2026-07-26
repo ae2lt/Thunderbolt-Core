@@ -69,6 +69,9 @@ dependencies {
     testImplementation platform("org.junit:junit-bom:5.10.2")
     testImplementation "org.junit.jupiter:junit-jupiter"
     testRuntimeOnly "org.junit.platform:junit-platform-launcher"
+    // AE2 API types exercised directly by unit tests (e.g. ByteTracker's AEKeyType);
+    // compileOnly deps are absent from the test runtime classpath otherwise.
+    testRuntimeOnly "curse.maven:applied-energistics-2-223794:7027323"
 }
 
 // Tests that exercise SavedData/codecs need the same generated Minecraft/NeoForge classes as main.

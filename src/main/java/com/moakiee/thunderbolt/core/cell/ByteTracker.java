@@ -123,8 +123,9 @@ public final class ByteTracker {
 
         if (keyRemoved) {
             bytesFreed += bytesPerType;
-            int remaining = keyTypeCounts.addTo(type, -1);
-            if (remaining <= 0) {
+            // fastutil addTo returns the PREVIOUS value: the last key of a type sees 1 here.
+            int countBefore = keyTypeCounts.addTo(type, -1);
+            if (countBefore <= 1) {
                 keyTypeCounts.removeInt(type);
                 keyTypeRemainders.removeLong(type);
             } else {
@@ -157,6 +158,11 @@ public final class ByteTracker {
 
     public boolean isTypeFull() {
         return totalTypesGetter.getAsInt() >= maxTypes;
+    }
+
+    /** Test-only visibility: per-type bookkeeping entries must vanish with a type's last key. */
+    int trackedTypeEntries() {
+        return keyTypeCounts.size() + keyTypeRemainders.size();
     }
 
     // ══════════════════════════════════════════════════════════════════════
