@@ -140,11 +140,15 @@ public final class CraftPlannerV2<K> {
         if (amount <= 0) {
             return new CraftPlan<>(true, true, Map.of(), Map.of(), Map.of(), Map.of(), Map.of(), 0, false);
         }
-        CycleAnalysis<K> cycleAnalysis = CycleAnalysis.analyze(graph, target);
         CraftPlannerV2<K> firstPlanner = new CraftPlannerV2<>(graph, visitCap);
         CraftPlan<K> first = firstPlanner.run(target, amount, List.of());
-        if (first.feasible()
-                || firstPlanner.cutOutputs.stream().noneMatch(cycleAnalysis::mayReorient)) {
+        if (first.feasible() || firstPlanner.cutOutputs.isEmpty()) {
+            return first;
+        }
+        // Only the infeasible-with-cut-outputs path consults cycle analysis; the feasible
+        // majority of requests never pays for the SCC passes.
+        CycleAnalysis<K> cycleAnalysis = CycleAnalysis.analyze(graph, target);
+        if (firstPlanner.cutOutputs.stream().noneMatch(cycleAnalysis::mayReorient)) {
             return first;
         }
 
