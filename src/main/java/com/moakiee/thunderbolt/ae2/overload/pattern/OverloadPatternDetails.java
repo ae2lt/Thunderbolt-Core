@@ -29,6 +29,8 @@ public final class OverloadPatternDetails implements OverloadedProviderOnlyPatte
     private final EncodedOverloadPattern encodedPattern;
     private final List<InputSlot> inputs;
     private final List<OutputSlot> outputs;
+    // Lazily computed from immutable state; benign race (String is safely publishable).
+    private String cachedIdentity;
 
     public OverloadPatternDetails(ParsedPatternDefinition parsedPattern, EncodedOverloadPattern encodedPattern) {
         Objects.requireNonNull(parsedPattern, "parsedPattern");
@@ -49,9 +51,15 @@ public final class OverloadPatternDetails implements OverloadedProviderOnlyPatte
 
     @Override
     public String overloadPatternIdentity() {
-        return sourcePattern.itemId() + "#" + sourcePattern.fingerprint()
+        var cached = cachedIdentity;
+        if (cached != null) {
+            return cached;
+        }
+        var computed = sourcePattern.itemId() + "#" + sourcePattern.fingerprint()
                 + "|inputs=" + encodedPattern.inputSlots().toString()
                 + "|outputs=" + encodedPattern.outputSlots().toString();
+        cachedIdentity = computed;
+        return computed;
     }
 
     @Override

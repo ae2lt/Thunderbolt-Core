@@ -35,6 +35,9 @@ public final class SourcePatternSnapshot {
     private final CompoundTag serializedStackTag;
     @Nullable
     private final CompoundTag customDataTag;
+    // Lazily computed from immutable state; benign race (String is safely publishable).
+    @Nullable
+    private String cachedFingerprint;
 
     public SourcePatternSnapshot(ResourceLocation itemId,
                                  @Nullable CompoundTag serializedStackTag,
@@ -65,6 +68,16 @@ public final class SourcePatternSnapshot {
 
     /** Stable content fingerprint used to keep distinct source recipes in distinct pending slots. */
     public String fingerprint() {
+        var cached = cachedFingerprint;
+        if (cached != null) {
+            return cached;
+        }
+        var computed = computeFingerprint();
+        cachedFingerprint = computed;
+        return computed;
+    }
+
+    private String computeFingerprint() {
         var identity = toTag();
         if (identity.contains(TAG_STACK, Tag.TAG_COMPOUND)) {
             // The stack count is transport state, not recipe identity. Pattern providers may hand
