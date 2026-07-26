@@ -18,6 +18,7 @@ import appeng.crafting.CraftingPlan;
 import com.moakiee.thunderbolt.ae2.timewheel.TimeWheelCraftingCpuPoolHost;
 import com.moakiee.thunderbolt.ae2.timewheel.ReusableSeedPattern;
 import com.moakiee.thunderbolt.ae2.timewheel.TimeWheelPoolRestrictedPattern;
+import com.moakiee.thunderbolt.core.planner.ReusableBootstrapRoute;
 import com.moakiee.thunderbolt.core.planner.ReusableStockUsageKey;
 
 /**
@@ -74,25 +75,39 @@ public record LoopCraftingPlan(
         if (usedReusableStock != null) {
             for (var entry : usedReusableStock.entrySet()) {
                 if (entry.getKey() != null && entry.getValue() != null && entry.getValue() > 0) {
-                    var owner = reusableStockOwner(reusablePatterns, entry.getKey());
+                    var bootstrapRoute = entry.getKey().routingScope()
+                            instanceof ReusableBootstrapRoute<?> route ? route : null;
+                    var owner = bootstrapRoute == null
+                            ? reusableStockOwner(reusablePatterns, entry.getKey())
+                            : reusableBootstrapOwner(reusablePatterns, entry.getKey(), bootstrapRoute);
                     if (owner == null) {
                         throw new IllegalStateException(
                                 "private reusable-stock usage has no owning loop pattern");
                     }
+                    AEKey plannedKey = bootstrapRoute != null
+                            && bootstrapRoute.returnedSeedKey() instanceof AEKey key
+                            ? key
+                            : entry.getKey().key();
                     hostSeeds.merge(
-                            entry.getKey().key(), entry.getValue(), LoopCraftingPlan::saturatingAdd);
-                    hostUsageByRoute.merge(
-                            HostRequirementKey.from(entry.getKey()), entry.getValue(),
+                            bootstrapRoute != null
+                                    ? entry.getKey().actualKey() : entry.getKey().key(),
+                            entry.getValue(),
                             LoopCraftingPlan::saturatingAdd);
+                    if (bootstrapRoute == null) {
+                        hostUsageByRoute.merge(
+                                HostRequirementKey.from(entry.getKey()), entry.getValue(),
+                                LoopCraftingPlan::saturatingAdd);
+                    }
                     hostAllocations.add(new HostReusableSeedAllocation(
                             entry.getKey().storageScope(),
                             entry.getKey().poolScope(),
-                            entry.getKey().routingScope(),
-                            entry.getKey().key(),
+                            owner.reusableStockSource().routingScope(),
+                            plannedKey,
                             entry.getKey().actualKey(),
                             entry.getValue(),
                             owner.reusableSeedGroupId(),
-                            owner.hasSingleSeedInputPerMember()));
+                            owner.hasSingleSeedInputPerMember(),
+                            bootstrapRoute != null));
                 }
             }
         }
@@ -145,6 +160,9 @@ public record LoopCraftingPlan(
     public boolean acceptsReusableSeedVariant(
             HostReusableSeedAllocation allocation, AEKey actual) {
         if (allocation == null || actual == null) return false;
+        if (allocation.bootstrap()) {
+            return allocation.actualKey().equals(actual);
+        }
         for (var details : delegate.patternTimes().keySet()) {
             if (!(details instanceof ReusableSeedPattern seeded)) continue;
             var source = seeded.reusableStockSource();
@@ -286,6 +304,26 @@ public record LoopCraftingPlan(
         return null;
     }
 
+    private static ReusableSeedPattern reusableBootstrapOwner(
+            List<ReusableSeedPattern> patterns,
+            ReusableStockUsageKey<AEKey> usage,
+            ReusableBootstrapRoute<?> bootstrapRoute) {
+        if (!(bootstrapRoute.returnedSeedKey() instanceof AEKey returnedSeedKey)) {
+            return null;
+        }
+        for (var seeded : patterns) {
+            var source = seeded.reusableStockSource();
+            if (usage.storageScope().equals(source.storageScope())
+                    && usage.poolScope().equals(source.poolScope())
+                    && bootstrapRoute.ownerRoutingScope().equals(source.routingScope())
+                    && seeded.totalReusableSeedRequirements()
+                            .getOrDefault(returnedSeedKey, 0L) > 0) {
+                return seeded;
+            }
+        }
+        return null;
+    }
+
     public record HostReusableSeedAllocation(
             Object storageScope,
             Object poolScope,
@@ -294,7 +332,8 @@ public record LoopCraftingPlan(
             AEKey actualKey,
             long amount,
             UUID reusableSeedGroupId,
-            boolean sharedPool) {
+            boolean sharedPool,
+            boolean bootstrap) {
         public HostReusableSeedAllocation {
             Objects.requireNonNull(storageScope, "storageScope");
             Objects.requireNonNull(poolScope, "poolScope");
