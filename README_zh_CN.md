@@ -5,7 +5,7 @@ Thunderbolt Core 是 AE2 Lightning Tech 使用的 AE2 优化与底层基础设�
 - 模组名：`Thunderbolt Core`
 - Mod ID：`thunderbolt`
 - Java 命名空间：`com.moakiee.thunderbolt`
-- Maven 坐标：`com.moakiee.thunderbolt:thunderbolt:2.0.0`
+- Maven 坐标：`com.moakiee.thunderbolt:thunderbolt:1.0.0`（版本号以 `gradle.properties` 的 `mod_version` 为准）
 
 构建：
 
