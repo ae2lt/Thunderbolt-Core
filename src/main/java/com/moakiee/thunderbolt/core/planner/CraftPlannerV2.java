@@ -638,18 +638,24 @@ public final class CraftPlannerV2<K> {
 
             List<FeedbackSeedBootstrap<K>> resolvedBackEdges =
                     new ArrayList<>(backEdges.size());
+            int resolvedBackEdgeCount = 0;
             for (CraftInput<K> backEdge : backEdges) {
-                FeedbackSeedBootstrap<K> bootstrap =
-                        directFeedbackSeedBootstrap(p, backEdge);
-                if (bootstrap == null) {
-                    bootstrap = feedbackSeedBootstrapFromConverter(p, backEdge);
+                List<FeedbackSeedBootstrap<K>> direct =
+                        directFeedbackSeedBootstraps(p, backEdge);
+                if (!direct.isEmpty()) {
+                    resolvedBackEdges.addAll(direct);
+                    resolvedBackEdgeCount++;
+                    continue;
                 }
+                FeedbackSeedBootstrap<K> bootstrap =
+                        feedbackSeedBootstrapFromConverter(p, backEdge);
                 if (bootstrap == null) {
                     break;
                 }
                 resolvedBackEdges.add(bootstrap);
+                resolvedBackEdgeCount++;
             }
-            if (resolvedBackEdges.size() != backEdges.size()) {
+            if (resolvedBackEdgeCount != backEdges.size()) {
                 cutOutputs.add(x);
                 continue;
             }
@@ -702,29 +708,24 @@ public final class CraftPlannerV2<K> {
      * {@code A} back into {@code B}. This does not admit a general SCC; it merely records the
      * executable one-step bootstrap that the target-first DAG cut would otherwise hide.
      */
-    private FeedbackSeedBootstrap<K> directFeedbackSeedBootstrap(
+    private List<FeedbackSeedBootstrap<K>> directFeedbackSeedBootstraps(
             CraftPattern<K> loopPattern, CraftInput<K> seedInput) {
         if (!seedInput.returned()
                 || seedInput.uses() != CraftInput.INFINITE_USES
                 || seedInput.reusableStockSource() == null) {
-            return null;
+            return List.of();
         }
 
-        CraftPattern<K> converter = null;
-        CraftInput<K> converterInput = null;
+        List<FeedbackSeedBootstrap<K>> result = new ArrayList<>();
         for (CraftPattern<K> candidate
                 : patternsByOutput.getOrDefault(seedInput.key(), List.of())) {
             CraftInput<K> input = feedbackConverterInput(
                     candidate, loopPattern.output(), seedInput.key());
             if (input == null) continue;
-            converter = candidate;
-            converterInput = input;
-            break;
+            result.add(new FeedbackSeedBootstrap<>(
+                    loopPattern, seedInput, candidate, input));
         }
-        return converter == null
-                ? null
-                : new FeedbackSeedBootstrap<>(
-                        loopPattern, seedInput, converter, converterInput);
+        return result;
     }
 
     /**
@@ -899,7 +900,7 @@ public final class CraftPlannerV2<K> {
 
     private long producibleVia(CraftPattern<K> p, Map<K, Long> cap) {
         long bound = Sat.SAT;
-        boolean feedbackSeedsBootstrappable = canBootstrapAllFeedbackSeeds(p);
+        boolean feedbackSeedsBootstrappable = canBootstrapAllFeedbackSeeds(p, cap);
         for (CraftInput<K> in : p.inputs()) {
             long c;
             if (in.reusableStockSource() != null) {
@@ -907,7 +908,7 @@ public final class CraftPlannerV2<K> {
                         graph.reusableStock(in.reusableStockSource(), in.key()),
                         cap.getOrDefault(in.key(), 0L));
                 if (feedbackSeedsBootstrappable
-                        && feedbackSeedBootstrap(p, in) != null) {
+                        && feedbackSeedBootstrap(p, in, cap) != null) {
                     // One physical output-state token can be converted into the reusable seed. Once
                     // that seed exists it supports every firing, exactly like a host-owned catalyst.
                     c = Math.max(c, in.amount());
@@ -930,16 +931,24 @@ public final class CraftPlannerV2<K> {
         return Sat.mul(bound, p.outputAmount());
     }
 
-    private boolean canBootstrapAllFeedbackSeeds(CraftPattern<K> pattern) {
+    private boolean canBootstrapAllFeedbackSeeds(
+            CraftPattern<K> pattern, Map<K, Long> materialCapacity) {
         List<FeedbackSeedBootstrap<K>> bootstraps = feedbackSeedBootstraps.get(pattern);
         if (bootstraps == null || bootstraps.isEmpty()) return false;
         long requiredOutput = 0L;
         long availableOutput = graph.stock(pattern.output());
         Set<Object> countedStorageScopes = new HashSet<>();
-        for (FeedbackSeedBootstrap<K> bootstrap : bootstraps) {
-            CraftInput<K> seed = bootstrap.seedInput();
+        boolean foundSeed = false;
+        for (CraftInput<K> seed : pattern.inputs()) {
+            FeedbackSeedBootstrap<K> bootstrap =
+                    feedbackSeedBootstrap(pattern, seed, materialCapacity);
+            if (bootstrap == null) continue;
+            foundSeed = true;
             long hostAvailable = graph.reusableStock(seed.reusableStockSource(), seed.key());
             long seedShortfall = Math.max(0L, seed.amount() - hostAvailable);
+            if (feedbackBootstrapSeedCapacity(bootstrap, materialCapacity) < seedShortfall) {
+                return false;
+            }
             requiredOutput = Sat.add(
                     requiredOutput, bootstrap.outputUnitsFor(seedShortfall));
             Object storageScope = seed.reusableStockSource().storageScope();
@@ -948,7 +957,7 @@ public final class CraftPlannerV2<K> {
                         availableOutput, graph.reusableStock(storageScope, pattern.output()));
             }
         }
-        return availableOutput >= requiredOutput;
+        return foundSeed && availableOutput >= requiredOutput;
     }
 
     // ---- linear backbone: one topological aggregation pass, each item resolved once -------------
@@ -1495,11 +1504,60 @@ public final class CraftPlannerV2<K> {
 
     private FeedbackSeedBootstrap<K> feedbackSeedBootstrap(
             CraftPattern<K> pattern, CraftInput<K> input) {
+        return feedbackSeedBootstrap(pattern, input, capacity);
+    }
+
+    private FeedbackSeedBootstrap<K> feedbackSeedBootstrap(
+            CraftPattern<K> pattern,
+            CraftInput<K> input,
+            Map<K, Long> materialCapacity) {
+        FeedbackSeedBootstrap<K> best = null;
+        long bestCapacity = -1L;
+        long bestStateCost = Long.MAX_VALUE;
         for (FeedbackSeedBootstrap<K> bootstrap
                 : feedbackSeedBootstraps.getOrDefault(pattern, List.of())) {
-            if (bootstrap.seedInput() == input) return bootstrap;
+            if (bootstrap.seedInput() != input) continue;
+            long candidateCapacity =
+                    feedbackBootstrapSeedCapacity(bootstrap, materialCapacity);
+            long candidateStateCost = bootstrap.outputUnitsFor(input.amount());
+            if (best == null
+                    || candidateCapacity > bestCapacity
+                    || (candidateCapacity == bestCapacity
+                    && candidateStateCost < bestStateCost)) {
+                best = bootstrap;
+                bestCapacity = candidateCapacity;
+                bestStateCost = candidateStateCost;
+            }
         }
-        return null;
+        return best;
+    }
+
+    /**
+     * Seed output supported by a converter's non-loop inputs. The loop-state input is reserved
+     * separately, so including it here would make the feedback edge prove its own capacity.
+     */
+    private long feedbackBootstrapSeedCapacity(
+            FeedbackSeedBootstrap<K> bootstrap, Map<K, Long> materialCapacity) {
+        CraftInput<K> seed = bootstrap.seedInput();
+        long availableLoopState = graph.stock(bootstrap.loopPattern().output());
+        if (seed.reusableStockSource() != null) {
+            availableLoopState = Sat.add(
+                    availableLoopState,
+                    graph.reusableStock(
+                            seed.reusableStockSource().storageScope(),
+                            bootstrap.loopPattern().output()));
+        }
+        long firings = bootstrap.converterInput().firingsFrom(availableLoopState);
+        for (CraftInput<K> auxiliary : bootstrap.converter().inputs()) {
+            if (auxiliary == bootstrap.converterInput()) continue;
+            long available = materialCapacity == null
+                    ? graph.stock(auxiliary.key())
+                    : materialCapacity.getOrDefault(
+                            auxiliary.key(), graph.stock(auxiliary.key()));
+            firings = Math.min(firings, auxiliary.firingsFrom(available));
+            if (firings == 0) return 0L;
+        }
+        return Sat.mul(firings, bootstrap.converter().outputAmount());
     }
 
     private boolean isFeedbackConverterInput(CraftPattern<K> pattern, CraftInput<K> input) {
@@ -1585,8 +1643,10 @@ public final class CraftPlannerV2<K> {
 
         Map<FeedbackSeedBootstrap<K>, Long> additionalBySeed = new HashMap<>();
         long totalAdditional = 0L;
-        for (FeedbackSeedBootstrap<K> bootstrap : bootstraps) {
-            CraftInput<K> seed = bootstrap.seedInput();
+        for (CraftInput<K> seed : preferred.inputs()) {
+            FeedbackSeedBootstrap<K> bootstrap =
+                    feedbackSeedBootstrap(preferred, seed);
+            if (bootstrap == null) continue;
             long hostAvailable = graph.reusableStock(seed.reusableStockSource(), seed.key());
             long seedShortfall = Math.max(0L, seed.amount() - hostAvailable);
             long required = bootstrap.outputUnitsFor(seedShortfall);

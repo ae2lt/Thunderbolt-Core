@@ -1355,6 +1355,72 @@ class CraftPlannerV2Test {
     }
 
     @Test
+    void multiInputBootstrapTriesAnotherConverterWhenFirstAuxiliaryIsMissing() {
+        var source = new ReusableStockSource("tianshu", "loop");
+        CraftPattern<String> unavailableConverter = new CraftPattern<>(
+                "seed", 1,
+                List.of(CraftInput.of("state", 1), CraftInput.of("missing_auxiliary", 1)),
+                "unavailable_converter");
+        CraftPattern<String> availableConverter = new CraftPattern<>(
+                "seed", 1,
+                List.of(CraftInput.of("state", 1), CraftInput.of("available_auxiliary", 1)),
+                "available_converter");
+        CraftPattern<String> gain = new CraftPattern<>(
+                "state", 2,
+                List.of(CraftInput.returnedFrom("seed", 1, source)),
+                "gain");
+        CraftGraph<String> graph = CraftGraph.<String>builder()
+                .pattern(unavailableConverter)
+                .pattern(availableConverter)
+                .pattern(gain)
+                .stock("state", 1)
+                .stock("available_auxiliary", 1)
+                .reusableStockRoute(source, "seed", List.of("seed"))
+                .build();
+
+        CraftPlan<String> plan = CraftPlannerV2.plan(graph, "state", 2);
+
+        assertTrue(plan.feasible(), "the second converter provides a valid bootstrap");
+        assertEquals(0L, firingsOf(plan, unavailableConverter));
+        assertEquals(1L, firingsOf(plan, availableConverter));
+        assertEquals(1L, firingsOf(plan, gain));
+        assertTrue(plan.missing().isEmpty());
+    }
+
+    @Test
+    void directFeedbackCutKeepsEveryBootstrapConverterCandidate() {
+        var source = new ReusableStockSource("tianshu", "loop");
+        CraftPattern<String> unavailableConverter = new CraftPattern<>(
+                "seed", 1,
+                List.of(CraftInput.of("state", 1), CraftInput.of("missing_auxiliary", 1)),
+                "unavailable_converter");
+        CraftPattern<String> availableConverter = new CraftPattern<>(
+                "seed", 1,
+                List.of(CraftInput.of("state", 1), CraftInput.of("available_auxiliary", 1)),
+                "available_converter");
+        CraftPattern<String> gain = new CraftPattern<>(
+                "state", 2,
+                List.of(CraftInput.returnedFrom("seed", 1, source)),
+                "gain");
+        CraftGraph<String> graph = CraftGraph.<String>builder()
+                .pattern(unavailableConverter)
+                .pattern(availableConverter)
+                .pattern(gain)
+                .stock("state", 1)
+                .stock("available_auxiliary", 3)
+                .reusableStockRoute(source, "seed", List.of("seed"))
+                .build();
+
+        CraftPlan<String> plan = CraftPlannerV2.plan(graph, "seed", 2);
+
+        assertTrue(plan.feasible(), "the direct cut must retain the second converter");
+        assertEquals(0L, firingsOf(plan, unavailableConverter));
+        assertEquals(3L, firingsOf(plan, availableConverter));
+        assertEquals(1L, firingsOf(plan, gain));
+        assertTrue(plan.missing().isEmpty());
+    }
+
+    @Test
     void alternateLoopStateCanBeCraftedIntoTheDefaultSeedBeforeStartup() {
         CraftPattern<String> bFromA = new CraftPattern<>(
                 "B", 1, List.of(CraftInput.of("A", 1)), "A_to_B");
