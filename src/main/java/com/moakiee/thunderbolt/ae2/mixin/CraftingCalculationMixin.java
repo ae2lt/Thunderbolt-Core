@@ -57,6 +57,9 @@ public abstract class CraftingCalculationMixin implements FastCraftingControl {
     private boolean simulate;
 
     @Shadow
+    private long requestedAmount;
+
+    @Shadow
     abstract net.minecraft.world.level.Level getLevel();
 
     @Unique
@@ -69,6 +72,14 @@ public abstract class CraftingCalculationMixin implements FastCraftingControl {
     @Nullable
     private Map<CraftingPlan, Map<ReusableStockUsageKey<AEKey>, Long>>
             thunderbolt$reusableStockByAttempt;
+
+    @Unique
+    @Nullable
+    private CraftingPlan thunderbolt$cachedFullSimulationPlan;
+
+    @Unique
+    private Map<ReusableStockUsageKey<AEKey>, Long>
+            thunderbolt$cachedFullSimulationReusableStock = Map.of();
 
     @Override
     public void ae2lt$setFastPlanningEnabled(boolean enabled) {
@@ -91,12 +102,24 @@ public abstract class CraftingCalculationMixin implements FastCraftingControl {
         }
         cir.setReturnValue(LoopCraftingPlan.wrapIfNeeded(result, usedReusableStock));
         reusableStockByAttempt.clear();
+        thunderbolt$clearSimulationFallback();
     }
 
     @Inject(method = "runCraftAttempt", at = @At("HEAD"), cancellable = true, remap = false)
     private void ae2ltCore$fastAttempt(boolean simulate, long amount,
                                        CallbackInfoReturnable<CraftingPlan> cir) {
         if (!ae2lt$isFastPlanningEnabled()) {
+            return;
+        }
+        if (simulate
+                && amount == requestedAmount
+                && thunderbolt$cachedFullSimulationPlan != null) {
+            this.simulate = true;
+            thunderbolt$getReusableStockByAttempt().put(
+                    thunderbolt$cachedFullSimulationPlan,
+                    thunderbolt$cachedFullSimulationReusableStock);
+            cir.setReturnValue(thunderbolt$cachedFullSimulationPlan);
+            thunderbolt$clearSimulationFallback();
             return;
         }
         var gridNode = simRequester.getGridNode();
@@ -116,6 +139,12 @@ public abstract class CraftingCalculationMixin implements FastCraftingControl {
                 // Reproduce the side effect of the real method body we are skipping, so that
                 // CraftingCalculation#isSimulation() reflects the attempt that produced this plan.
                 this.simulate = simulate;
+                if (!simulate
+                        && amount == requestedAmount
+                        && attempt.simulationFallback() != null) {
+                    thunderbolt$cachedFullSimulationPlan = attempt.simulationFallback();
+                    thunderbolt$cachedFullSimulationReusableStock = attempt.usedReusableStock();
+                }
                 if (attempt.plan() != null) {
                     thunderbolt$getReusableStockByAttempt().put(
                             attempt.plan(), attempt.usedReusableStock());
@@ -140,5 +169,11 @@ public abstract class CraftingCalculationMixin implements FastCraftingControl {
             this.thunderbolt$reusableStockByAttempt = new IdentityHashMap<>();
         }
         return this.thunderbolt$reusableStockByAttempt;
+    }
+
+    @Unique
+    private void thunderbolt$clearSimulationFallback() {
+        thunderbolt$cachedFullSimulationPlan = null;
+        thunderbolt$cachedFullSimulationReusableStock = Map.of();
     }
 }

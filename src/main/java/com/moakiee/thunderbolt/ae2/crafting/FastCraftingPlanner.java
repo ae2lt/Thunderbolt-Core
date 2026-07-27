@@ -129,22 +129,25 @@ public final class FastCraftingPlanner {
     public record FastAttempt(
             boolean handled,
             @Nullable CraftingPlan plan,
+            @Nullable CraftingPlan simulationFallback,
             Map<ReusableStockUsageKey<AEKey>, Long> usedReusableStock) {
         public FastAttempt {
             usedReusableStock = Map.copyOf(usedReusableStock);
         }
 
         static FastAttempt decline() {
-            return new FastAttempt(false, null, Map.of());
-        }
-
-        static FastAttempt handled(@Nullable CraftingPlan plan) {
-            return new FastAttempt(true, plan, Map.of());
+            return new FastAttempt(false, null, null, Map.of());
         }
 
         static FastAttempt handled(
                 CraftingPlan plan, Map<ReusableStockUsageKey<AEKey>, Long> usedReusableStock) {
-            return new FastAttempt(true, plan, usedReusableStock);
+            return new FastAttempt(true, plan, null, usedReusableStock);
+        }
+
+        static FastAttempt infeasible(
+                CraftingPlan simulationFallback,
+                Map<ReusableStockUsageKey<AEKey>, Long> usedReusableStock) {
+            return new FastAttempt(true, null, simulationFallback, usedReusableStock);
         }
     }
 
@@ -207,7 +210,13 @@ public final class FastCraftingPlanner {
         // failure. A feasible plan is always mass-balanced; an infeasible one reports the shortfall
         // found by the selected local routes.
         if (!simulate) {
-            return FastAttempt.handled(null); // this amount can't be made within our bounded search
+            // AE2 asks for this exact amount again with simulate=true to build the missing-material
+            // page. Build that cheap representation now while the graph/snapshot are still available;
+            // CraftingCalculationMixin reuses it instead of rebuilding and replanning the same graph.
+            return FastAttempt.infeasible(
+                    toAe2Plan(output, amount, plan, multi, true, durability,
+                            patternSources, emittable, snapshot, reservedStock),
+                    plan.usedReusableStock());
         }
         return FastAttempt.handled(
                 toAe2Plan(output, amount, plan, multi, true, durability,

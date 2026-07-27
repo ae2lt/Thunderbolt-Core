@@ -40,7 +40,15 @@ public final class FastPlanningWatchdog {
     }
 
     public static void stop() {
-        ACTIVE.remove(Thread.currentThread());
+        Watch watch = ACTIVE.remove(Thread.currentThread());
+        if (watch == null) {
+            return;
+        }
+        long elapsed = System.currentTimeMillis() - watch.startMs;
+        if (elapsed >= WARN_AFTER_MS) {
+            LOG.warn("[thunderbolt] SLOW crafting calc completed after {}ms\n    {}",
+                    elapsed, watch.label);
+        }
     }
 
     private static void ensureTicker() {

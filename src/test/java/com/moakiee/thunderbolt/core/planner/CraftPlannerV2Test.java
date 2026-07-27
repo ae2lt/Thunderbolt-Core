@@ -3,8 +3,10 @@ package com.moakiee.thunderbolt.core.planner;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertTimeoutPreemptively;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.LinkedHashSet;
@@ -124,6 +126,45 @@ class CraftPlannerV2Test {
         assertTrue(plan.feasible(), "1 bucket should be reused 100 times");
         assertEquals(100L, plan.usedStock().get("water"));
         assertEquals(1L, plan.usedStock().get("bucket"));
+    }
+
+    /** The same unchanged catalyst is a global reusable reserve, not one seed per distinct pattern. */
+    @Test
+    void unchangedCatalystIsSharedAcrossLinearPatterns() {
+        CraftGraph<String> graph = CraftGraph.<String>builder()
+                .pattern("target", 1, List.of(
+                        CraftInput.of("intermediate", 1),
+                        CraftInput.returned("template", 1)))
+                .pattern("intermediate", 1, List.of(
+                        CraftInput.of("raw", 1),
+                        CraftInput.returned("template", 1)))
+                .stock("raw", 1)
+                .stock("template", 1)
+                .build();
+
+        CraftPlan<String> plan = CraftPlannerV2.plan(graph, "target", 1);
+
+        assertTrue(plan.feasible());
+        assertEquals(1L, plan.usedStock().get("raw"));
+        assertEquals(1L, plan.usedStock().get("template"));
+    }
+
+    /**
+     * A sibling byproduct must not algebraically bootstrap an earlier catalyst when that sibling
+     * itself depends on the catalyzed output.
+     */
+    @Test
+    void indirectByproductCannotBootstrapReturnedCatalyst() {
+        CraftGraph<String> graph = CraftGraph.<String>builder()
+                .pattern("target", 1, List.of(CraftInput.of("catalyzed", 1)),
+                        List.of(CraftOutput.of("seed", 1)))
+                .pattern("catalyzed", 1, List.of(CraftInput.returned("seed", 1)))
+                .build();
+
+        CraftPlan<String> plan = CraftPlannerV2.plan(graph, "target", 1);
+
+        assertFalse(plan.feasible());
+        assertEquals(1L, plan.missing().get("seed"));
     }
 
     @Test
@@ -2032,6 +2073,30 @@ class CraftPlannerV2Test {
     }
 
     /**
+     * Ordinary unchanged catalysts do not make a deep acyclic graph seed-order-sensitive. The shared
+     * seed reserve stays linear and the graph must not fall into the recursive depth guard.
+     */
+    @Test
+    void deepAcyclicCatalystChainRemainsLinear() {
+        int n = 1_000;
+        CraftGraph.Builder<String> builder = CraftGraph.<String>builder()
+                .stock("A" + n, 1)
+                .stock("template", 1);
+        for (int i = 0; i < n; i++) {
+            builder.pattern("A" + i, 1, List.of(
+                    CraftInput.of("A" + (i + 1), 1),
+                    CraftInput.returned("template", 1)));
+        }
+
+        CraftPlan<String> plan = CraftPlannerV2.plan(builder.build(), "A0", 1);
+
+        assertTrue(plan.feasible());
+        assertEquals(1L, plan.usedStock().get("A" + n));
+        assertEquals(1L, plan.usedStock().get("template"));
+        assertFalse(plan.budgetExhausted());
+    }
+
+    /**
      * The same chain with no stock anywhere forces the recursive bounded search (the linear pass reports
      * infeasible). Without {@link CraftPlannerV2#MAX_OBTAIN_DEPTH} the descent would recurse {@code n}
      * deep and {@code StackOverflowError}; with it, only the over-deep branch degrades to a
@@ -2052,5 +2117,38 @@ class CraftPlannerV2Test {
         assertFalse(plan.feasible());
         assertFalse(plan.missing().isEmpty(), "shortfall reported, not crashed");
         assertFalse(plan.budgetExhausted(), "depth degradation is branch-local, not a global result flag");
+    }
+
+    /**
+     * A reusable-seed output can be revisited by every materially distinct parent branch. Capacity
+     * ranking depends only on the immutable graph snapshot and must therefore be computed once, not
+     * re-sorted through {@code producibleVia} before every node-budget check.
+     */
+    @Test
+    void feedbackCapacityRankingIsCachedAcrossParentRetries() {
+        assertTimeoutPreemptively(Duration.ofSeconds(2), () -> {
+            var source = new ReusableStockSource("host", "loop");
+            CraftGraph.Builder<String> builder = CraftGraph.<String>builder()
+                    .pattern("A", 1, List.of(CraftInput.returnedFrom("B", 1, source)))
+                    .pattern("B", 1, List.of(CraftInput.of("A", 1)))
+                    .reusableStock("host", "A", 1)
+                    .reusableStockRoute(source, "B", List.of("B"));
+
+            for (int route = 0; route < 64; route++) {
+                builder.pattern("A", 1, List.of(CraftInput.of("raw-" + route, 1)));
+            }
+            for (int parent = 0; parent < 1_024; parent++) {
+                builder.pattern(new CraftPattern<>(
+                        "target",
+                        1,
+                        List.of(CraftInput.of("A", 1), CraftInput.of("missing-" + parent, 1)),
+                        List.of(CraftOutput.of("distinct-" + parent, 1)),
+                        "parent-" + parent));
+            }
+
+            CraftPlan<String> plan = CraftPlannerV2.plan(builder.build(), "target", 1);
+            assertFalse(plan.feasible());
+            assertFalse(plan.missing().isEmpty());
+        });
     }
 }
