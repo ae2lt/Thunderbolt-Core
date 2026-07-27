@@ -23,7 +23,8 @@ import com.moakiee.thunderbolt.ae2.overload.model.MatchMode;
  * It preserves the original pattern's execution behavior while overriding input
  * matching semantics per slot for planning and crafting extraction.
  */
-public final class Ae2OverloadPatternDetails implements IPatternDetails, OverloadedProviderOnlyPatternDetails {
+public final class Ae2OverloadPatternDetails
+        implements IPatternDetails, OverloadedProviderOnlyPatternDetails, WrappedPatternDetails {
     private final AEItemKey definition;
     private final OverloadPatternDetails overloadDetails;
     private final IPatternDetails sourceDetails;
@@ -88,6 +89,11 @@ public final class Ae2OverloadPatternDetails implements IPatternDetails, Overloa
     @Override
     public OverloadPatternDetails overloadPatternDetailsView() {
         return overloadDetails;
+    }
+
+    @Override
+    public IPatternDetails wrappedPatternDetails() {
+        return sourceDetails;
     }
 
     @Override
