@@ -51,6 +51,8 @@ public final class ExecuteLoopPattern implements IPatternDetails, IProviderLooku
     private final Map<AEKey, SeedVariantRule> plannedSeedRules;
     private final int dispatchPriority;
     private final int dispatchOrder;
+    /** Cached because the seed counters and routed-credit maps are immutable after construction. */
+    private final int hashCode;
 
     public ExecuteLoopPattern(
             IPatternDetails delegate,
@@ -92,6 +94,7 @@ public final class ExecuteLoopPattern implements IPatternDetails, IProviderLooku
                 ? prioritized.dispatchPriority() : 0;
         this.dispatchOrder = delegate instanceof IPrioritizedCraftingTask prioritized
                 ? prioritized.dispatchOrder() : 0;
+        this.hashCode = computeHashCode();
     }
 
     private static Map<Integer, AEKey> snapshotPlannedSeedSlots(IPatternDetails delegate) {
@@ -329,6 +332,83 @@ public final class ExecuteLoopPattern implements IPatternDetails, IProviderLooku
     @Override public void pushInputsToExternalInventory(
             KeyCounter[] inputHolder, PatternInputSink inputSink) {
         delegate.pushInputsToExternalInventory(inputHolder, inputSink);
+    }
+
+    /**
+     * Execution wrappers are equal only when every source field that affects seed accounting is
+     * equal. This deliberately permits safely identical tasks to merge in AE2's task maps while
+     * keeping tasks for different consumers or routed credits separate.
+     */
+    @Override
+    public boolean equals(Object obj) {
+        if (this == obj) return true;
+        if (!(obj instanceof ExecuteLoopPattern other) || hashCode != other.hashCode) return false;
+        return delegate.equals(other.delegate)
+                && seedConsumerId.equals(other.seedConsumerId)
+                && counterEquals(initialSeed, other.initialSeed)
+                && counterEquals(inputSeed, other.inputSeed)
+                && creditMapsEqual(outputSeedCredits, other.outputSeedCredits)
+                && creditMapsEqual(sharedOutputSeedCredits, other.sharedOutputSeedCredits);
+    }
+
+    @Override
+    public int hashCode() {
+        return hashCode;
+    }
+
+    private int computeHashCode() {
+        int result = delegate.hashCode();
+        result = 31 * result + seedConsumerId.hashCode();
+        result = 31 * result + counterHashCode(initialSeed);
+        result = 31 * result + counterHashCode(inputSeed);
+        result = 31 * result + creditMapHashCode(outputSeedCredits);
+        result = 31 * result + creditMapHashCode(sharedOutputSeedCredits);
+        return result;
+    }
+
+    private static boolean counterEquals(KeyCounter left, KeyCounter right) {
+        if (left == right) return true;
+        int leftEntries = 0;
+        for (var entry : left) {
+            long amount = entry.getLongValue();
+            if (amount == 0L) continue;
+            leftEntries++;
+            if (right.get(entry.getKey()) != amount) return false;
+        }
+        int rightEntries = 0;
+        for (var entry : right) {
+            if (entry.getLongValue() != 0L) rightEntries++;
+        }
+        return leftEntries == rightEntries;
+    }
+
+    private static int counterHashCode(KeyCounter counter) {
+        int result = 0;
+        for (var entry : counter) {
+            long amount = entry.getLongValue();
+            if (amount == 0L) continue;
+            result += entry.getKey().hashCode() ^ Long.hashCode(amount);
+        }
+        return result;
+    }
+
+    private static boolean creditMapsEqual(
+            Map<UUID, KeyCounter> left, Map<UUID, KeyCounter> right) {
+        if (left == right) return true;
+        if (left.size() != right.size()) return false;
+        for (var entry : left.entrySet()) {
+            var other = right.get(entry.getKey());
+            if (other == null || !counterEquals(entry.getValue(), other)) return false;
+        }
+        return true;
+    }
+
+    private static int creditMapHashCode(Map<UUID, KeyCounter> credits) {
+        int result = 0;
+        for (var entry : credits.entrySet()) {
+            result += entry.getKey().hashCode() ^ counterHashCode(entry.getValue());
+        }
+        return result;
     }
 
     private static KeyCounter copy(KeyCounter source) {
