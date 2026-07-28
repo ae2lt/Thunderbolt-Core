@@ -1557,7 +1557,7 @@ class CraftPlannerV2Test {
 
         assertTrue(plan.supported());
         assertFalse(plan.feasible());
-        assertFalse(plan.budgetExhausted(), "node-local exhaustion must not poison the whole result");
+        assertFalse(plan.budgetExhausted(), "exact failure reuse should complete within the global budget");
         assertEquals(requested, plan.missing().get("A" + depth),
                 "the final greedy route must still report its concrete raw-leaf shortfall");
         assertTrue(plan.itemsProcessed() <= depth * alternatives,
@@ -1618,8 +1618,8 @@ class CraftPlannerV2Test {
 
     /**
      * One hard-fuzzy AE2 pattern may contribute 64 concrete candidates. If all of them revisit the same
-     * child and lose on a shared-stock conflict, that child's local cap must switch it to bounded probe
-     * mode without killing the parent search or hiding the first ordinary alternative after the window.
+     * child and lose on a shared-stock conflict, that child's hot threshold may change route ordering
+     * without killing the parent search or hiding any later ordinary alternative.
      */
     @Test
     void localCapFallsBackToGreedyWithoutKillingParentSearch() {
@@ -1632,7 +1632,7 @@ class CraftPlannerV2Test {
         for (int i = 0; i < failedAlternatives; i++) {
             String sibling = "Y" + i;
             // A unique byproduct makes these branches materially distinct, ensuring this test
-            // exercises the local visit cap rather than the equivalence proof below.
+            // exercises the hot-node threshold rather than the equivalence proof below.
             builder.pattern(
                     sibling,
                     1,
@@ -1655,8 +1655,8 @@ class CraftPlannerV2Test {
         CraftPlan<String> cap64 = CraftPlannerV2.plan(graph, "target", 1, 64);
         CraftPlan<String> defaultCap = CraftPlannerV2.plan(graph, "target", 1);
 
-        assertTrue(cap64.feasible(), "the locally capped X subtree must continue greedily");
-        assertFalse(cap64.budgetExhausted(), "local greedy degradation must not kill the whole plan");
+        assertTrue(cap64.feasible(), "the hot X subtree must continue searching");
+        assertFalse(cap64.budgetExhausted(), "route reordering must not kill the whole plan");
         assertEquals(1L, firingsOf(cap64, good));
         assertTrue(defaultCap.feasible(), "the default must search beyond one complete fuzzy window");
         assertFalse(defaultCap.budgetExhausted());
@@ -1664,13 +1664,13 @@ class CraftPlannerV2Test {
     }
 
     /**
-     * A hot child may reach its local visit cap under many distinct parent alternatives. Its former
+     * A hot child may reach its visit threshold under many distinct parent alternatives. Its former
      * highest-capacity route can become impossible after a later parent consumes that route's leaf
      * stock, while another child route remains feasible. Capped mode must therefore choose against
-     * the current rollback-restored pools instead of freezing one recipe for every future state.
+     * the current rollback-restored pools instead of reusing one stale order for every future state.
      */
     @Test
-    void cappedChildReevaluatesGreedyRouteAgainstCurrentStock() {
+    void hotChildReevaluatesGreedyRouteAgainstCurrentStock() {
         CraftPattern<String> xViaShared = new CraftPattern<>(
                 "X", 1, List.of(CraftInput.of("shared", 1)), "X-via-shared");
         CraftPattern<String> xViaSpecial = new CraftPattern<>(
@@ -1680,13 +1680,13 @@ class CraftPlannerV2Test {
                 .stock("shared", 1)
                 .stock("special", 1);
         List<String> blockedRouteStock = new ArrayList<>();
-        for (int i = 0; i < CraftPlannerV2.MAX_CAPPED_ROUTE_PROBES + 3; i++) {
+        for (int i = 0; i < 7; i++) {
             String key = "blocked-route-" + i;
             blockedRouteStock.add(key);
             builder.pattern("X", 1, List.of(CraftInput.of(key, 1)));
             builder.stock(key, 1);
         }
-        // This route deliberately sits outside the fixed probe window in immutable capacity order.
+        // This route deliberately sits behind several equal-capacity routes in immutable order.
         builder.pattern(xViaSpecial);
 
         for (int i = 0; i < CraftPlannerV2.DEFAULT_VISIT_CAP; i++) {
@@ -1731,12 +1731,87 @@ class CraftPlannerV2Test {
                 () -> CraftPlannerV2.plan(graph, "target", 1));
 
         assertTrue(plan.feasible(),
-                "after shared is reserved by the parent, capped X must route through special");
+                "after shared is reserved by the parent, hot X must route through special");
         assertEquals(1L, firingsOf(plan, good));
         assertEquals(0L, firingsOf(plan, xViaShared));
         assertEquals(1L, firingsOf(plan, xViaSpecial));
         assertEquals(1L, plan.usedStock().get("shared"));
         assertEquals(1L, plan.usedStock().get("special"));
+    }
+
+    /**
+     * Four optimistic trap routes rank ahead of the only feasible fifth route. Each trap appears to
+     * have capacity because its two child branches independently count the same token, but firing it
+     * needs that token twice and fails. Repeated parent conflicts first make X hot; the final parent
+     * is craftable only if hot-node search keeps going past all four traps.
+     */
+    @Test
+    void hotNodeSearchDoesNotDropTheFifthFeasibleRoute() {
+        CraftGraph.Builder<String> builder = CraftGraph.builder();
+        for (int trap = 0; trap < 4; trap++) {
+            String token = "token-" + trap;
+            String left = "left-" + trap;
+            String right = "right-" + trap;
+            builder.pattern(left, 1, List.of(CraftInput.of(token, 1)));
+            builder.pattern(right, 1, List.of(CraftInput.of(token, 1)));
+            builder.pattern("X", 1, List.of(
+                    CraftInput.of(left, 1),
+                    CraftInput.of(right, 1)));
+            builder.stock(token, 1);
+        }
+
+        CraftPattern<String> feasibleX = new CraftPattern<>(
+                "X", 1, List.of(CraftInput.of("special", 1)), "X-via-special");
+        builder.pattern(feasibleX).stock("special", 1);
+
+        for (int parent = 0; parent < CraftPlannerV2.DEFAULT_VISIT_CAP; parent++) {
+            String sibling = "sibling-" + parent;
+            builder.pattern(sibling, 1, List.of(CraftInput.of("special", 1)));
+            builder.pattern(new CraftPattern<>(
+                    "target",
+                    1,
+                    List.of(CraftInput.of("X", 1), CraftInput.of(sibling, 1)),
+                    List.of(CraftOutput.of("distinct-" + parent, 1)),
+                    "decoy-" + parent));
+        }
+        CraftPattern<String> good = new CraftPattern<>(
+                "target", 1, List.of(CraftInput.of("X", 1)), "good");
+        builder.pattern(good);
+
+        CraftPlan<String> plan = assertTimeoutPreemptively(
+                Duration.ofSeconds(2),
+                () -> CraftPlannerV2.plan(builder.build(), "target", 1));
+
+        assertTrue(plan.feasible(), "the fifth X route remains eligible while work budget remains");
+        assertFalse(plan.budgetExhausted());
+        assertEquals(1L, firingsOf(plan, feasibleX));
+        assertEquals(1L, firingsOf(plan, good));
+    }
+
+    /**
+     * Exhausting the global work guard is not evidence that a leaf is absent. Partial speculative
+     * mutations are discarded and no missing-material diagnosis is emitted.
+     */
+    @Test
+    void globalSearchBudgetExhaustionIsNotReportedAsMissing() {
+        CraftGraph<String> graph = CraftGraph.<String>builder()
+                .pattern("X", 1, List.of(CraftInput.of("shared", 1)))
+                .pattern("Y", 1, List.of(CraftInput.of("shared", 1)))
+                .pattern("target", 1, List.of(
+                        CraftInput.of("X", 1),
+                        CraftInput.of("Y", 1)))
+                .pattern("target", 1, List.of(CraftInput.of("good", 1)))
+                .stock("shared", 1)
+                .stock("good", 1)
+                .build();
+
+        CraftPlan<String> plan = CraftPlannerV2.plan(graph, "target", 1, 1, 1);
+
+        assertFalse(plan.feasible());
+        assertTrue(plan.budgetExhausted());
+        assertTrue(plan.firings().isEmpty());
+        assertTrue(plan.usedStock().isEmpty());
+        assertTrue(plan.missing().isEmpty(), "budget cutoff must not masquerade as absent material");
     }
 
     /**
@@ -2005,11 +2080,10 @@ class CraftPlannerV2Test {
      * (a witness plan exists with exactly-provisioned stock), then add real <em>trap</em> recipes that
      * the optimistic capacity estimate prefers but that are actually infeasible (a diamond that
      * double-counts one shared unit). The greedy linear pass takes the bait, fails, and the bounded
-     * search must roll back and recover the witness.
+     * budgeted search must roll back and recover the witness.
      *
-     * <p>The planner MUST come back feasible across thousands of random graphs. The legacy
-     * {@link CraftPlan#budgetExhausted()} result bit also remains {@code false}: local node freezing is
-     * no longer represented as whole-plan exhaustion.
+     * <p>The planner MUST come back feasible across thousands of random graphs and complete within the
+     * global work budget.
      */
     @Test
     void reverseConstructedGraphsAreAlwaysCraftable() {
@@ -2023,7 +2097,7 @@ class CraftPlannerV2Test {
                             + plan.missing() + " seed=" + seed);
             assertTrue(plan.missing().isEmpty(), "seed=" + seed);
             assertFalse(plan.budgetExhausted(),
-                    "node-local search must never emit a whole-plan exhaustion flag, seed=" + seed);
+                    "constructed witness should fit within the work budget, seed=" + seed);
             assertMassBalance(plan, rg, seed); // soundness on top of completeness
         }
     }

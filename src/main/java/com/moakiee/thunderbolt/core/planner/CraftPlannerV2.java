@@ -31,14 +31,12 @@ import java.util.Set;
  *   <li><b>Dynamic-capacity greedy</b>: among an item's recipes, the one with the highest current
  *       capacity ({@code stock + craftable}) is preferred, so the planner naturally balances onto the
  *       recipe current stock can actually fulfill (no scarcity metric needed).</li>
- *   <li><b>Bounded backtracking</b>: contended items (more than one recipe) are searched in
- *       capacity order with a {@code trail} for commit/rollback. Each node has a visit cap {@code K};
- *       after that, that node re-ranks against the current pools and probes only a fixed route window
- *       while parents, siblings and descendants retain their own independent search budgets. Exhaustion
- *       can therefore make one node choose a suboptimal route, but never invalidates the whole
- *       calculation. Failed speculative subtrees are memoized only for the exact node, amount, depth
- *       and rollback-restored availability state, preventing repeated proof work without reusing a
- *       stale inventory result.</li>
+ *   <li><b>Budgeted backtracking</b>: contended items (more than one recipe) are searched in
+ *       capacity order with a {@code trail} for commit/rollback. No node drops candidates at a fixed
+ *       route count: a hot node re-ranks every materially distinct route against the current pools and
+ *       search continues while the plan-wide deterministic work budget remains. Failed speculative
+ *       subtrees are memoized only for the exact node, amount, depth and rollback-restored availability
+ *       state, preventing repeated proof work without reusing a stale inventory result.</li>
  * </ul>
  *
  * <p><b>Soundness (no false positives):</b> the pool is never overdrawn (a draw is capped by what is
@@ -49,20 +47,19 @@ import java.util.Set;
 public final class CraftPlannerV2<K> {
 
     /**
-     * Default per-node visit cap. It is a safety net, not the workhorse: normal graphs are resolved by
-     * the linear backbone or recover via a handful of backtracks, never approaching this bound. 256
-     * lets a hot shared node participate in several rounds of parent/fuzzy backtracking before only
-     * that node switches to bounded current-state probes.
+     * Default hot-node threshold. It does not truncate search: after this many visits the node merely
+     * switches from its immutable capacity order to current-pool re-ranking. Normal graphs are resolved
+     * by the linear backbone or recover via a handful of backtracks, never approaching this threshold.
      */
     public static final int DEFAULT_VISIT_CAP = 256;
 
     /**
-     * Once a hot node reaches its local visit cap, re-check only this many materially distinct routes
-     * against the current rollback-restored inventory state. A single permanently frozen recipe is
-     * unsafe: an ancestor may consume that recipe's leaf stock before revisiting the node while a
-     * different route remains feasible. The fixed window preserves the bounded fallback contract.
+     * Deterministic work budget shared by the fallback search and conversion-orientation retries.
+     * It counts recursive craftable-node expansions, alternate-route probes and dynamic route-score
+     * evaluations. The linear topological backbone does not consume this budget.
      */
-    static final int MAX_CAPPED_ROUTE_PROBES = 4;
+    public static final int DEFAULT_SEARCH_WORK_BUDGET =
+            Math.max(1_024, Integer.getInteger("thunderbolt.maxCraftSearchWork", 131_072));
 
     /**
      * Maximum number of alternate roots tried for a proven conservative conversion SCC. This is a
@@ -87,6 +84,7 @@ public final class CraftPlannerV2<K> {
 
     private final CraftGraph<K> graph;
     private final int visitCap;
+    private final SearchBudget searchBudget;
     private final Set<K> cutOutputs = new LinkedHashSet<>();
     private final Map<CraftPattern<K>, Set<K>> suppressedPositiveFeedbackOutputs =
             new IdentityHashMap<>();
@@ -160,22 +158,33 @@ public final class CraftPlannerV2<K> {
     // introduces no new missing, so the decision survives nested single-recipe commits.
     private long missingTotal;
 
-    private CraftPlannerV2(CraftGraph<K> graph, int visitCap) {
+    private CraftPlannerV2(CraftGraph<K> graph, int visitCap, SearchBudget searchBudget) {
         this.graph = graph;
         this.visitCap = Math.max(1, visitCap);
+        this.searchBudget = searchBudget;
     }
 
     public static <K> CraftPlan<K> plan(CraftGraph<K> graph, K target, long amount) {
-        return plan(graph, target, amount, DEFAULT_VISIT_CAP);
+        return plan(graph, target, amount, DEFAULT_VISIT_CAP, DEFAULT_SEARCH_WORK_BUDGET);
     }
 
     public static <K> CraftPlan<K> plan(CraftGraph<K> graph, K target, long amount, int visitCap) {
+        return plan(graph, target, amount, visitCap, DEFAULT_SEARCH_WORK_BUDGET);
+    }
+
+    static <K> CraftPlan<K> plan(
+            CraftGraph<K> graph,
+            K target,
+            long amount,
+            int visitCap,
+            int searchWorkBudget) {
         if (amount <= 0) {
             return new CraftPlan<>(true, true, Map.of(), Map.of(), Map.of(), Map.of(), Map.of(), 0, false);
         }
-        CraftPlannerV2<K> firstPlanner = new CraftPlannerV2<>(graph, visitCap);
+        SearchBudget budget = new SearchBudget(searchWorkBudget);
+        CraftPlannerV2<K> firstPlanner = new CraftPlannerV2<>(graph, visitCap, budget);
         CraftPlan<K> first = firstPlanner.run(target, amount, List.of());
-        if (first.feasible() || firstPlanner.cutOutputs.isEmpty()) {
+        if (first.feasible() || first.budgetExhausted() || firstPlanner.cutOutputs.isEmpty()) {
             return first;
         }
         // Only the infeasible-with-cut-outputs path consults cycle analysis; the feasible
@@ -192,9 +201,9 @@ public final class CraftPlannerV2<K> {
                 continue;
             }
             retries++;
-            CraftPlan<K> retry = new CraftPlannerV2<>(graph, visitCap)
+            CraftPlan<K> retry = new CraftPlannerV2<>(graph, visitCap, budget)
                     .run(target, amount, List.of(cutOutput));
-            if (retry.feasible()) return retry;
+            if (retry.feasible() || retry.budgetExhausted()) return retry;
         }
         return first;
     }
@@ -243,11 +252,19 @@ public final class CraftPlannerV2<K> {
             }
         }
 
-        // 2) Contended cone only: fall back to the bounded recursive search (trail + per-node cap K).
+        // 2) Contended cone only: fall back to the budgeted recursive search (trail + rollback).
         for (K x : items) {
             stockLeft.put(x, graph.stock(x));
         }
+        int fallbackMark = trail.size();
         obtain(target, amount, true);
+        if (searchBudget.exhausted()) {
+            // Budget exhaustion is not a material proof. Discard every partial mutation so callers
+            // cannot accidentally turn an interrupted route into a missing-material diagnosis.
+            rollback(fallbackMark);
+            return new CraftPlan<>(true, false,
+                    Map.of(), Map.of(), Map.of(), Map.of(), Map.of(), processed, true);
+        }
         boolean feasible = missing.isEmpty();
         CraftPlan<K> fallback = new CraftPlan<>(true, feasible,
                 new IdentityHashMap<>(firings),
@@ -1218,21 +1235,26 @@ public final class CraftPlannerV2<K> {
             return d;
         }
 
+        if (!searchBudget.tryConsume()) {
+            return d;
+        }
         if (processed < Integer.MAX_VALUE) {
             processed++;
         }
 
         int v = visit.getOrDefault(x, 0);
         if (v >= visitCap) {
-            return obtainCapped(x, d, commitFailure, failureKey);
+            return obtainHot(x, d, commitFailure, failureKey);
         }
         visit.put(x, v + 1);
 
-        // A single recipe needs no alternate search, but its descendants may still resolve their own
-        // contention normally until one of them reaches its local cap.
+        // A single recipe needs no alternate search, but its descendants still resolve their own
+        // contention normally and may switch to current-state ordering once hot.
         if (ps.size() == 1) {
             long unmet = fire(x, ps.get(0), d, !commitFailure);
-            if (!commitFailure && unmet > 0) failedSpeculativeSearches.add(failureKey);
+            if (!commitFailure && unmet > 0 && !searchBudget.exhausted()) {
+                failedSpeculativeSearches.add(failureKey);
+            }
             return unmet;
         }
 
@@ -1242,13 +1264,22 @@ public final class CraftPlannerV2<K> {
             // There is no materially different alternative to discover. Commit the representative
             // once instead of speculatively expanding it, rolling it back, and expanding it again.
             long unmet = fire(x, distinctBranches.get(0), d, !commitFailure);
-            if (!commitFailure && unmet > 0) failedSpeculativeSearches.add(failureKey);
+            if (!commitFailure && unmet > 0 && !searchBudget.exhausted()) {
+                failedSpeculativeSearches.add(failureKey);
+            }
             return unmet;
         }
         for (CraftPattern<K> r : distinctBranches) {
+            if (!searchBudget.tryConsume()) {
+                return d;
+            }
             int mark = trail.size();
             long beforeMissing = missingTotal;
             long unmet = fire(x, r, d, true);
+            if (searchBudget.exhausted()) {
+                rollback(mark);
+                return d;
+            }
             if (unmet == 0 && missingTotal == beforeMissing) {
                 return unmet; // this recipe satisfied d without introducing any shortfall
             }
@@ -1263,20 +1294,27 @@ public final class CraftPlannerV2<K> {
     }
 
     /**
-     * Bounded degradation for a node already hot under many parent alternatives. Probe a small fixed
-     * route window using the actual current pools; successful probes stay committed, while failures
-     * roll back exactly like the normal alternate search. This avoids carrying a recipe selected under
-     * an old inventory state into every later call without reopening unbounded branching.
+     * A node revisited under many parent alternatives is re-ranked against the exact current pools.
+     * Every materially distinct route remains eligible: the plan-wide work budget, rather than a
+     * per-node candidate cutoff, is the only search bound.
      */
-    private long obtainCapped(
+    private long obtainHot(
             K x, long d, boolean commitFailure, SearchFailure<K> failureKey) {
-        List<CraftPattern<K>> distinctBranches = cappedRouteOrder(x);
-        int probes = Math.min(MAX_CAPPED_ROUTE_PROBES, distinctBranches.size());
-        for (int i = 0; i < probes; i++) {
-            CraftPattern<K> route = distinctBranches.get(i);
+        List<CraftPattern<K>> distinctBranches = hotRouteOrder(x);
+        if (searchBudget.exhausted()) {
+            return d;
+        }
+        for (CraftPattern<K> route : distinctBranches) {
+            if (!searchBudget.tryConsume()) {
+                return d;
+            }
             int mark = trail.size();
             long beforeMissing = missingTotal;
             long unmet = fire(x, route, d, true);
+            if (searchBudget.exhausted()) {
+                rollback(mark);
+                return d;
+            }
             if (unmet == 0 && missingTotal == beforeMissing) {
                 return 0L;
             }
@@ -1295,7 +1333,7 @@ public final class CraftPlannerV2<K> {
      * retain their already-proven static score because their availability has separate reservation
      * semantics. Sorting is stable, so equal estimates preserve the caller-defined preference order.
      */
-    private List<CraftPattern<K>> cappedRouteOrder(K x) {
+    private List<CraftPattern<K>> hotRouteOrder(K x) {
         List<CraftPattern<K>> routes =
                 new ArrayList<>(distinctMaterialBranches(capacityOrder(x)));
         if (routes.size() < 2) {
@@ -1307,6 +1345,9 @@ public final class CraftPlannerV2<K> {
         for (CraftPattern<K> route : routes) {
             scores.put(route, currentCapacityVia(
                     route, currentCapacity, new HashSet<>()));
+            if (searchBudget.exhausted()) {
+                return routes;
+            }
         }
         routes.sort((left, right) ->
                 Long.compare(scores.get(right), scores.get(left)));
@@ -1317,6 +1358,9 @@ public final class CraftPlannerV2<K> {
             CraftPattern<K> pattern,
             Map<K, Long> memo,
             Set<K> evaluating) {
+        if (!searchBudget.tryConsume()) {
+            return 0L;
+        }
         long bound = Sat.SAT;
         for (CraftInput<K> input : pattern.inputs()) {
             if (input.returned() || input.reusableStockSource() != null) {
@@ -1350,6 +1394,10 @@ public final class CraftPlannerV2<K> {
             bestCrafted = Math.max(
                     bestCrafted,
                     currentCapacityVia(pattern, memo, evaluating));
+            if (searchBudget.exhausted()) {
+                evaluating.remove(key);
+                return immediate;
+            }
             if (Sat.isSaturated(bestCrafted)) {
                 break;
             }
@@ -1420,6 +1468,9 @@ public final class CraftPlannerV2<K> {
                 }
             }
             inputUnmet = Sat.add(inputUnmet, unmet);
+            if (searchBudget.exhausted()) {
+                return inputUnmet;
+            }
             if (in.returned() && in.uses() == CraftInput.INFINITE_USES) {
                 // true catalyst/container: the seed is handed back, net consumption zero —
                 // return what we actually got into the pool for reuse downstream. A finite-use
@@ -1767,9 +1818,16 @@ public final class CraftPlannerV2<K> {
         }
         alternatives.sort((a, b) -> Long.compare(capacityScore(b), capacityScore(a)));
         for (CraftPattern<K> alternative : alternatives) {
+            if (!searchBudget.tryConsume()) {
+                return amount;
+            }
             int mark = trail.size();
             long beforeMissing = missingTotal;
             long unmet = fire(key, alternative, amount, true);
+            if (searchBudget.exhausted()) {
+                rollback(mark);
+                return amount;
+            }
             if (unmet == 0 && missingTotal == beforeMissing) return 0L;
             rollback(mark);
         }
@@ -2030,6 +2088,32 @@ public final class CraftPlannerV2<K> {
     }
 
     private record SearchFailure<K>(K key, long amount, long availabilityState, int depth) {
+    }
+
+    /**
+     * Monotonic plan-wide guard. Exhaustion is recorded only when work is actually denied, so a route
+     * that succeeds on the final permitted unit remains a valid completed proof.
+     */
+    private static final class SearchBudget {
+        private int remaining;
+        private boolean exhausted;
+
+        private SearchBudget(int work) {
+            this.remaining = Math.max(1, work);
+        }
+
+        private boolean tryConsume() {
+            if (remaining <= 0) {
+                exhausted = true;
+                return false;
+            }
+            remaining--;
+            return true;
+        }
+
+        private boolean exhausted() {
+            return exhausted;
+        }
     }
 
     private record FeedbackSeedBootstrap<K>(

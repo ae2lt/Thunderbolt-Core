@@ -71,11 +71,11 @@ import com.moakiee.thunderbolt.ae2.timewheel.ReusableSeedPattern;
  *       reverse side resolves from stock/missing; cuts only remove options, never overstate feasibility.</li>
  *   <li>A <b>feasible</b> plan is always safe to return (mass-balanced ⇒ executable), even with
  *       byproducts and multiple recipe choices.</li>
- *   <li><b>Infeasible</b>: best-effort, never declined (Policy A). {@code simulate=false}→null,
- *       {@code simulate=true}→partial plan with missing items. We do NOT fall back to AE2's exhaustive
- *       simulator even if one contended node hit its local cap — that slow path is exactly what this
- *       engine replaces. Only that node switches to fixed-width current-state route probes; the rest
- *       of the plan continues searching normally.</li>
+ *   <li><b>Proven infeasible</b>: best-effort, never declined (Policy A).
+ *       {@code simulate=false}→null, {@code simulate=true}→partial plan with missing items.</li>
+ *   <li><b>Search budget exhausted</b>: decline this attempt to AE2. This is not reported as missing:
+ *       the planner keeps every route eligible while budget remains, so exhaustion means only that
+ *       this fast search did not finish a proof.</li>
  * </ul>
  *
  * <p><b>Execution-time contract (fuzzy substitution).</b> For a hard-fuzzy slot the planner commits to a
@@ -194,6 +194,9 @@ public final class FastCraftingPlanner {
         }
 
         CraftPlan<AEKey> plan = CraftPlannerV2.plan(builder.build(), output, amount);
+        if (!plan.supported() || plan.budgetExhausted()) {
+            return FastAttempt.decline();
+        }
         boolean multi = multiplePaths[0];
         // Emittable shortfalls are supplied by emitters, not crafted, so they don't make a plan
         // infeasible — only a non-emittable shortfall does.
@@ -203,12 +206,9 @@ public final class FastCraftingPlanner {
                             patternSources, emittable, snapshot, reservedStock),
                     plan.usedReusableStock());
         }
-        // Infeasible at this amount. Best-effort policy (Policy A): we never fall back to AE2's
-        // exhaustive simulator for performance — that is the slow path this engine exists to avoid.
-        // Cycles are broken in-engine and each hot node eventually degrades to a fixed-width route
-        // probe, so the result remains bounded without converting a local search compromise into a
-        // whole-plan failure. A feasible plan is always mass-balanced; an infeasible one reports the
-        // shortfall found by the selected local routes.
+        // Infeasible at this amount and the complete in-budget search proved it. Best-effort policy
+        // (Policy A) therefore remains valid: a feasible plan is mass-balanced, while this infeasible
+        // plan reports concrete shortfalls rather than a search cutoff.
         if (!simulate) {
             // AE2 asks for this exact amount again with simulate=true to build the missing-material
             // page. Build that cheap representation now while the graph/snapshot are still available;

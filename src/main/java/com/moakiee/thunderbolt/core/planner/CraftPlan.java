@@ -22,11 +22,11 @@ import java.util.Map;
  * @param itemsProcessed number of items visited by the linear demand pass, or recursive node
  *                       invocations performed by the bounded fallback. Request magnitude does not
  *                       affect this value because every firing count is handled in closed form.
- * @param budgetExhausted retained for result compatibility. Node-local visit exhaustion no longer
- *                       invalidates a calculation: that node switches to current-state fixed-width
- *                       route probes, so the v2 planner leaves this {@code false}. Depth overflow is
- *                       reported as a normal branch-local missing input and may be recovered by a
- *                       parent alternative.
+ * @param budgetExhausted {@code true} only when the plan-wide fallback-search work budget denied more
+ *                       work before feasibility or infeasibility was proven. In that case the plan
+ *                       carries no partial firings, stock use or missing-material diagnosis, and the
+ *                       adapter must decline to AE2. A hot-node visit threshold merely changes route
+ *                       ordering and does not set this flag.
  * @param <K> item key type
  */
 public record CraftPlan<K>(
