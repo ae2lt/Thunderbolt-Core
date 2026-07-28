@@ -73,9 +73,10 @@ import com.moakiee.thunderbolt.ae2.timewheel.ReusableSeedPattern;
  *       byproducts and multiple recipe choices.</li>
  *   <li><b>Proven infeasible</b>: best-effort, never declined (Policy A).
  *       {@code simulate=false}→null, {@code simulate=true}→partial plan with missing items.</li>
- *   <li><b>Search budget exhausted</b>: decline this attempt to AE2. This is not reported as missing:
- *       the planner keeps every route eligible while budget remains, so exhaustion means only that
- *       this fast search did not finish a proof.</li>
+ *   <li><b>Search budget exhausted</b>: keep the best bounded diagnostic route and expose its missing
+ *       items through AE2's simulation result. The missing list is a targeted replenishment suggestion,
+ *       not a proof about every alternate route; the pathological graph is never handed to AE2's
+ *       exhaustive simulator merely because the fast search reached its guard.</li>
  * </ul>
  *
  * <p><b>Execution-time contract (fuzzy substitution).</b> For a hard-fuzzy slot the planner commits to a
@@ -194,7 +195,7 @@ public final class FastCraftingPlanner {
         }
 
         CraftPlan<AEKey> plan = CraftPlannerV2.plan(builder.build(), output, amount);
-        if (!plan.supported() || plan.budgetExhausted()) {
+        if (!plan.supported()) {
             return FastAttempt.decline();
         }
         boolean multi = multiplePaths[0];
@@ -206,9 +207,10 @@ public final class FastCraftingPlanner {
                             patternSources, emittable, snapshot, reservedStock),
                     plan.usedReusableStock());
         }
-        // Infeasible at this amount and the complete in-budget search proved it. Best-effort policy
-        // (Policy A) therefore remains valid: a feasible plan is mass-balanced, while this infeasible
-        // plan reports concrete shortfalls rather than a search cutoff.
+        // Infeasible at this amount. A completed search reports proven shortfalls; a budget-limited
+        // search reports the missing leaves of its best concrete diagnostic route. In both cases keep
+        // the attempt inside Thunderbolt so AE2 can show replenishment targets without re-entering the
+        // exhaustive simulator that this fast path is protecting.
         if (!simulate) {
             // AE2 asks for this exact amount again with simulate=true to build the missing-material
             // page. Build that cheap representation now while the graph/snapshot are still available;

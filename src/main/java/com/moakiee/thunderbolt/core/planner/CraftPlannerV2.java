@@ -41,7 +41,8 @@ import java.util.Set;
  *   <li><b>Conflict-directed anytime replay</b>: if a locally successful child route consumes stock
  *       later needed by a sibling, the planner replays the whole request with the implicated choice
  *       changed. The first complete plan is returned immediately; otherwise a graph-scaled
- *       {@code O(E log E)} budget ends as an explicit decline, never as fake missing material.</li>
+ *       {@code O(E log E)} budget keeps the best concrete partial plan and reports its actionable
+ *       missing materials instead of delegating the pathological graph back to AE2.</li>
  *   <li><b>Consumable-bound no-goods</b>: an unavoidable direct raw-consumable shortage is proven
  *       against the exact current pool and quantity, rather than tied to a whole recipe identity.
  *       Thus materially different routes that both require eight unavailable C are pruned alike,
@@ -93,6 +94,8 @@ public final class CraftPlannerV2<K> {
     private final int visitCap;
     private final SearchBudget searchBudget;
     private final Map<K, CraftPattern<K>> routePreferences;
+    /** Bounded single-route pass used only to turn a search cutoff into actionable missing items. */
+    private final boolean diagnosticMode;
     private final Set<K> cutOutputs = new LinkedHashSet<>();
     private final Map<CraftPattern<K>, Set<K>> suppressedPositiveFeedbackOutputs =
             new IdentityHashMap<>();
@@ -184,11 +187,13 @@ public final class CraftPlannerV2<K> {
             CraftGraph<K> graph,
             int visitCap,
             SearchBudget searchBudget,
-            Map<K, CraftPattern<K>> routePreferences) {
+            Map<K, CraftPattern<K>> routePreferences,
+            boolean diagnosticMode) {
         this.graph = graph;
         this.visitCap = Math.max(1, visitCap);
         this.searchBudget = searchBudget;
         this.routePreferences = routePreferences;
+        this.diagnosticMode = diagnosticMode;
     }
 
     public static <K> CraftPlan<K> plan(CraftGraph<K> graph, K target, long amount) {
@@ -218,11 +223,16 @@ public final class CraftPlannerV2<K> {
         PlanVariant<K> firstVariant =
                 new PlanVariant<>(List.of(), Map.of(), 0, 0L);
         CraftPlannerV2<K> firstPlanner =
-                new CraftPlannerV2<>(graph, visitCap, budget, firstVariant.routePreferences());
+                new CraftPlannerV2<>(
+                        graph, visitCap, budget, firstVariant.routePreferences(), false);
         CraftPlan<K> first = firstPlanner.run(target, amount, firstVariant.priorityRoots());
-        if (first.feasible() || first.budgetExhausted()) {
+        if (first.feasible()) {
             return first;
         }
+        if (first.budgetExhausted()) {
+            return diagnosticAfterCutoff(graph, target, amount, visitCap);
+        }
+        CraftPlan<K> bestIncomplete = first;
 
         PriorityQueue<PlanVariant<K>> frontier = new PriorityQueue<>((left, right) -> {
             int byDiscrepancy = Integer.compare(left.discrepancies(), right.discrepancies());
@@ -262,20 +272,25 @@ public final class CraftPlannerV2<K> {
         while (!frontier.isEmpty()) {
             PlanVariant<K> variant = frontier.poll();
             if (!budget.tryConsume(replayCharge)) {
-                return budgetExhaustedPlan(0);
+                return markBudgetExhausted(bestIncomplete);
             }
             CraftPlannerV2<K> planner =
-                    new CraftPlannerV2<>(graph, visitCap, budget, variant.routePreferences());
+                    new CraftPlannerV2<>(
+                            graph, visitCap, budget, variant.routePreferences(), false);
             CraftPlan<K> candidate = planner.run(target, amount, variant.priorityRoots());
-            if (candidate.feasible() || candidate.budgetExhausted()) {
+            if (candidate.feasible()) {
                 return candidate;
             }
+            if (candidate.budgetExhausted()) {
+                return markBudgetExhausted(bestIncomplete);
+            }
+            bestIncomplete = betterIncompletePlan(bestIncomplete, candidate);
             enqueue = enqueueRouteVariants(
                     variant, planner, frontier, queued, sequence, budget, replayCharge);
             sequence = enqueue.sequence();
             frontierTruncated |= enqueue.truncated();
         }
-        return frontierTruncated ? budgetExhaustedPlan(0) : first;
+        return frontierTruncated ? markBudgetExhausted(bestIncomplete) : bestIncomplete;
     }
 
     /**
@@ -348,9 +363,75 @@ public final class CraftPlannerV2<K> {
         return new EnqueueResult(sequence, routeAlternatives.truncated());
     }
 
-    private static <K> CraftPlan<K> budgetExhaustedPlan(int processed) {
+    /**
+     * Search cutoffs still need to answer AE2's missing-material simulation. Run one deterministic
+     * capacity-first route with a fresh bounded budget; once that diagnostic budget is spent, unresolved
+     * intermediate nodes themselves become missing. This pass never enumerates alternatives.
+     */
+    private static <K> CraftPlan<K> diagnosticAfterCutoff(
+            CraftGraph<K> graph, K target, long amount, int visitCap) {
+        SearchBudget diagnosticBudget =
+                new SearchBudget(scaledSearchWorkBudget(graph, target), false);
+        CraftPlan<K> diagnostic = new CraftPlannerV2<>(
+                graph, visitCap, diagnosticBudget, Map.of(), true)
+                .run(target, amount, List.of());
+        if (diagnostic.feasible()) {
+            return diagnostic;
+        }
+        if (diagnostic.missing().isEmpty()) {
+            Map<K, Long> missingTarget = Map.of(target, amount);
+            diagnostic = new CraftPlan<>(
+                    true,
+                    false,
+                    diagnostic.firings(),
+                    diagnostic.usedStock(),
+                    diagnostic.usedReusableStock(),
+                    missingTarget,
+                    diagnostic.grossDemand(),
+                    diagnostic.itemsProcessed(),
+                    false);
+        }
+        return markBudgetExhausted(diagnostic);
+    }
+
+    /**
+     * Prefer a diagnosis that asks the player to replenish fewer kinds, then fewer total units.
+     * Quantities across item types are only a heuristic tie-breaker; every retained plan remains a
+     * concrete, mass-balanced simulation candidate.
+     */
+    private static <K> CraftPlan<K> betterIncompletePlan(
+            CraftPlan<K> current, CraftPlan<K> candidate) {
+        int byKinds = Integer.compare(candidate.missing().size(), current.missing().size());
+        if (byKinds < 0) {
+            return candidate;
+        }
+        if (byKinds > 0) {
+            return current;
+        }
+        long currentTotal = missingTotal(current);
+        long candidateTotal = missingTotal(candidate);
+        return candidateTotal < currentTotal ? candidate : current;
+    }
+
+    private static <K> long missingTotal(CraftPlan<K> plan) {
+        long total = 0L;
+        for (long amount : plan.missing().values()) {
+            total = Sat.add(total, amount);
+        }
+        return total;
+    }
+
+    private static <K> CraftPlan<K> markBudgetExhausted(CraftPlan<K> plan) {
         return new CraftPlan<>(
-                true, false, Map.of(), Map.of(), Map.of(), Map.of(), Map.of(), processed, true);
+                plan.supported(),
+                plan.feasible(),
+                plan.firings(),
+                plan.usedStock(),
+                plan.usedReusableStock(),
+                plan.missing(),
+                plan.grossDemand(),
+                plan.itemsProcessed(),
+                true);
     }
 
     private CraftPlan<K> run(K target, long amount, List<K> priorityRoots) {
@@ -1419,10 +1500,20 @@ public final class CraftPlannerV2<K> {
         }
 
         if (!searchBudget.tryConsume()) {
+            if (diagnosticMode && commitFailure) {
+                addMissing(x, d);
+            }
             return d;
         }
         if (processed < Integer.MAX_VALUE) {
             processed++;
+        }
+
+        if (diagnosticMode) {
+            if (ps.size() == 1) {
+                return fire(x, ps.get(0), d, false);
+            }
+            return commitBestEffort(distinctMaterialBranches(capacityOrder(x)), x, d);
         }
 
         int v = visit.getOrDefault(x, 0);
@@ -2465,15 +2556,23 @@ public final class CraftPlannerV2<K> {
     }
 
     /**
-     * Monotonic plan-wide guard. Exhaustion is recorded only when work is actually denied, so a route
-     * that succeeds on the final permitted unit remains a valid completed proof.
+     * Monotonic plan-wide guard. Normal search records exhaustion only when work is actually denied, so
+     * a route that succeeds on the final permitted unit remains a valid completed proof. The bounded
+     * diagnostic pass uses the same counter without raising the global cutoff flag: denied nodes are
+     * converted into explicit intermediate missing items and the pass continues across sibling inputs.
      */
     private static final class SearchBudget {
         private int remaining;
+        private final boolean recordExhaustion;
         private boolean exhausted;
 
         private SearchBudget(int work) {
+            this(work, true);
+        }
+
+        private SearchBudget(int work, boolean recordExhaustion) {
             this.remaining = Math.max(1, work);
+            this.recordExhaustion = recordExhaustion;
         }
 
         private boolean tryConsume() {
@@ -2483,7 +2582,9 @@ public final class CraftPlannerV2<K> {
         private boolean tryConsume(int work) {
             int requested = Math.max(1, work);
             if (remaining < requested) {
-                exhausted = true;
+                if (recordExhaustion) {
+                    exhausted = true;
+                }
                 return false;
             }
             remaining -= requested;

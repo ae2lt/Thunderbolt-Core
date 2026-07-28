@@ -1789,11 +1789,12 @@ class CraftPlannerV2Test {
     }
 
     /**
-     * Exhausting the global work guard is not evidence that a leaf is absent. Partial speculative
-     * mutations are discarded and no missing-material diagnosis is emitted.
+     * Exhausting the global work guard is not a proof that every route needs the same leaf, but AE2's
+     * simulation still needs an actionable replenishment target. A fresh bounded single-route pass
+     * must discard speculative mutations and return one concrete partial plan.
      */
     @Test
-    void globalSearchBudgetExhaustionIsNotReportedAsMissing() {
+    void globalSearchBudgetExhaustionReturnsABoundedMissingDiagnosis() {
         CraftGraph<String> graph = CraftGraph.<String>builder()
                 .pattern("X", 1, List.of(CraftInput.of("shared", 1)))
                 .pattern("Y", 1, List.of(CraftInput.of("shared", 1)))
@@ -1809,9 +1810,29 @@ class CraftPlannerV2Test {
 
         assertFalse(plan.feasible());
         assertTrue(plan.budgetExhausted());
-        assertTrue(plan.firings().isEmpty());
-        assertTrue(plan.usedStock().isEmpty());
-        assertTrue(plan.missing().isEmpty(), "budget cutoff must not masquerade as absent material");
+        assertFalse(plan.firings().isEmpty(), "the diagnostic retains one concrete route");
+        assertEquals(1L, plan.usedStock().get("shared"));
+        assertEquals(1L, plan.missing().get("shared"));
+        assertFalse(plan.usedStock().containsKey("good"),
+                "the discarded speculative alternative must not leak into the diagnosis");
+
+        CraftGraph<String> replenished = CraftGraph.<String>builder()
+                .pattern("X", 1, List.of(CraftInput.of("shared", 1)))
+                .pattern("Y", 1, List.of(CraftInput.of("shared", 1)))
+                .pattern("target", 1, List.of(
+                        CraftInput.of("X", 1),
+                        CraftInput.of("Y", 1)))
+                .pattern("target", 1, List.of(CraftInput.of("good", 1)))
+                .stock("shared", 2)
+                .stock("good", 1)
+                .build();
+        CraftPlan<String> afterReplenishment =
+                CraftPlannerV2.plan(replenished, "target", 1, 1, 1);
+
+        assertTrue(afterReplenishment.feasible(),
+                "supplying the diagnosed shortfall must make that concrete route executable");
+        assertFalse(afterReplenishment.budgetExhausted(),
+                "a feasible diagnostic route is a complete proof despite the earlier search cutoff");
     }
 
     /**
@@ -1848,6 +1869,37 @@ class CraftPlannerV2Test {
         assertEquals(1L, firingsOf(plan, xSpecial));
         assertEquals(1L, plan.usedStock().get("shared"));
         assertEquals(1L, plan.usedStock().get("special"));
+    }
+
+    @Test
+    void anytimeReplayCutoffKeepsTheBestCompletedMissingCandidate() {
+        ReusableStockSource source = new ReusableStockSource("host", "pool");
+        CraftPattern<String> xShared = new CraftPattern<>(
+                "X", 1, List.of(CraftInput.of("shared", 1)), "X-shared");
+        CraftPattern<String> xSpecial = new CraftPattern<>(
+                "X", 1, List.of(CraftInput.of("special", 1)), "X-special");
+        CraftGraph<String> graph = CraftGraph.<String>builder()
+                .pattern(xShared)
+                .pattern(xSpecial)
+                .pattern("Y", 1, List.of(CraftInput.of("shared", 1)))
+                .pattern("target", 1, List.of(
+                        CraftInput.of("X", 1),
+                        CraftInput.of("Y", 1),
+                        CraftInput.returnedFrom("tool", 1, source)))
+                .stock("shared", 1)
+                .stock("special", 1)
+                .reusableStock("host", "tool", 1)
+                .reusableStockRoute(source, "tool", List.of("tool"))
+                .build();
+
+        CraftPlan<String> plan = CraftPlannerV2.plan(graph, "target", 1, 1, 20);
+
+        assertFalse(plan.feasible());
+        assertTrue(plan.budgetExhausted());
+        assertEquals(1L, firingsOf(plan, xShared));
+        assertEquals(0L, firingsOf(plan, xSpecial));
+        assertEquals(1L, plan.usedStock().get("shared"));
+        assertEquals(1L, plan.missing().get("shared"));
     }
 
     @Test
