@@ -9,11 +9,12 @@ import java.util.IdentityHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.PriorityQueue;
 import java.util.Set;
 
 /**
- * v2 autocrafting planner: dynamic-capacity greedy over a shared mutable pool, with byproduct reuse
- * and bounded backtracking for contended choices.
+ * v2 autocrafting planner: an iterative linear backbone plus conflict-directed anytime search over a
+ * shared mutable pool, with byproduct reuse and bounded backtracking for contended choices.
  *
  * <p>This is the evolution of the v1 planner (closed-form two-pass, removed). It keeps v1's strengths
  * — quantity-independent batching ({@code ceil} arithmetic), {@code returned} (container/catalyst)
@@ -37,6 +38,14 @@ import java.util.Set;
  *       search continues while the plan-wide deterministic work budget remains. Failed speculative
  *       subtrees are memoized only for the exact node, amount, depth and rollback-restored availability
  *       state, preventing repeated proof work without reusing a stale inventory result.</li>
+ *   <li><b>Conflict-directed anytime replay</b>: if a locally successful child route consumes stock
+ *       later needed by a sibling, the planner replays the whole request with the implicated choice
+ *       changed. The first complete plan is returned immediately; otherwise a graph-scaled
+ *       {@code O(E log E)} budget ends as an explicit decline, never as fake missing material.</li>
+ *   <li><b>Consumable-bound no-goods</b>: an unavoidable direct raw-consumable shortage is proven
+ *       against the exact current pool and quantity, rather than tied to a whole recipe identity.
+ *       Thus materially different routes that both require eight unavailable C are pruned alike,
+ *       while a route requiring one available C remains eligible.</li>
  * </ul>
  *
  * <p><b>Soundness (no false positives):</b> the pool is never overdrawn (a draw is capped by what is
@@ -53,13 +62,11 @@ public final class CraftPlannerV2<K> {
      */
     public static final int DEFAULT_VISIT_CAP = 256;
 
-    /**
-     * Deterministic work budget shared by the fallback search and conversion-orientation retries.
-     * It counts recursive craftable-node expansions, alternate-route probes and dynamic route-score
-     * evaluations. The linear topological backbone does not consume this budget.
-     */
+    /** Upper guard for the graph-scaled {@code O(E log E)} default search budget. */
     public static final int DEFAULT_SEARCH_WORK_BUDGET =
-            Math.max(1_024, Integer.getInteger("thunderbolt.maxCraftSearchWork", 131_072));
+            Math.max(4_096, Integer.getInteger("thunderbolt.maxCraftSearchWork", 1_048_576));
+
+    private static final int MIN_SEARCH_WORK_BUDGET = 4_096;
 
     /**
      * Maximum number of alternate roots tried for a proven conservative conversion SCC. This is a
@@ -85,6 +92,7 @@ public final class CraftPlannerV2<K> {
     private final CraftGraph<K> graph;
     private final int visitCap;
     private final SearchBudget searchBudget;
+    private final Map<K, CraftPattern<K>> routePreferences;
     private final Set<K> cutOutputs = new LinkedHashSet<>();
     private final Map<CraftPattern<K>, Set<K>> suppressedPositiveFeedbackOutputs =
             new IdentityHashMap<>();
@@ -121,6 +129,16 @@ public final class CraftPlannerV2<K> {
      */
     private final Map<CraftPattern<K>, Long> capacityScoreByPattern = new IdentityHashMap<>();
     private final Map<K, List<CraftPattern<K>>> capacityOrderByOutput = new HashMap<>();
+    /** Per-firing unavoidable ordinary raw inputs, aggregated by consumable rather than pattern slot. */
+    private final Map<CraftPattern<K>, Map<K, Long>> directRawConsumablesByPattern =
+            new IdentityHashMap<>();
+    /**
+     * Learned lower bounds keyed by the consumable and exact rollback-restored availability state.
+     * The value is the smallest quantity already proven unavailable in that state, so the proof is
+     * reusable across unrelated patterns with an equal or larger requirement.
+     */
+    private final Map<ConsumableProofState<K>, Long> provenDirectConsumableShortfalls =
+            new HashMap<>();
     // Canonical, stock-independent material transformation for patterns whose whole downstream tree
     // can be proven simple and deterministic. Equal ids let one obtain() call search an equivalent
     // branch once instead of reopening the same dependency tree under a different intermediate key.
@@ -143,6 +161,10 @@ public final class CraftPlannerV2<K> {
     private final Map<K, Long> missing = new HashMap<>();     // unmet at raw leaves
     private final Map<K, Long> grossDemand = new HashMap<>(); // pre-extraction request totals (bytes)
     private final Map<CraftPattern<K>, Long> firings = new IdentityHashMap<>();
+    /** Successful/committed contended decisions on the current trail, in execution order. */
+    private final List<RouteDecision<K>> routeDecisions = new ArrayList<>();
+    /** Decisions implicated in a later sibling's stock shortfall; these alone merit whole-plan replay. */
+    private final List<RouteDecision<K>> replayRouteDecisions = new ArrayList<>();
 
     // Node-local search state is monotonic: rollback restores inventory, not knowledge already learned.
     private final Map<K, Integer> visit = new HashMap<>();
@@ -158,18 +180,28 @@ public final class CraftPlannerV2<K> {
     // introduces no new missing, so the decision survives nested single-recipe commits.
     private long missingTotal;
 
-    private CraftPlannerV2(CraftGraph<K> graph, int visitCap, SearchBudget searchBudget) {
+    private CraftPlannerV2(
+            CraftGraph<K> graph,
+            int visitCap,
+            SearchBudget searchBudget,
+            Map<K, CraftPattern<K>> routePreferences) {
         this.graph = graph;
         this.visitCap = Math.max(1, visitCap);
         this.searchBudget = searchBudget;
+        this.routePreferences = routePreferences;
     }
 
     public static <K> CraftPlan<K> plan(CraftGraph<K> graph, K target, long amount) {
-        return plan(graph, target, amount, DEFAULT_VISIT_CAP, DEFAULT_SEARCH_WORK_BUDGET);
+        return plan(
+                graph,
+                target,
+                amount,
+                DEFAULT_VISIT_CAP,
+                scaledSearchWorkBudget(graph, target));
     }
 
     public static <K> CraftPlan<K> plan(CraftGraph<K> graph, K target, long amount, int visitCap) {
-        return plan(graph, target, amount, visitCap, DEFAULT_SEARCH_WORK_BUDGET);
+        return plan(graph, target, amount, visitCap, scaledSearchWorkBudget(graph, target));
     }
 
     static <K> CraftPlan<K> plan(
@@ -182,30 +214,143 @@ public final class CraftPlannerV2<K> {
             return new CraftPlan<>(true, true, Map.of(), Map.of(), Map.of(), Map.of(), Map.of(), 0, false);
         }
         SearchBudget budget = new SearchBudget(searchWorkBudget);
-        CraftPlannerV2<K> firstPlanner = new CraftPlannerV2<>(graph, visitCap, budget);
-        CraftPlan<K> first = firstPlanner.run(target, amount, List.of());
-        if (first.feasible() || first.budgetExhausted() || firstPlanner.cutOutputs.isEmpty()) {
-            return first;
-        }
-        // Only the infeasible-with-cut-outputs path consults cycle analysis; the feasible
-        // majority of requests never pays for the SCC passes.
-        CycleAnalysis<K> cycleAnalysis = CycleAnalysis.analyze(graph, target);
-        if (firstPlanner.cutOutputs.stream().noneMatch(cycleAnalysis::mayReorient)) {
+        int replayCharge = reachableWorkEstimate(graph, target);
+        PlanVariant<K> firstVariant =
+                new PlanVariant<>(List.of(), Map.of(), 0, 0L);
+        CraftPlannerV2<K> firstPlanner =
+                new CraftPlannerV2<>(graph, visitCap, budget, firstVariant.routePreferences());
+        CraftPlan<K> first = firstPlanner.run(target, amount, firstVariant.priorityRoots());
+        if (first.feasible() || first.budgetExhausted()) {
             return first;
         }
 
-        int retries = 0;
-        for (K cutOutput : firstPlanner.cutOutputs) {
-            if (retries >= MAX_CONVERSION_ORIENTATION_RETRIES) break;
-            if (!first.missing().containsKey(cutOutput) || !cycleAnalysis.mayReorient(cutOutput)) {
-                continue;
+        PriorityQueue<PlanVariant<K>> frontier = new PriorityQueue<>((left, right) -> {
+            int byDiscrepancy = Integer.compare(left.discrepancies(), right.discrepancies());
+            return byDiscrepancy != 0
+                    ? byDiscrepancy
+                    : Long.compare(left.sequence(), right.sequence());
+        });
+        Set<VariantKey<K>> queued = new HashSet<>();
+        queued.add(firstVariant.key());
+        long sequence = 1L;
+
+        // Conversion-SCC orientations remain the first discrepancies, preserving the former retry
+        // policy while sharing one global anytime-search budget with ordinary route deviations.
+        if (!firstPlanner.cutOutputs.isEmpty()) {
+            CycleAnalysis<K> cycleAnalysis = CycleAnalysis.analyze(graph, target);
+            int retries = 0;
+            for (K cutOutput : firstPlanner.cutOutputs) {
+                if (retries >= MAX_CONVERSION_ORIENTATION_RETRIES) break;
+                if (!first.missing().containsKey(cutOutput)
+                        || !cycleAnalysis.mayReorient(cutOutput)) {
+                    continue;
+                }
+                retries++;
+                PlanVariant<K> variant =
+                        new PlanVariant<>(List.of(cutOutput), Map.of(), 1, sequence++);
+                if (queued.add(variant.key())) {
+                    frontier.add(variant);
+                }
             }
-            retries++;
-            CraftPlan<K> retry = new CraftPlannerV2<>(graph, visitCap, budget)
-                    .run(target, amount, List.of(cutOutput));
-            if (retry.feasible() || retry.budgetExhausted()) return retry;
         }
-        return first;
+
+        EnqueueResult enqueue = enqueueRouteVariants(
+                firstVariant, firstPlanner, frontier, queued, sequence, budget, replayCharge);
+        sequence = enqueue.sequence();
+        boolean frontierTruncated = enqueue.truncated();
+
+        while (!frontier.isEmpty()) {
+            PlanVariant<K> variant = frontier.poll();
+            if (!budget.tryConsume(replayCharge)) {
+                return budgetExhaustedPlan(0);
+            }
+            CraftPlannerV2<K> planner =
+                    new CraftPlannerV2<>(graph, visitCap, budget, variant.routePreferences());
+            CraftPlan<K> candidate = planner.run(target, amount, variant.priorityRoots());
+            if (candidate.feasible() || candidate.budgetExhausted()) {
+                return candidate;
+            }
+            enqueue = enqueueRouteVariants(
+                    variant, planner, frontier, queued, sequence, budget, replayCharge);
+            sequence = enqueue.sequence();
+            frontierTruncated |= enqueue.truncated();
+        }
+        return frontierTruncated ? budgetExhaustedPlan(0) : first;
+    }
+
+    /**
+     * The first planner run remains the ordinary linear/greedy path. Replays are charged by the whole
+     * reachable graph size, so the scaled budget permits only {@code O(log E)} complete deviations and
+     * keeps preprocessing plus fallback work near {@code O(E log E)}.
+     */
+    static <K> int scaledSearchWorkBudget(CraftGraph<K> graph, K target) {
+        int work = reachableWorkEstimate(graph, target);
+        int log = 32 - Integer.numberOfLeadingZeros(Math.max(1, work));
+        long scaled = (long) work * (log + 4L);
+        return (int) Math.min(
+                DEFAULT_SEARCH_WORK_BUDGET,
+                Math.max(MIN_SEARCH_WORK_BUDGET, scaled));
+    }
+
+    static <K> int reachableWorkEstimate(CraftGraph<K> graph, K target) {
+        Set<K> seen = new HashSet<>();
+        Deque<K> queue = new ArrayDeque<>();
+        seen.add(target);
+        queue.add(target);
+        long work = 0L;
+        while (!queue.isEmpty()) {
+            K key = queue.removeFirst();
+            work++;
+            for (CraftPattern<K> pattern : graph.patternsFor(key)) {
+                work++;
+                for (CraftInput<K> input : pattern.inputs()) {
+                    work++;
+                    if (seen.add(input.key())) {
+                        queue.addLast(input.key());
+                    }
+                }
+            }
+            if (work >= Integer.MAX_VALUE) {
+                return Integer.MAX_VALUE;
+            }
+        }
+        return Math.max(1, (int) work);
+    }
+
+    private static <K> EnqueueResult enqueueRouteVariants(
+            PlanVariant<K> parent,
+            CraftPlannerV2<K> planner,
+            PriorityQueue<PlanVariant<K>> frontier,
+            Set<VariantKey<K>> queued,
+            long sequence,
+            SearchBudget budget,
+            int replayCharge) {
+        int affordableReplays = budget.remaining() / Math.max(1, replayCharge);
+        int availableSlots = Math.max(0, affordableReplays - frontier.size());
+        RouteAlternatives<K> routeAlternatives = planner.routeAlternatives(availableSlots);
+        for (RouteAlternative<K> alternative : routeAlternatives.alternatives()) {
+            Map<K, CraftPattern<K>> preferences =
+                    new HashMap<>(parent.routePreferences());
+            if (alternative.pattern() == alternative.defaultPattern()) {
+                preferences.remove(alternative.key());
+            } else {
+                preferences.put(alternative.key(), alternative.pattern());
+            }
+            PlanVariant<K> variant = new PlanVariant<>(
+                    parent.priorityRoots(),
+                    Map.copyOf(preferences),
+                    parent.priorityRoots().isEmpty() ? preferences.size() : preferences.size() + 1,
+                    sequence++);
+            if (queued.add(variant.key())) {
+                frontier.add(variant);
+            }
+        }
+        return new EnqueueResult(sequence, routeAlternatives.truncated());
+    }
+
+    private static <K> CraftPlan<K> budgetExhaustedPlan(int processed) {
+        return new CraftPlan<>(
+                true, false, Map.of(), Map.of(), Map.of(), Map.of(), Map.of(), processed, true);
     }
 
     private CraftPlan<K> run(K target, long amount, List<K> priorityRoots) {
@@ -237,6 +382,7 @@ public final class CraftPlannerV2<K> {
         }
         this.capacity = capacityFromOrder(order, items.size());
         indexCapacityOrder();
+        indexDirectRawConsumables();
         indexEquivalentMaterialFootprints(order);
 
         // Returned catalysts must be acquired before the firing's outputs enter the shared pool.
@@ -1023,9 +1169,46 @@ public final class CraftPlannerV2<K> {
         return producibleVia(pattern, capacity, capacityScoreByPattern);
     }
 
+    private void indexDirectRawConsumables() {
+        directRawConsumablesByPattern.clear();
+        for (List<CraftPattern<K>> patterns : patternsByOutput.values()) {
+            for (CraftPattern<K> pattern : patterns) {
+                Map<K, Long> perFiring = new HashMap<>();
+                for (CraftInput<K> input : pattern.inputs()) {
+                    if (input.returned() || input.reusableStockSource() != null
+                            || !patternsByOutput.getOrDefault(input.key(), List.of()).isEmpty()) {
+                        continue;
+                    }
+                    perFiring.merge(input.key(), input.amount(), Sat::add);
+                }
+                if (!perFiring.isEmpty()) {
+                    directRawConsumablesByPattern.put(pattern, Map.copyOf(perFiring));
+                }
+            }
+        }
+    }
+
     private List<CraftPattern<K>> capacityOrder(K key) {
-        return capacityOrderByOutput.getOrDefault(
+        List<CraftPattern<K>> ordered = capacityOrderByOutput.getOrDefault(
                 key, patternsByOutput.getOrDefault(key, List.of()));
+        return promotePreferredRoute(key, ordered);
+    }
+
+    private List<CraftPattern<K>> promotePreferredRoute(
+            K key, List<CraftPattern<K>> ordered) {
+        CraftPattern<K> preferred = routePreferences.get(key);
+        int index = preferred == null ? -1 : ordered.indexOf(preferred);
+        if (index <= 0) {
+            return ordered;
+        }
+        List<CraftPattern<K>> promoted = new ArrayList<>(ordered.size());
+        promoted.add(preferred);
+        for (CraftPattern<K> pattern : ordered) {
+            if (pattern != preferred) {
+                promoted.add(pattern);
+            }
+        }
+        return promoted;
     }
 
     private boolean canBootstrapAllFeedbackSeeds(
@@ -1270,11 +1453,15 @@ public final class CraftPlannerV2<K> {
             return unmet;
         }
         for (CraftPattern<K> r : distinctBranches) {
+            if (hasProvenDirectConsumableShortfall(r, d)) {
+                continue;
+            }
             if (!searchBudget.tryConsume()) {
                 return d;
             }
             int mark = trail.size();
             long beforeMissing = missingTotal;
+            recordRouteDecision(x, r, distinctBranches);
             long unmet = fire(x, r, d, true);
             if (searchBudget.exhausted()) {
                 rollback(mark);
@@ -1305,11 +1492,15 @@ public final class CraftPlannerV2<K> {
             return d;
         }
         for (CraftPattern<K> route : distinctBranches) {
+            if (hasProvenDirectConsumableShortfall(route, d)) {
+                continue;
+            }
             if (!searchBudget.tryConsume()) {
                 return d;
             }
             int mark = trail.size();
             long beforeMissing = missingTotal;
+            recordRouteDecision(x, route, distinctBranches);
             long unmet = fire(x, route, d, true);
             if (searchBudget.exhausted()) {
                 rollback(mark);
@@ -1351,7 +1542,37 @@ public final class CraftPlannerV2<K> {
         }
         routes.sort((left, right) ->
                 Long.compare(scores.get(right), scores.get(left)));
-        return routes;
+        return promotePreferredRoute(x, routes);
+    }
+
+    /**
+     * Consumable-bound no-good proof for this exact rollback-restored pool. Full material footprints
+     * need not match: {@code 5 A + 8 C} and {@code 4 B + 8 C} are both impossible when fewer than
+     * {@code 8 C} remain and C has no producer. Quantity is aggregated across duplicate slots, so a
+     * route needing only one available C is never pruned by another route's eight-C shortfall.
+     *
+     * <p>Only ordinary, directly consumed raw leaves participate. Returned/reusable inputs and
+     * craftable intermediates keep their normal reservation and recursive-search semantics.
+     */
+    private boolean hasProvenDirectConsumableShortfall(CraftPattern<K> pattern, long demand) {
+        long times = Sat.ceilDiv(demand, pattern.outputAmount());
+        for (Map.Entry<K, Long> entry
+                : directRawConsumablesByPattern.getOrDefault(pattern, Map.of()).entrySet()) {
+            long required = Sat.mul(entry.getValue(), times);
+            ConsumableProofState<K> state =
+                    new ConsumableProofState<>(entry.getKey(), availabilityState);
+            Long unavailableFrom = provenDirectConsumableShortfalls.get(state);
+            if (unavailableFrom != null && required >= unavailableFrom) {
+                return true;
+            }
+            long available = Sat.add(
+                    get(stockLeft, entry.getKey()), get(bpPool, entry.getKey()));
+            if (available < required) {
+                provenDirectConsumableShortfalls.merge(state, required, Math::min);
+                return true;
+            }
+        }
+        return false;
     }
 
     private long currentCapacityVia(
@@ -1425,6 +1646,7 @@ public final class CraftPlannerV2<K> {
     }
 
     private long commitBestEffort(List<CraftPattern<K>> ps, K x, long d) {
+        recordRouteDecision(x, ps.get(0), ps);
         return fire(x, ps.get(0), d, false);
     }
 
@@ -1441,8 +1663,17 @@ public final class CraftPlannerV2<K> {
         long times = Sat.ceilDiv(d, r.outputAmount());
         bumpFiring(r, times);
 
+        boolean detectSiblingConflict = !search && r.inputs().size() > 1;
+        Map<K, Long> usedAtEntry =
+                detectSiblingConflict ? new HashMap<>(usedStock) : Map.of();
+        int decisionsAtEntry = routeDecisions.size();
         long inputUnmet = 0;
         for (CraftInput<K> in : r.inputs()) {
+            int decisionsBeforeInput = routeDecisions.size();
+            Map<K, Long> missingBeforeInput =
+                    detectSiblingConflict && decisionsBeforeInput > decisionsAtEntry
+                            ? new HashMap<>(missing)
+                            : Map.of();
             long amt = in.unitsFor(times); // closed form per flavour
             long unmet;
             ReusableSeedAcquisition reusableAcquisition = null;
@@ -1470,6 +1701,11 @@ public final class CraftPlannerV2<K> {
             inputUnmet = Sat.add(inputUnmet, unmet);
             if (searchBudget.exhausted()) {
                 return inputUnmet;
+            }
+            if (detectSiblingConflict
+                    && decisionsBeforeInput > decisionsAtEntry
+                    && hasSiblingStockConflict(usedAtEntry, missingBeforeInput)) {
+                rememberReplayDecisions(decisionsAtEntry, decisionsBeforeInput);
             }
             if (in.returned() && in.uses() == CraftInput.INFINITE_USES) {
                 // true catalyst/container: the seed is handed back, net consumption zero —
@@ -1510,6 +1746,38 @@ public final class CraftPlannerV2<K> {
             }
         }
         return inputUnmet;
+    }
+
+    private boolean hasSiblingStockConflict(
+            Map<K, Long> usedAtEntry, Map<K, Long> missingBeforeInput) {
+        for (Map.Entry<K, Long> entry : missing.entrySet()) {
+            long beforeMissing = missingBeforeInput.getOrDefault(entry.getKey(), 0L);
+            if (entry.getValue() <= beforeMissing) {
+                continue;
+            }
+            long beforeUsed = usedAtEntry.getOrDefault(entry.getKey(), 0L);
+            if (get(usedStock, entry.getKey()) > beforeUsed) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private void rememberReplayDecisions(int fromInclusive, int toExclusive) {
+        for (int i = fromInclusive; i < toExclusive; i++) {
+            RouteDecision<K> decision = routeDecisions.get(i);
+            boolean alreadyRemembered = false;
+            for (RouteDecision<K> remembered : replayRouteDecisions) {
+                if (remembered.key().equals(decision.key())
+                        && remembered.selected() == decision.selected()) {
+                    alreadyRemembered = true;
+                    break;
+                }
+            }
+            if (!alreadyRemembered) {
+                replayRouteDecisions.add(decision);
+            }
+        }
     }
 
     /**
@@ -1817,12 +2085,14 @@ public final class CraftPlannerV2<K> {
             if (pattern != excluded && !hasSelfReturnedSeed(pattern)) alternatives.add(pattern);
         }
         alternatives.sort((a, b) -> Long.compare(capacityScore(b), capacityScore(a)));
+        alternatives = new ArrayList<>(promotePreferredRoute(key, alternatives));
         for (CraftPattern<K> alternative : alternatives) {
             if (!searchBudget.tryConsume()) {
                 return amount;
             }
             int mark = trail.size();
             long beforeMissing = missingTotal;
+            recordRouteDecision(key, alternative, alternatives);
             long unmet = fire(key, alternative, amount, true);
             if (searchBudget.exhausted()) {
                 rollback(mark);
@@ -2072,6 +2342,72 @@ public final class CraftPlannerV2<K> {
         firings.put(r, Sat.add(old == null ? 0L : old, delta));
     }
 
+    private void recordRouteDecision(
+            K key, CraftPattern<K> selected, List<CraftPattern<K>> candidates) {
+        if (candidates.size() < 2) {
+            return;
+        }
+        int oldSize = routeDecisions.size();
+        trail.push(() -> {
+            while (routeDecisions.size() > oldSize) {
+                routeDecisions.remove(routeDecisions.size() - 1);
+            }
+        });
+        routeDecisions.add(new RouteDecision<>(key, selected, List.copyOf(candidates)));
+    }
+
+    /**
+     * Generates chronological-backtracking deviations from the committed path. The latest decision
+     * is offered first; candidates after the selected heuristic route precede candidates that already
+     * failed before it. One route preference applies to every visit of that key during a replay, which
+     * is intentionally coarser and much cheaper than cloning every mutable inventory state.
+     */
+    private RouteAlternatives<K> routeAlternatives(int limit) {
+        List<RouteAlternative<K>> alternatives = new ArrayList<>();
+        Set<K> emittedKeys = new HashSet<>();
+        boolean truncated = false;
+        for (int decisionIndex = replayRouteDecisions.size() - 1;
+                decisionIndex >= 0;
+                decisionIndex--) {
+            RouteDecision<K> decision = replayRouteDecisions.get(decisionIndex);
+            if (!emittedKeys.add(decision.key())) {
+                continue;
+            }
+            List<CraftPattern<K>> candidates = decision.candidates();
+            int selected = candidates.indexOf(decision.selected());
+            if (selected < 0) {
+                continue;
+            }
+            List<CraftPattern<K>> defaultOrder = capacityOrderByOutput.getOrDefault(
+                    decision.key(), patternsByOutput.getOrDefault(decision.key(), List.of()));
+            CraftPattern<K> defaultPattern =
+                    defaultOrder.isEmpty() ? decision.selected() : defaultOrder.get(0);
+            for (int i = selected + 1; i < candidates.size(); i++) {
+                if (alternatives.size() >= limit) {
+                    truncated = true;
+                    break;
+                }
+                alternatives.add(new RouteAlternative<>(
+                        decision.key(), candidates.get(i), defaultPattern));
+            }
+            if (truncated) {
+                break;
+            }
+            for (int i = 0; i < selected; i++) {
+                if (alternatives.size() >= limit) {
+                    truncated = true;
+                    break;
+                }
+                alternatives.add(new RouteAlternative<>(
+                        decision.key(), candidates.get(i), defaultPattern));
+            }
+            if (truncated) {
+                break;
+            }
+        }
+        return new RouteAlternatives<>(List.copyOf(alternatives), truncated);
+    }
+
     private void rollback(int mark) {
         while (trail.size() > mark) {
             trail.pop().run();
@@ -2090,6 +2426,44 @@ public final class CraftPlannerV2<K> {
     private record SearchFailure<K>(K key, long amount, long availabilityState, int depth) {
     }
 
+    private record ConsumableProofState<K>(K key, long availabilityState) {
+    }
+
+    private record RouteDecision<K>(
+            K key, CraftPattern<K> selected, List<CraftPattern<K>> candidates) {
+    }
+
+    private record RouteAlternative<K>(
+            K key, CraftPattern<K> pattern, CraftPattern<K> defaultPattern) {
+    }
+
+    private record RouteAlternatives<K>(
+            List<RouteAlternative<K>> alternatives, boolean truncated) {
+    }
+
+    private record EnqueueResult(long sequence, boolean truncated) {
+    }
+
+    private record VariantKey<K>(
+            List<K> priorityRoots, Map<K, CraftPattern<K>> routePreferences) {
+    }
+
+    private record PlanVariant<K>(
+            List<K> priorityRoots,
+            Map<K, CraftPattern<K>> routePreferences,
+            int discrepancies,
+            long sequence) {
+
+        private PlanVariant {
+            priorityRoots = List.copyOf(priorityRoots);
+            routePreferences = Map.copyOf(routePreferences);
+        }
+
+        private VariantKey<K> key() {
+            return new VariantKey<>(priorityRoots, routePreferences);
+        }
+    }
+
     /**
      * Monotonic plan-wide guard. Exhaustion is recorded only when work is actually denied, so a route
      * that succeeds on the final permitted unit remains a valid completed proof.
@@ -2103,16 +2477,25 @@ public final class CraftPlannerV2<K> {
         }
 
         private boolean tryConsume() {
-            if (remaining <= 0) {
+            return tryConsume(1);
+        }
+
+        private boolean tryConsume(int work) {
+            int requested = Math.max(1, work);
+            if (remaining < requested) {
                 exhausted = true;
                 return false;
             }
-            remaining--;
+            remaining -= requested;
             return true;
         }
 
         private boolean exhausted() {
             return exhausted;
+        }
+
+        private int remaining() {
+            return remaining;
         }
     }
 

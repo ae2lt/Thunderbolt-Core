@@ -1815,6 +1815,179 @@ class CraftPlannerV2Test {
     }
 
     /**
+     * X's first route is locally feasible but consumes the only shared unit before sibling Y asks for
+     * it. The ordinary recursive pass cannot reopen that successful decision. A whole-plan deviation
+     * must replay X through special and preserve shared for Y.
+     */
+    @Test
+    void anytimeReplayReopensSuccessfulChildAfterLaterSiblingConflict() {
+        ReusableStockSource source = new ReusableStockSource("host", "pool");
+        CraftPattern<String> xShared = new CraftPattern<>(
+                "X", 1, List.of(CraftInput.of("shared", 1)), "X-shared");
+        CraftPattern<String> xSpecial = new CraftPattern<>(
+                "X", 1, List.of(CraftInput.of("special", 1)), "X-special");
+        CraftGraph<String> graph = CraftGraph.<String>builder()
+                .pattern(xShared)
+                .pattern(xSpecial)
+                .pattern("Y", 1, List.of(CraftInput.of("shared", 1)))
+                .pattern("target", 1, List.of(
+                        CraftInput.of("X", 1),
+                        CraftInput.of("Y", 1),
+                        CraftInput.returnedFrom("tool", 1, source)))
+                .stock("shared", 1)
+                .stock("special", 1)
+                .reusableStock("host", "tool", 1)
+                .reusableStockRoute(source, "tool", List.of("tool"))
+                .build();
+
+        CraftPlan<String> plan = CraftPlannerV2.plan(graph, "target", 1);
+
+        assertTrue(plan.feasible(), "one route-policy deviation should resolve the sibling conflict");
+        assertFalse(plan.budgetExhausted());
+        assertEquals(0L, firingsOf(plan, xShared));
+        assertEquals(1L, firingsOf(plan, xSpecial));
+        assertEquals(1L, plan.usedStock().get("shared"));
+        assertEquals(1L, plan.usedStock().get("special"));
+    }
+
+    @Test
+    void defaultAnytimeBudgetScalesAsReachableEdgesTimesLogEdges() {
+        CraftGraph.Builder<String> builder = CraftGraph.builder();
+        int depth = 256;
+        for (int i = 0; i < depth; i++) {
+            builder.pattern(
+                    "N" + i,
+                    1,
+                    List.of(CraftInput.of("N" + (i + 1), 1)));
+        }
+        CraftGraph<String> graph = builder.build();
+
+        int work = CraftPlannerV2.reachableWorkEstimate(graph, "N0");
+        int budget = CraftPlannerV2.scaledSearchWorkBudget(graph, "N0");
+        int log = 32 - Integer.numberOfLeadingZeros(work);
+        long expected = Math.min(
+                CraftPlannerV2.DEFAULT_SEARCH_WORK_BUDGET,
+                Math.max(4_096L, (long) work * (log + 4L)));
+
+        assertEquals(3 * depth + 1, work);
+        assertEquals(expected, budget);
+        assertTrue(budget >= work, "one complete reachable-graph pass must always fit");
+    }
+
+    /**
+     * Complete material footprints differ (A versus a deep B chain), but both target routes have the
+     * same unavoidable eight-C shortage. The proof is attached to that raw consumable requirement, so
+     * the B subtree is never expanded merely to rediscover the already-visible C blocker.
+     */
+    @Test
+    void commonConsumableShortfallPrunesDifferentMaterialRoutes() {
+        CraftGraph.Builder<String> builder = CraftGraph.<String>builder()
+                .pattern("target", 1, List.of(
+                        CraftInput.of("A", 5),
+                        CraftInput.of("C", 8)))
+                .pattern("target", 1, List.of(
+                        CraftInput.of("B0", 4),
+                        CraftInput.of("C", 8)))
+                .stock("A", 5);
+        int depth = 48;
+        for (int i = 0; i < depth; i++) {
+            builder.pattern(
+                    "B" + i,
+                    1,
+                    List.of(CraftInput.of("B" + (i + 1), 1)));
+        }
+        builder.stock("B" + depth, 4);
+
+        CraftPlan<String> plan = CraftPlannerV2.plan(builder.build(), "target", 1);
+
+        assertFalse(plan.feasible());
+        assertFalse(plan.budgetExhausted());
+        assertEquals(8L, plan.missing().get("C"));
+        assertEquals(5L, plan.usedStock().get("A"));
+        assertFalse(plan.usedStock().containsKey("B" + depth),
+                "the alternative B tree is irrelevant once its common C blocker is proven");
+        assertEquals(1, plan.itemsProcessed(),
+                "only target is expanded; the committed best effort reports C directly");
+    }
+
+    @Test
+    void consumableShortfallProofKeepsAFeasibleLowerQuantityRoute() {
+        ReusableStockSource source = new ReusableStockSource("host", "pool");
+        CraftPattern<String> needsEight = new CraftPattern<>(
+                "target",
+                1,
+                List.of(
+                        CraftInput.of("A", 1),
+                        CraftInput.of("C", 8),
+                        CraftInput.returnedFrom("tool", 1, source)),
+                "needs-eight-C");
+        CraftPattern<String> needsOne = new CraftPattern<>(
+                "target",
+                1,
+                List.of(
+                        CraftInput.of("B", 1),
+                        CraftInput.of("C", 1),
+                        CraftInput.returnedFrom("tool", 1, source)),
+                "needs-one-C");
+        CraftGraph<String> graph = CraftGraph.<String>builder()
+                .pattern(needsEight)
+                .pattern(needsOne)
+                .stock("A", 1)
+                .stock("B", 1)
+                .stock("C", 1)
+                .reusableStock("host", "tool", 1)
+                .reusableStockRoute(source, "tool", List.of("tool"))
+                .build();
+
+        CraftPlan<String> plan = CraftPlannerV2.plan(graph, "target", 1);
+
+        assertTrue(plan.feasible());
+        assertEquals(0L, firingsOf(plan, needsEight));
+        assertEquals(1L, firingsOf(plan, needsOne));
+        assertEquals(1L, plan.usedStock().get("C"));
+    }
+
+    @Test
+    void consumableShortfallProofIsScopedToTheAvailabilityState() {
+        ReusableStockSource source = new ReusableStockSource("host", "pool");
+        CraftPattern<String> xViaA = new CraftPattern<>(
+                "X", 1, List.of(CraftInput.of("A", 1), CraftInput.of("C", 8)), "X-via-A");
+        CraftPattern<String> xViaB = new CraftPattern<>(
+                "X", 1, List.of(CraftInput.of("B", 1), CraftInput.of("C", 8)), "X-via-B");
+        CraftPattern<String> makeC = new CraftPattern<>(
+                "P",
+                1,
+                List.of(CraftInput.of("seed", 1)),
+                List.of(CraftOutput.of("C", 8)),
+                "make-C");
+        CraftGraph<String> graph = CraftGraph.<String>builder()
+                .pattern(xViaA)
+                .pattern(xViaB)
+                .pattern(makeC)
+                .pattern("target", 1, List.of(
+                        CraftInput.of("X", 1),
+                        CraftInput.returnedFrom("tool", 1, source)))
+                .pattern("target", 1, List.of(
+                        CraftInput.of("P", 1),
+                        CraftInput.of("X", 1),
+                        CraftInput.returnedFrom("tool", 1, source)))
+                .stock("A", 1)
+                .stock("B", 1)
+                .stock("seed", 1)
+                .reusableStock("host", "tool", 1)
+                .reusableStockRoute(source, "tool", List.of("tool"))
+                .build();
+
+        CraftPlan<String> plan = CraftPlannerV2.plan(graph, "target", 1);
+
+        assertTrue(plan.feasible(),
+                "a proof learned before C is produced must not survive the availability change");
+        assertEquals(1L, firingsOf(plan, makeC));
+        assertEquals(1L, plan.usedStock().get("seed"));
+        assertEquals(0L, plan.missing().getOrDefault("C", 0L));
+    }
+
+    /**
      * B accepts two concrete fuzzy variants. Their intermediate names differ, but both normalize to
      * exactly 1 E per B, so one failed material tree proves the other equivalent for this rollback
      * state. The amount is deliberately large to verify that proof work remains quantity-independent.
