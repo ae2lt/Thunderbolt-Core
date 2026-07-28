@@ -33,11 +33,12 @@ import java.util.Set;
  *       recipe current stock can actually fulfill (no scarcity metric needed).</li>
  *   <li><b>Bounded backtracking</b>: contended items (more than one recipe) are searched in
  *       capacity order with a {@code trail} for commit/rollback. Each node has a visit cap {@code K};
- *       after that, that node permanently freezes to its highest-capacity greedy recipe while parents,
- *       siblings and descendants retain their own independent search budgets. Exhaustion can therefore
- *       make one node choose a suboptimal route, but never invalidates the whole calculation. Failed
- *       speculative subtrees are memoized only for the exact node, amount, depth and rollback-restored
- *       availability state, preventing repeated proof work without reusing a stale inventory result.</li>
+ *       after that, that node re-ranks against the current pools and probes only a fixed route window
+ *       while parents, siblings and descendants retain their own independent search budgets. Exhaustion
+ *       can therefore make one node choose a suboptimal route, but never invalidates the whole
+ *       calculation. Failed speculative subtrees are memoized only for the exact node, amount, depth
+ *       and rollback-restored availability state, preventing repeated proof work without reusing a
+ *       stale inventory result.</li>
  * </ul>
  *
  * <p><b>Soundness (no false positives):</b> the pool is never overdrawn (a draw is capped by what is
@@ -51,9 +52,17 @@ public final class CraftPlannerV2<K> {
      * Default per-node visit cap. It is a safety net, not the workhorse: normal graphs are resolved by
      * the linear backbone or recover via a handful of backtracks, never approaching this bound. 256
      * lets a hot shared node participate in several rounds of parent/fuzzy backtracking before only
-     * that node freezes to its greedy choice.
+     * that node switches to bounded current-state probes.
      */
     public static final int DEFAULT_VISIT_CAP = 256;
+
+    /**
+     * Once a hot node reaches its local visit cap, re-check only this many materially distinct routes
+     * against the current rollback-restored inventory state. A single permanently frozen recipe is
+     * unsafe: an ancestor may consume that recipe's leaf stock before revisiting the node while a
+     * different route remains feasible. The fixed window preserves the bounded fallback contract.
+     */
+    static final int MAX_CAPPED_ROUTE_PROBES = 4;
 
     /**
      * Maximum number of alternate roots tried for a proven conservative conversion SCC. This is a
@@ -139,7 +148,6 @@ public final class CraftPlannerV2<K> {
 
     // Node-local search state is monotonic: rollback restores inventory, not knowledge already learned.
     private final Map<K, Integer> visit = new HashMap<>();
-    private final Map<K, CraftPattern<K>> frozenGreedyPattern = new HashMap<>();
     // Exact failure memo for speculative calls. availabilityState is restored with trail rollback,
     // so a proof is reused only when node, amount and every availability-affecting map are identical.
     private final Set<SearchFailure<K>> failedSpeculativeSearches = new HashSet<>();
@@ -1214,20 +1222,9 @@ public final class CraftPlannerV2<K> {
             processed++;
         }
 
-        CraftPattern<K> frozen = frozenGreedyPattern.get(x);
-        if (frozen != null) {
-            long unmet = fire(x, frozen, d, !commitFailure);
-            if (!commitFailure && unmet > 0) failedSpeculativeSearches.add(failureKey);
-            return unmet;
-        }
-
         int v = visit.getOrDefault(x, 0);
         if (v >= visitCap) {
-            CraftPattern<K> greedy = capacityOrder(x).get(0);
-            frozenGreedyPattern.put(x, greedy);
-            long unmet = fire(x, greedy, d, !commitFailure);
-            if (!commitFailure && unmet > 0) failedSpeculativeSearches.add(failureKey);
-            return unmet;
+            return obtainCapped(x, d, commitFailure, failureKey);
         }
         visit.put(x, v + 1);
 
@@ -1263,6 +1260,105 @@ public final class CraftPlannerV2<K> {
         }
         // Root/final route: commit the highest-capacity one and record its concrete missing leaves.
         return commitBestEffort(distinctBranches, x, d);
+    }
+
+    /**
+     * Bounded degradation for a node already hot under many parent alternatives. Probe a small fixed
+     * route window using the actual current pools; successful probes stay committed, while failures
+     * roll back exactly like the normal alternate search. This avoids carrying a recipe selected under
+     * an old inventory state into every later call without reopening unbounded branching.
+     */
+    private long obtainCapped(
+            K x, long d, boolean commitFailure, SearchFailure<K> failureKey) {
+        List<CraftPattern<K>> distinctBranches = cappedRouteOrder(x);
+        int probes = Math.min(MAX_CAPPED_ROUTE_PROBES, distinctBranches.size());
+        for (int i = 0; i < probes; i++) {
+            CraftPattern<K> route = distinctBranches.get(i);
+            int mark = trail.size();
+            long beforeMissing = missingTotal;
+            long unmet = fire(x, route, d, true);
+            if (unmet == 0 && missingTotal == beforeMissing) {
+                return 0L;
+            }
+            rollback(mark);
+        }
+        if (!commitFailure) {
+            failedSpeculativeSearches.add(failureKey);
+            return d;
+        }
+        return commitBestEffort(distinctBranches, x, d);
+    }
+
+    /**
+     * Re-ranks the immutable capacity order using the inventory/byproduct pools of this exact branch.
+     * Only ordinary DAG material edges participate in the dynamic estimate; returned/reusable inputs
+     * retain their already-proven static score because their availability has separate reservation
+     * semantics. Sorting is stable, so equal estimates preserve the caller-defined preference order.
+     */
+    private List<CraftPattern<K>> cappedRouteOrder(K x) {
+        List<CraftPattern<K>> routes =
+                new ArrayList<>(distinctMaterialBranches(capacityOrder(x)));
+        if (routes.size() < 2) {
+            return routes;
+        }
+
+        Map<K, Long> currentCapacity = new HashMap<>();
+        Map<CraftPattern<K>, Long> scores = new IdentityHashMap<>();
+        for (CraftPattern<K> route : routes) {
+            scores.put(route, currentCapacityVia(
+                    route, currentCapacity, new HashSet<>()));
+        }
+        routes.sort((left, right) ->
+                Long.compare(scores.get(right), scores.get(left)));
+        return routes;
+    }
+
+    private long currentCapacityVia(
+            CraftPattern<K> pattern,
+            Map<K, Long> memo,
+            Set<K> evaluating) {
+        long bound = Sat.SAT;
+        for (CraftInput<K> input : pattern.inputs()) {
+            if (input.returned() || input.reusableStockSource() != null) {
+                return capacityScore(pattern);
+            }
+            long available = currentCapacity(input.key(), memo, evaluating);
+            bound = Math.min(bound, input.firingsFrom(available));
+            if (bound == 0) {
+                return 0L;
+            }
+        }
+        return Sat.mul(bound, pattern.outputAmount());
+    }
+
+    private long currentCapacity(
+            K key,
+            Map<K, Long> memo,
+            Set<K> evaluating) {
+        Long cached = memo.get(key);
+        if (cached != null) {
+            return cached;
+        }
+
+        long immediate = Sat.add(get(stockLeft, key), get(bpPool, key));
+        if (!evaluating.add(key)) {
+            return immediate;
+        }
+        long bestCrafted = 0L;
+        for (CraftPattern<K> pattern
+                : patternsByOutput.getOrDefault(key, List.of())) {
+            bestCrafted = Math.max(
+                    bestCrafted,
+                    currentCapacityVia(pattern, memo, evaluating));
+            if (Sat.isSaturated(bestCrafted)) {
+                break;
+            }
+        }
+        evaluating.remove(key);
+
+        long result = Sat.add(immediate, bestCrafted);
+        memo.put(key, result);
+        return result;
     }
 
     private List<CraftPattern<K>> distinctMaterialBranches(List<CraftPattern<K>> ordered) {

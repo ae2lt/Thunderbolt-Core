@@ -1618,7 +1618,7 @@ class CraftPlannerV2Test {
 
     /**
      * One hard-fuzzy AE2 pattern may contribute 64 concrete candidates. If all of them revisit the same
-     * child and lose on a shared-stock conflict, that child's local cap must switch it to greedy-tree
+     * child and lose on a shared-stock conflict, that child's local cap must switch it to bounded probe
      * mode without killing the parent search or hiding the first ordinary alternative after the window.
      */
     @Test
@@ -1661,6 +1661,82 @@ class CraftPlannerV2Test {
         assertTrue(defaultCap.feasible(), "the default must search beyond one complete fuzzy window");
         assertFalse(defaultCap.budgetExhausted());
         assertEquals(1L, firingsOf(defaultCap, good));
+    }
+
+    /**
+     * A hot child may reach its local visit cap under many distinct parent alternatives. Its former
+     * highest-capacity route can become impossible after a later parent consumes that route's leaf
+     * stock, while another child route remains feasible. Capped mode must therefore choose against
+     * the current rollback-restored pools instead of freezing one recipe for every future state.
+     */
+    @Test
+    void cappedChildReevaluatesGreedyRouteAgainstCurrentStock() {
+        CraftPattern<String> xViaShared = new CraftPattern<>(
+                "X", 1, List.of(CraftInput.of("shared", 1)), "X-via-shared");
+        CraftPattern<String> xViaSpecial = new CraftPattern<>(
+                "X", 1, List.of(CraftInput.of("special", 1)), "X-via-special");
+        CraftGraph.Builder<String> builder = CraftGraph.<String>builder()
+                .pattern(xViaShared)
+                .stock("shared", 1)
+                .stock("special", 1);
+        List<String> blockedRouteStock = new ArrayList<>();
+        for (int i = 0; i < CraftPlannerV2.MAX_CAPPED_ROUTE_PROBES + 3; i++) {
+            String key = "blocked-route-" + i;
+            blockedRouteStock.add(key);
+            builder.pattern("X", 1, List.of(CraftInput.of(key, 1)));
+            builder.stock(key, 1);
+        }
+        // This route deliberately sits outside the fixed probe window in immutable capacity order.
+        builder.pattern(xViaSpecial);
+
+        for (int i = 0; i < CraftPlannerV2.DEFAULT_VISIT_CAP; i++) {
+            String y = "Y" + i;
+            String z = "Z" + i;
+            builder.pattern(
+                    y,
+                    1,
+                    List.of(CraftInput.of("shared", 1)),
+                    List.of(CraftOutput.of("waste-" + i, 1)));
+            builder.pattern(z, 1, List.of(CraftInput.of("special", 1)));
+            List<CraftInput<String>> decoyInputs = new ArrayList<>();
+            decoyInputs.add(CraftInput.of("X", 1));
+            for (String key : blockedRouteStock) {
+                decoyInputs.add(CraftInput.of(key, 1));
+            }
+            decoyInputs.add(CraftInput.of(y, 1));
+            decoyInputs.add(CraftInput.of(z, 1));
+            builder.pattern(new CraftPattern<>(
+                    "target",
+                    1,
+                    decoyInputs,
+                    List.of(CraftOutput.of("distinct-" + i, 1)),
+                    "decoy-" + i));
+        }
+        List<CraftInput<String>> goodInputs = new ArrayList<>();
+        goodInputs.add(CraftInput.of("shared", 1));
+        for (String key : blockedRouteStock) {
+            goodInputs.add(CraftInput.of(key, 1));
+        }
+        goodInputs.add(CraftInput.of("X", 1));
+        CraftPattern<String> good = new CraftPattern<>(
+                "target",
+                1,
+                goodInputs,
+                "good");
+        builder.pattern(good);
+
+        CraftGraph<String> graph = builder.build();
+        CraftPlan<String> plan = assertTimeoutPreemptively(
+                Duration.ofSeconds(2),
+                () -> CraftPlannerV2.plan(graph, "target", 1));
+
+        assertTrue(plan.feasible(),
+                "after shared is reserved by the parent, capped X must route through special");
+        assertEquals(1L, firingsOf(plan, good));
+        assertEquals(0L, firingsOf(plan, xViaShared));
+        assertEquals(1L, firingsOf(plan, xViaSpecial));
+        assertEquals(1L, plan.usedStock().get("shared"));
+        assertEquals(1L, plan.usedStock().get("special"));
     }
 
     /**

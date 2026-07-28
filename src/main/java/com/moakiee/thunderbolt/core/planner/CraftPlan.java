@@ -23,9 +23,10 @@ import java.util.Map;
  *                       invocations performed by the bounded fallback. Request magnitude does not
  *                       affect this value because every firing count is handled in closed form.
  * @param budgetExhausted retained for result compatibility. Node-local visit exhaustion no longer
- *                       invalidates a calculation: that node freezes to one greedy recipe, so the v2
- *                       planner leaves this {@code false}. Depth overflow is reported as a normal
- *                       branch-local missing input and may be recovered by a parent alternative.
+ *                       invalidates a calculation: that node switches to current-state fixed-width
+ *                       route probes, so the v2 planner leaves this {@code false}. Depth overflow is
+ *                       reported as a normal branch-local missing input and may be recovered by a
+ *                       parent alternative.
  * @param <K> item key type
  */
 public record CraftPlan<K>(
