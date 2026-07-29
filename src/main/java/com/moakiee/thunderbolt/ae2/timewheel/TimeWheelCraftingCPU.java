@@ -22,6 +22,8 @@ import appeng.api.networking.security.IActionSource;
 import appeng.api.stacks.GenericStack;
 
 public final class TimeWheelCraftingCPU implements ICraftingCPU {
+    private static final long PROGRESS_SCALE = Integer.MAX_VALUE;
+
     private final TimeWheelCraftingCpuHost host;
     private final long storageBytes;
     private final int coProcessors;
@@ -65,14 +67,18 @@ public final class TimeWheelCraftingCPU implements ICraftingCPU {
         }
 
         var elapsedTimeTracker = craftingLogic.getElapsedTimeTracker();
-        var progress = Math.max(
-                0,
-                elapsedTimeTracker.getStartItemCount() - elapsedTimeTracker.getRemainingItemCount());
+        long remaining = remainingProgressUnits(elapsedTimeTracker.getProgress());
+        long progress = Math.max(0, PROGRESS_SCALE - remaining);
         return new CraftingJobStatus(
                 output,
-                elapsedTimeTracker.getStartItemCount(),
+                PROGRESS_SCALE,
                 progress,
                 elapsedTimeTracker.getElapsedTime());
+    }
+
+    private static long remainingProgressUnits(float progress) {
+        // Preserve AE2's legacy status scale while using its replacement progress API.
+        return (long) (PROGRESS_SCALE - (double) progress * PROGRESS_SCALE);
     }
 
     @Override

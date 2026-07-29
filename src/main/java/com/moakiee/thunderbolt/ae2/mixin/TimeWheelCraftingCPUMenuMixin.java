@@ -32,6 +32,9 @@ import com.moakiee.thunderbolt.ae2.timewheel.TimeWheelCraftingCPU;
 
 @Mixin(value = CraftingCPUMenu.class, remap = false)
 public abstract class TimeWheelCraftingCPUMenuMixin extends AEBaseMenu {
+    @Unique
+    private static final long thunderbolt$PROGRESS_SCALE = Integer.MAX_VALUE;
+
     @Final
     @Shadow
     private IncrementalUpdateHelper incrementalUpdateHelper;
@@ -159,12 +162,20 @@ public abstract class TimeWheelCraftingCPUMenuMixin extends AEBaseMenu {
         }
 
         var tracker = logic.getElapsedTimeTracker();
+        long remaining = thunderbolt$remainingProgressUnits(tracker.getProgress());
         return new CraftingStatus(
                 full,
                 tracker.getElapsedTime(),
-                tracker.getRemainingItemCount(),
-                tracker.getStartItemCount(),
+                remaining,
+                thunderbolt$PROGRESS_SCALE,
                 entries,
                 logic.isJobSuspended());
+    }
+
+    @Unique
+    private static long thunderbolt$remainingProgressUnits(float progress) {
+        // Preserve AE2's legacy status scale while using its replacement progress API.
+        return (long) (thunderbolt$PROGRESS_SCALE
+                - (double) progress * thunderbolt$PROGRESS_SCALE);
     }
 }
