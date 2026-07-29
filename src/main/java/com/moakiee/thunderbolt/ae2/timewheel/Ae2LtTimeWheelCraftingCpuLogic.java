@@ -75,6 +75,7 @@ import com.moakiee.thunderbolt.ae2.overload.model.MatchMode;
 import com.moakiee.thunderbolt.ae2.overload.pattern.OverloadedProviderOnlyPatternDetails;
 import com.moakiee.thunderbolt.ae2.crafting.PatternFiringExpander;
 import com.moakiee.thunderbolt.ae2.crafting.ExecuteLoopPattern;
+import com.moakiee.thunderbolt.ae2.crafting.FinalOutputAccounting;
 import com.moakiee.thunderbolt.ae2.crafting.LoopCraftingPlan;
 import com.moakiee.thunderbolt.core.planner.Sat;
 
@@ -946,6 +947,7 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
 
         long retainedRequester = 0L;
         long requesterAccepted = 0L;
+        long deferredRequester = 0L;
         var limited = preview;
         if (!activeJob.softCancelling && preview.claimedForRequester() > 0) {
             retainedRequester = retainableFinalOutputAmount(
@@ -955,7 +957,16 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
                     activeJob.remainingAmount);
             requesterAccepted = requesterLimit > 0
                     ? activeJob.link.insert(what, requesterLimit, type) : 0L;
-            limited = preview.partitionRequester(requesterLimit, requesterAccepted);
+            boolean fallsThroughToNetwork = activeJob.link.isStandalone();
+            long requesterCompleted = FinalOutputAccounting.completedAmount(
+                    fallsThroughToNetwork, requesterLimit, requesterAccepted);
+            deferredRequester = FinalOutputAccounting.deferredAmount(
+                    fallsThroughToNetwork, requesterLimit, requesterAccepted);
+            // Deferred requester output becomes public CPU inventory and is
+            // retried from pendingRequesterOutputs instead of remaining in
+            // overload state.
+            limited = preview.partitionRequester(
+                    requesterCompleted, requesterCompleted);
         }
         var claims = limited;
         if (type == Actionable.MODULATE) {
@@ -977,15 +988,31 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
                     finishSoftCancelIfReady(activeJob);
                 }
             } else {
-                retainedRequester = Math.min(
-                        retainedRequester, overloadPublicInventory(claims));
-                accepted += applyInventoryClaims(activeJob, what, claims);
+                long publicInventory = overloadPublicInventory(claims);
+                retainedRequester = Math.min(retainedRequester, publicInventory);
+                long inventoryAccepted = applyInventoryClaims(
+                        activeJob, what, claims);
                 markRetainedRequesterClaim(what, retainedRequester);
-                accepted += applyRequesterClaims(activeJob, what, claims);
+                long deferredCommitted = Math.min(
+                        deferredRequester,
+                        Math.max(0L, publicInventory - retainedRequester));
+                if (deferredCommitted > 0
+                        && job == activeJob
+                        && !activeJob.link.isCanceled()) {
+                    pendingRequesterOutputs.add(what, deferredCommitted);
+                }
+                applyRequesterClaims(activeJob, what, claims);
+                accepted += FinalOutputAccounting.physicallyAcceptedAmount(
+                        inventoryAccepted,
+                        claims.claimedForRequester(),
+                        requesterAccepted);
             }
             cpu.markDirty();
         } else {
-            accepted += claims.claimedAmount();
+            accepted += FinalOutputAccounting.physicallyAcceptedAmount(
+                    claims.claimedForInventory(),
+                    claims.claimedForRequester(),
+                    requesterAccepted);
         }
 
         return new OverloadInsert(claims.claimedAmount(), accepted);
@@ -1050,9 +1077,9 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
         // returns zero. The produced item must fall through to ordinary ME storage, but the CPU
         // still has to count the offered final output as completed. Vanilla CraftingCpuLogic uses
         // the same split between storage acceptance and job-progress accounting.
-        long completedFinalOutput = FinalOutputProgress.completedAmount(
+        long completedFinalOutput = FinalOutputAccounting.completedAmount(
                 activeJob.link.isStandalone(), finalOffer, delivered);
-        long deferredRequesterOutput = FinalOutputProgress.deferredRequesterAmount(
+        long deferredRequesterOutput = FinalOutputAccounting.deferredAmount(
                 activeJob.link.isStandalone(), finalOffer, delivered);
         if (deferredRequesterOutput > 0) {
             // Requester callbacks can legitimately accept only part of an output. In particular,
@@ -2319,11 +2346,11 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
         cpu.markDirty();
     }
 
-    private long applyRequesterClaims(
+    private void applyRequesterClaims(
             TimeWheelJob activeJob, AEKey incoming, OverloadClaimResult claims) {
         long claimed = claims.claimedForRequester();
         if (claimed <= 0) {
-            return 0;
+            return;
         }
 
         decrementItems(activeJob.timeTracker, claimed, incoming.getType());
@@ -2335,7 +2362,6 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
         } else {
             cpu.updateOutput(null);
         }
-        return claimed;
     }
 
     private void consumeTaskCopies(TimeWheelJob activeJob, IPatternDetails details, long copies) {

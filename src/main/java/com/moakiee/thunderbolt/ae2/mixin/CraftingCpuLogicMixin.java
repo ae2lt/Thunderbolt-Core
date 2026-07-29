@@ -28,6 +28,7 @@ import appeng.me.cluster.implementations.CraftingCPUCluster;
 import com.moakiee.thunderbolt.ae2.mixin.ElapsedTimeTrackerAccessor;
 import com.moakiee.thunderbolt.ae2.mixin.ExecutingCraftingJobAccessor;
 import com.moakiee.thunderbolt.ae2.api.crafting.CraftingPatternDelegates;
+import com.moakiee.thunderbolt.ae2.crafting.FinalOutputAccounting;
 import com.moakiee.thunderbolt.ae2.overload.cpu.InsertContext;
 import com.moakiee.thunderbolt.ae2.overload.cpu.OverloadClaimResult;
 import com.moakiee.thunderbolt.ae2.overload.cpu.OverloadCpuInsertSupport;
@@ -105,12 +106,17 @@ public abstract class CraftingCpuLogicMixin {
         long requesterLimit = Math.min(
                 preview.claimedForRequester(),
                 Math.max(0L, jobAccessor.getRemainingAmount()));
-        long requesterAccepted = requesterLimit;
+        long requesterAccepted = 0L;
         if (requesterLimit > 0) {
             requesterAccepted = link != null
                     ? link.insert(what, requesterLimit, type) : 0L;
         }
-        var claims = preview.partitionRequester(requesterLimit, requesterAccepted);
+        // Vanilla CraftingCpuLogic completes the offered final output even when
+        // its requester accepts zero and the item falls through to ME storage.
+        long requesterCompleted = FinalOutputAccounting.completedAmount(
+                true, requesterLimit, requesterAccepted);
+        var claims = preview.partitionRequester(
+                requesterLimit, requesterCompleted);
         if (type == Actionable.MODULATE) {
             claims = OverloadCpuStateManager.INSTANCE.commitPreview(logic, claims);
         }
@@ -119,11 +125,18 @@ public abstract class CraftingCpuLogicMixin {
         long supplementalReturn = 0;
         if (type == Actionable.MODULATE) {
             ae2lt$deductClaimedWaitingFor(job, claims);
-            supplementalReturn += ae2lt$applyInventoryClaims(what, claims);
-            supplementalReturn += ae2lt$applyRequesterClaims(what, claims);
+            long inventoryAccepted = ae2lt$applyInventoryClaims(what, claims);
+            ae2lt$applyRequesterClaims(what, claims);
+            supplementalReturn = FinalOutputAccounting.physicallyAcceptedAmount(
+                    inventoryAccepted,
+                    claims.claimedForRequester(),
+                    requesterAccepted);
             cluster.markDirty();
         } else {
-            supplementalReturn += claims.claimedAmount();
+            supplementalReturn = FinalOutputAccounting.physicallyAcceptedAmount(
+                    claims.claimedForInventory(),
+                    claims.claimedForRequester(),
+                    requesterAccepted);
         }
 
         cir.setReturnValue(cir.getReturnValue() + supplementalReturn);
@@ -239,17 +252,17 @@ public abstract class CraftingCpuLogicMixin {
     }
 
     @Unique
-    private long ae2lt$applyRequesterClaims(AEKey incoming, OverloadClaimResult claims) {
+    private void ae2lt$applyRequesterClaims(AEKey incoming, OverloadClaimResult claims) {
         long claimed = claims.claimedForRequester();
         if (claimed <= 0) {
-            return 0;
+            return;
         }
 
         var logic = (appeng.crafting.execution.CraftingCpuLogic) (Object) this;
         var logicAccessor = (CraftingCpuLogicAccessor) logic;
         ExecutingCraftingJob job = logicAccessor.getJob();
         if (job == null) {
-            return 0;
+            return;
         }
 
         var jobAccessor = (ExecutingCraftingJobAccessor) job;
@@ -271,7 +284,6 @@ public abstract class CraftingCpuLogicMixin {
             }
         }
 
-        return claimed;
     }
 
     @Unique

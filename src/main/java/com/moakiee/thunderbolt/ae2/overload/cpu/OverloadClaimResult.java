@@ -101,29 +101,31 @@ public record OverloadClaimResult(
 
     /**
      * Keeps public output beyond {@code maximumRequesterAmount} as ordinary inventory, commits only
-     * the accepted part within that request limit, and leaves the rejected in-range part pending.
+     * the completed part within that request limit, and leaves the incomplete in-range part pending.
+     * Completion and physical acceptance are intentionally separate: a standalone final output can
+     * complete here while still falling through to ordinary ME storage.
      */
     public OverloadClaimResult partitionRequester(
-            long maximumRequesterAmount, long acceptedRequesterAmount) {
+            long maximumRequesterAmount, long completedRequesterAmount) {
         long requestLimit = Math.max(0L, maximumRequesterAmount);
-        long acceptedRemaining = Math.max(0L, acceptedRequesterAmount);
+        long completedRemaining = Math.max(0L, completedRequesterAmount);
         long total = 0L;
         var partitioned = new ArrayList<PendingOverloadClaim>(claims.size());
         for (var claim : claims) {
             long publicAmount = claim.requesterAmount();
             long requested = Math.min(publicAmount, requestLimit);
             requestLimit -= requested;
-            long accepted = Math.min(requested, acceptedRemaining);
-            acceptedRemaining -= accepted;
+            long completed = Math.min(requested, completedRemaining);
+            completedRemaining -= completed;
             long excess = publicAmount - requested;
             long inventoryPart = claim.claimedAmount() - publicAmount;
-            long kept = addSaturated(addSaturated(inventoryPart, excess), accepted);
+            long kept = addSaturated(addSaturated(inventoryPart, excess), completed);
             if (kept <= 0) continue;
             partitioned.add(new PendingOverloadClaim(
                     claim.key(),
                     kept,
                     claim.routesToRequester(),
-                    accepted,
+                    completed,
                     claim.exactExpectedKey(),
                     OverloadConsumerCredit.limit(claim.consumerCredits(), kept),
                     claim.sharedReusableSeedPool()));
