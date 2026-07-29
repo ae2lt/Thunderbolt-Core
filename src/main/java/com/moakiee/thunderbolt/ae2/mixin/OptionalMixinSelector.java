@@ -15,7 +15,8 @@ public final class OptionalMixinSelector {
             Map.entry("AaeTaskProgressAccessor", "advanced_ae"),
             Map.entry("ECOCraftingCpuLogicBatchMixin", "neoecoae"),
             Map.entry("ECOCraftingCpuLogicMixin", "neoecoae"),
-            Map.entry("ECOCraftingCpuAccessor", "neoecoae"));
+            Map.entry("ECOCraftingCpuAccessor", "neoecoae"),
+            Map.entry("ExtendedAePlusVirtualCompletionSuppressionMixin", "extendedae_plus"));
 
     private OptionalMixinSelector() {
     }
