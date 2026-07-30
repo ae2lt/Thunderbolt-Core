@@ -83,6 +83,60 @@ class CraftPlannerV2Test {
         assertEquals(5L, plan.usedStock().get("iron"));
     }
 
+    @Test
+    void fuzzySiblingRouteConsumesStockBeforeCraftingTheDeclaredVariant() {
+        Object fuzzyPattern = new Object();
+        CraftPattern<String> fromStockVariant = new CraftPattern<>(
+                "tier3", 1, List.of(CraftInput.of("tier2-with-other-nbt", 1)), fuzzyPattern);
+        CraftPattern<String> fromDeclaredVariant = new CraftPattern<>(
+                "tier3", 1, List.of(CraftInput.of("tier2-declared-nbt", 1)), fuzzyPattern);
+        CraftPattern<String> makeDeclaredVariant = new CraftPattern<>(
+                "tier2-declared-nbt", 1, List.of(CraftInput.of("tier1", 1)), "tier1-to-tier2");
+        CraftGraph<String> graph = CraftGraph.<String>builder()
+                .pattern(fromStockVariant)
+                .pattern(fromDeclaredVariant)
+                .pattern(makeDeclaredVariant)
+                .stock("tier2-with-other-nbt", 1)
+                .stock("tier1", 64)
+                .build();
+
+        CraftPlan<String> plan = CraftPlannerV2.plan(graph, "tier3", 1);
+
+        assertTrue(plan.feasible());
+        assertEquals(1L, firingsOf(plan, fromStockVariant));
+        assertEquals(0L, firingsOf(plan, fromDeclaredVariant));
+        assertEquals(0L, firingsOf(plan, makeDeclaredVariant));
+        assertEquals(1L, plan.usedStock().get("tier2-with-other-nbt"));
+        assertNull(plan.usedStock().get("tier1"));
+    }
+
+    @Test
+    void fuzzySiblingRouteCraftsOnlyTheAmountMissingAfterStock() {
+        Object fuzzyPattern = new Object();
+        CraftPattern<String> fromStockVariant = new CraftPattern<>(
+                "tier3", 1, List.of(CraftInput.of("tier2-with-other-nbt", 1)), fuzzyPattern);
+        CraftPattern<String> fromDeclaredVariant = new CraftPattern<>(
+                "tier3", 1, List.of(CraftInput.of("tier2-declared-nbt", 1)), fuzzyPattern);
+        CraftPattern<String> makeDeclaredVariant = new CraftPattern<>(
+                "tier2-declared-nbt", 1, List.of(CraftInput.of("tier1", 1)), "tier1-to-tier2");
+        CraftGraph<String> graph = CraftGraph.<String>builder()
+                .pattern(fromStockVariant)
+                .pattern(fromDeclaredVariant)
+                .pattern(makeDeclaredVariant)
+                .stock("tier2-with-other-nbt", 1)
+                .stock("tier1", 64)
+                .build();
+
+        CraftPlan<String> plan = CraftPlannerV2.plan(graph, "tier3", 2);
+
+        assertTrue(plan.feasible());
+        assertEquals(1L, firingsOf(plan, fromStockVariant));
+        assertEquals(1L, firingsOf(plan, fromDeclaredVariant));
+        assertEquals(1L, firingsOf(plan, makeDeclaredVariant));
+        assertEquals(1L, plan.usedStock().get("tier2-with-other-nbt"));
+        assertEquals(1L, plan.usedStock().get("tier1"));
+    }
+
     /**
      * Capacity is optimistic (it double-counts a shared input), so the highest-capacity recipe is
      * tried first and fails at runtime; bounded backtracking rolls it back and the alternative wins.

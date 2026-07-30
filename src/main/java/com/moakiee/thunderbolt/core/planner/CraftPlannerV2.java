@@ -11,6 +11,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.PriorityQueue;
 import java.util.Set;
+import java.util.function.ToLongFunction;
 
 /**
  * v2 autocrafting planner: an iterative linear backbone plus conflict-directed anytime search over a
@@ -30,8 +31,9 @@ import java.util.Set;
  *       demand draws byproducts first, then stock, then crafts. Multi-output patterns are supported
  *       (a pattern's extra outputs feed sibling demands).</li>
  *   <li><b>Dynamic-capacity greedy</b>: among an item's recipes, the one with the highest current
- *       capacity ({@code stock + craftable}) is preferred, so the planner naturally balances onto the
- *       recipe current stock can actually fulfill (no scarcity metric needed).</li>
+ *       capacity ({@code stock + craftable}) is preferred. Concrete fuzzy expansions of one real
+ *       recipe are kept in a source group and consume already-stocked variants before recursively
+ *       crafting another accepted variant.</li>
  *   <li><b>Budgeted backtracking</b>: contended items (more than one recipe) are searched in
  *       capacity order with a {@code trail} for commit/rollback. No node drops candidates at a fixed
  *       route count: a hot node re-ranks every materially distinct route against the current pools and
@@ -1236,8 +1238,8 @@ public final class CraftPlannerV2<K> {
             for (CraftPattern<K> pattern : ordered) {
                 capacityScore(pattern);
             }
-            ordered.sort((left, right) ->
-                    Long.compare(capacityScore(right), capacityScore(left)));
+            ordered = groupedCapacityOrder(
+                    ordered, this::capacityScore, this::preexistingStockCapacity);
             capacityOrderByOutput.put(entry.getKey(), List.copyOf(ordered));
         }
     }
@@ -1248,6 +1250,21 @@ public final class CraftPlannerV2<K> {
             return cached;
         }
         return producibleVia(pattern, capacity, capacityScoreByPattern);
+    }
+
+    /**
+     * Capacity supplied directly by the immutable inventory snapshot, without recursively counting
+     * craftable inputs. The AE2 adapter emits one concrete route per accepted fuzzy/NBT variant and
+     * gives all of those routes the same source object. Within that source group, stocked variants
+     * must be consumed before a declared variant that merely has a larger upstream crafting capacity.
+     */
+    private long preexistingStockCapacity(CraftPattern<K> pattern) {
+        long bound = Sat.SAT;
+        for (CraftInput<K> input : pattern.inputs()) {
+            bound = Math.min(bound, input.firingsFrom(graph.stock(input.key())));
+            if (bound == 0) return 0L;
+        }
+        return Sat.mul(bound, pattern.outputAmount());
     }
 
     private void indexDirectRawConsumables() {
@@ -1385,8 +1402,10 @@ public final class CraftPlannerV2<K> {
                                 Map<K, Long> need, Map<K, Long> bp,
                                 Map<K, Long> returnedSeedReserve,
                                 Map<CraftPattern<K>, Long> fired) {
-        List<CraftPattern<K>> ordered = new ArrayList<>(ps);
-        ordered.sort((a, b) -> Long.compare(capRemainingVia(b, need), capRemainingVia(a, need)));
+        List<CraftPattern<K>> ordered = groupedCapacityOrder(
+                ps,
+                pattern -> capRemainingVia(pattern, need),
+                pattern -> preexistingStockRemainingCapacity(pattern, need));
 
         for (CraftPattern<K> r : ordered) {
             if (d <= 0) {
@@ -1452,6 +1471,85 @@ public final class CraftPlannerV2<K> {
             }
         }
         return Sat.mul(bound, r.outputAmount());
+    }
+
+    private long preexistingStockRemainingCapacity(
+            CraftPattern<K> pattern, Map<K, Long> need) {
+        long bound = Sat.SAT;
+        for (CraftInput<K> input : pattern.inputs()) {
+            long remaining = Math.max(
+                    0L, graph.stock(input.key()) - need.getOrDefault(input.key(), 0L));
+            bound = Math.min(bound, input.firingsFrom(remaining));
+            if (bound == 0) return 0L;
+        }
+        return Sat.mul(bound, pattern.outputAmount());
+    }
+
+    /**
+     * Orders real recipes by total capacity as before, but treats concrete expansions of the same
+     * source recipe as one route group. The group's best total capacity determines its position
+     * relative to unrelated recipes; inside the group, direct inventory capacity wins. This keeps
+     * ordinary recipe preference unchanged while making ignore-NBT/fuzzy expansions consume an
+     * already-stocked sibling variant before recursively crafting the pattern's declared variant.
+     */
+    private List<CraftPattern<K>> groupedCapacityOrder(
+            List<CraftPattern<K>> patterns,
+            ToLongFunction<CraftPattern<K>> totalCapacity,
+            ToLongFunction<CraftPattern<K>> directStockCapacity) {
+        if (patterns.size() < 2) {
+            return patterns;
+        }
+
+        List<List<CraftPattern<K>>> groups = new ArrayList<>();
+        IdentityHashMap<Object, List<CraftPattern<K>>> bySource = new IdentityHashMap<>();
+        for (CraftPattern<K> pattern : patterns) {
+            Object source = pattern.source();
+            if (source == null) {
+                groups.add(new ArrayList<>(List.of(pattern)));
+                continue;
+            }
+            List<CraftPattern<K>> group = bySource.get(source);
+            if (group == null) {
+                group = new ArrayList<>();
+                bySource.put(source, group);
+                groups.add(group);
+            }
+            group.add(pattern);
+        }
+
+        for (List<CraftPattern<K>> group : groups) {
+            if (group.size() > 1) {
+                group.sort((left, right) -> {
+                    int byStock = Long.compare(
+                            directStockCapacity.applyAsLong(right),
+                            directStockCapacity.applyAsLong(left));
+                    return byStock != 0
+                            ? byStock
+                            : Long.compare(
+                                    totalCapacity.applyAsLong(right),
+                                    totalCapacity.applyAsLong(left));
+                });
+            }
+        }
+        groups.sort((left, right) -> Long.compare(
+                maxCapacity(right, totalCapacity),
+                maxCapacity(left, totalCapacity)));
+
+        List<CraftPattern<K>> ordered = new ArrayList<>(patterns.size());
+        for (List<CraftPattern<K>> group : groups) {
+            ordered.addAll(group);
+        }
+        return ordered;
+    }
+
+    private long maxCapacity(
+            List<CraftPattern<K>> patterns,
+            ToLongFunction<CraftPattern<K>> capacity) {
+        long best = 0L;
+        for (CraftPattern<K> pattern : patterns) {
+            best = Math.max(best, capacity.applyAsLong(pattern));
+        }
+        return best;
     }
 
     private long lget(Map<K, Long> m, K k) {
