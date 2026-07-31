@@ -38,6 +38,7 @@ import com.moakiee.thunderbolt.core.planner.CraftOutput;
 import com.moakiee.thunderbolt.core.planner.CraftPattern;
 import com.moakiee.thunderbolt.core.planner.CraftPlan;
 import com.moakiee.thunderbolt.core.planner.CraftPlannerV2;
+import com.moakiee.thunderbolt.core.planner.PlanningResult;
 import com.moakiee.thunderbolt.core.planner.ReusableStockFallback;
 import com.moakiee.thunderbolt.core.planner.ReusableStockUsageKey;
 import com.moakiee.thunderbolt.core.planner.DurabilityChain;
@@ -73,10 +74,10 @@ import com.moakiee.thunderbolt.ae2.timewheel.ReusableSeedPattern;
  *       byproducts and multiple recipe choices.</li>
  *   <li><b>Proven infeasible</b>: best-effort, never declined (Policy A).
  *       {@code simulate=false}→null, {@code simulate=true}→partial plan with missing items.</li>
- *   <li><b>Search budget exhausted</b>: keep the best bounded diagnostic route and expose its missing
- *       items through AE2's simulation result. The missing list is a targeted replenishment suggestion,
- *       not a proof about every alternate route; the pathological graph is never handed to AE2's
- *       exhaustive simulator merely because the fast search reached its guard.</li>
+ *   <li><b>Search budget exhausted</b>: stop enumerating alternatives and finish the current route
+ *       deterministically from the already-built graph and current shared pools. Its missing items are
+ *       exposed through AE2's simulation result. The missing list is a targeted replenishment
+ *       suggestion, not a proof about every alternate route; no second diagnostic plan is run.</li>
  * </ul>
  *
  * <p><b>Execution-time contract (fuzzy substitution).</b> For a hard-fuzzy slot the planner commits to a
@@ -117,7 +118,7 @@ public final class FastCraftingPlanner {
     /**
      * Cyclic-fuzzy budget. A durability tool {@code 1·A(n) + 1·B → 1·C + A(n-1)} forms a degradation
      * chain {@code A(n)→A(n-1)→…→broken}. We walk that chain once via {@code getRemainingKey}, capping
-     * the walk here ("超步报缺失" → decline to AE2), then reduce it to the closed form
+     * the walk here ("超步报缺失" → omit that recipe), then reduce it to the closed form
      * {@code uses = chainLen} so a batch costs {@code ceil(times / uses)} full tools instead of one
      * firing per durability point. Also bounds the secondary-fuzzy (re-fuzzy output) collapse.
      */
@@ -181,30 +182,43 @@ public final class FastCraftingPlanner {
         ChildCraftingSimulationState reusableSeedSnapshot = new ChildCraftingSimulationState(networkInv);
         snapshot.ignore(output);
 
-        CraftGraph.Builder<AEKey> builder = CraftGraph.builder();
-        boolean[] multiplePaths = {false};
-        Map<AEKey, DurabilityChain<AEKey>> durability = new HashMap<>();
-        Map<AEKey, Set<IPatternDetails>> patternSources = new HashMap<>();
-        Set<AEKey> emittable = new HashSet<>();
-        if (!buildGraph(craftingService, snapshot, reusableSeedSnapshot, level, output, builder, multiplePaths,
-                durability, patternSources, emittable, reservedStock)) {
-            // Rare hard declines only: e.g. a key used both as a durability carrier (priced in uses)
-            // and as a plain whole-item input — two unit systems on one pool. AE2's exact simulator
-            // handles those correctly, and correctness beats speed for the odd setup that hits this.
-            return FastAttempt.decline();
+        // A durability item can occasionally be used under incompatible semantics in the same
+        // reachable graph (different damage-per-firing rules, or both degraded and consumed whole).
+        // Discover those items on the first pass, then rebuild only those items conservatively as
+        // whole-item inputs. This keeps every unrelated durability chain on the fast representation
+        // and, unlike pattern-private durability pools, never counts one physical tool more than once.
+        Set<Item> conservativeDurabilityItems = new HashSet<>();
+        GraphBuild graphBuild;
+        long graphBuildStarted = System.nanoTime();
+        while (true) {
+            graphBuild = new GraphBuild();
+            Set<Item> conflicts = buildGraph(
+                    craftingService, snapshot, reusableSeedSnapshot, level, output,
+                    graphBuild.builder, graphBuild.multiplePaths, graphBuild.durability,
+                    graphBuild.patternSources, graphBuild.emittable, conservativeDurabilityItems,
+                    reservedStock);
+            if (conflicts.isEmpty() || !conservativeDurabilityItems.addAll(conflicts)) {
+                // A repeated conflict is still safe: buildGraph drops the conflicting pattern before
+                // publishing it. Normally this branch is reached after one discovery + one clean pass.
+                break;
+            }
         }
 
-        CraftPlan<AEKey> plan = CraftPlannerV2.plan(builder.build(), output, amount);
+        CraftGraph<AEKey> graph = graphBuild.builder.build();
+        FastPlanningWatchdog.recordGraphBuild(System.nanoTime() - graphBuildStarted);
+        PlanningResult<AEKey> planning = CraftPlannerV2.planDetailed(graph, output, amount);
+        FastPlanningWatchdog.record(planning.diagnostics());
+        CraftPlan<AEKey> plan = planning.plan();
         if (!plan.supported()) {
             return FastAttempt.decline();
         }
-        boolean multi = multiplePaths[0];
+        boolean multi = graphBuild.multiplePaths[0];
         // Emittable shortfalls are supplied by emitters, not crafted, so they don't make a plan
         // infeasible — only a non-emittable shortfall does.
-        if (plan.feasible() || noNonEmittableMissing(plan, emittable)) {
+        if (plan.feasible() || noNonEmittableMissing(plan, graphBuild.emittable)) {
             return FastAttempt.handled(
-                    toAe2Plan(output, amount, plan, multi, false, durability,
-                            patternSources, emittable, snapshot, reservedStock),
+                    toAe2Plan(output, amount, plan, multi, false, graphBuild.durability,
+                            graphBuild.patternSources, graphBuild.emittable, snapshot, reservedStock),
                     plan.usedReusableStock());
         }
         // Infeasible at this amount. A completed search reports proven shortfalls; a budget-limited
@@ -216,14 +230,22 @@ public final class FastCraftingPlanner {
             // page. Build that cheap representation now while the graph/snapshot are still available;
             // CraftingCalculationMixin reuses it instead of rebuilding and replanning the same graph.
             return FastAttempt.infeasible(
-                    toAe2Plan(output, amount, plan, multi, true, durability,
-                            patternSources, emittable, snapshot, reservedStock),
+                    toAe2Plan(output, amount, plan, multi, true, graphBuild.durability,
+                            graphBuild.patternSources, graphBuild.emittable, snapshot, reservedStock),
                     plan.usedReusableStock());
         }
         return FastAttempt.handled(
-                toAe2Plan(output, amount, plan, multi, true, durability,
-                        patternSources, emittable, snapshot, reservedStock),
+                toAe2Plan(output, amount, plan, multi, true, graphBuild.durability,
+                        graphBuild.patternSources, graphBuild.emittable, snapshot, reservedStock),
                 plan.usedReusableStock()); // partial + missing
+    }
+
+    private static final class GraphBuild {
+        private final CraftGraph.Builder<AEKey> builder = CraftGraph.builder();
+        private final boolean[] multiplePaths = {false};
+        private final Map<AEKey, DurabilityChain<AEKey>> durability = new HashMap<>();
+        private final Map<AEKey, Set<IPatternDetails>> patternSources = new HashMap<>();
+        private final Set<AEKey> emittable = new HashSet<>();
     }
 
     private static boolean noNonEmittableMissing(CraftPlan<AEKey> plan, Set<AEKey> emittable) {
@@ -239,8 +261,12 @@ public final class FastCraftingPlanner {
         return a instanceof AEItemKey ai && b instanceof AEItemKey bi && ai.getItem() == bi.getItem();
     }
 
-    /** BFS the reachable recipe graph; returns false to decline the fast path. */
-    private static boolean buildGraph(ICraftingService craftingService,
+    /**
+     * BFS the reachable recipe graph.
+     *
+     * @return durability item types that must be rebuilt with conservative whole-item semantics
+     */
+    private static Set<Item> buildGraph(ICraftingService craftingService,
                                       ChildCraftingSimulationState snapshot,
                                       ChildCraftingSimulationState reusableSeedSnapshot,
                                       Level level,
@@ -250,6 +276,7 @@ public final class FastCraftingPlanner {
                                       Map<AEKey, DurabilityChain<AEKey>> durability,
                                       Map<AEKey, Set<IPatternDetails>> patternSources,
                                       Set<AEKey> emittable,
+                                      Set<Item> conservativeDurabilityItems,
                                       @Nullable ReservedStockCraftingRequester reservedStock) {
         Set<AEKey> seen = new HashSet<>();
         Deque<AEKey> queue = new ArrayDeque<>();
@@ -266,9 +293,11 @@ public final class FastCraftingPlanner {
         // an already-built chain reuses that chain when their step granularities line up ("相接"),
         // instead of building a second, overlapping chain. Any overlap that ISN'T such a clean merge
         // (a link priced as a whole item, or two chains stepping the same tool at different
-        // durability-per-craft granularities) is a genuine conflict -> decline to AE2's simulator.
+        // durability-per-craft granularities) is a genuine conflict. Such an item is rediscovered on
+        // a clean pass using conservative whole-item semantics; the rest of the graph stays optimized.
         Set<AEKey> itemUnitKeys = new HashSet<>();
         Map<AEKey, DurabilityChain<AEKey>> linkOwner = new HashMap<>();
+        Set<Item> durabilityConflicts = new HashSet<>();
         seen.add(root);
         queue.add(root);
 
@@ -392,9 +421,12 @@ public final class FastCraftingPlanner {
                     IPatternDetails.IInput in = inputs[slot];
                     // Durability tool slot: collapse the degradation chain to one finite-use token.
                     ChainLookup lookup = durabilityChain(in, craftingService, snapshot, level, builder,
-                            durability, linkOwner, itemUnitKeys, reservedStock);
+                            durability, linkOwner, itemUnitKeys, conservativeDurabilityItems,
+                            reservedStock);
                     if (lookup.conflict()) {
-                        return false; // incompatible durability semantics -> AE2's exact simulator
+                        durabilityConflicts.add(lookup.conflictItem());
+                        patternUnsatisfiable = true;
+                        break;
                     }
                     DurabilityChain<AEKey> chain = lookup.chain();
                     if (chain != null) {
@@ -411,13 +443,21 @@ public final class FastCraftingPlanner {
                     }
                     boolean idOnly = overloadView != null && overloadView.inputMode(slot) == MatchMode.ID_ONLY;
                     List<GenericStack> templates = idOnlyTemplates(in, idOnly, snapshot);
+                    templates = addConservativeDurabilityTemplates(
+                            in, templates, craftingService, snapshot, level,
+                            conservativeDurabilityItems);
                     List<CraftInput<AEKey>> opts = new ArrayList<>(templates.size());
                     for (GenericStack template : templates) {
                         AEKey inputKey = template.what();
                         if (linkOwner.containsKey(inputKey)) {
                             // Whole-item consumption of a key some chain prices in uses (its carrier
                             // OR any mid-chain damaged variant) would mix the two unit systems.
-                            return false;
+                            DurabilityChain<AEKey> owner = linkOwner.get(inputKey);
+                            if (owner.carrier() instanceof AEItemKey carrierKey) {
+                                durabilityConflicts.add(carrierKey.getItem());
+                            }
+                            patternUnsatisfiable = true;
+                            break;
                         }
                         itemUnitKeys.add(inputKey);
                         AEKey remaining = in.getRemainingKey(inputKey) instanceof AEKey r ? r : null;
@@ -435,15 +475,25 @@ public final class FastCraftingPlanner {
                                 opts.add(CraftInput.returned(inputKey, template.amount()));
                             }
                         } else if (sameItem(inputKey, remaining)) {
-                            // Same item, lower durability, but durabilityChain declined it (chain longer
-                            // than the cyclic budget). Report missing rather than decline: drop the option.
-                            // If it was the slot's only option the pattern becomes unsatisfiable below.
+                            if (inputKey instanceof AEItemKey itemKey
+                                    && conservativeDurabilityItems.contains(itemKey.getItem())) {
+                                // Local conflict fallback: consume one concrete tool per firing and
+                                // deliberately ignore its damaged return in the planning graph. Runtime
+                                // still returns that tool, so this can only over-prepare tools; it cannot
+                                // over-promise stock or double-count a tool between pattern semantics.
+                                opts.add(CraftInput.of(inputKey, template.amount()));
+                            }
+                            // Otherwise durabilityChain declined it (usually over the cyclic budget).
+                            // Drop the option so this recipe safely surfaces as missing.
                         } else {
                             // Different leftover item (e.g. filled bucket -> empty bucket): consume the
                             // full input and hand back the remainder as a byproduct, so refilling it
                             // closes a cycle the planner resolves instead of declining.
                             opts.add(CraftInput.consumedReturning(inputKey, template.amount(), remaining));
                         }
+                    }
+                    if (patternUnsatisfiable) {
+                        break;
                     }
                     if (opts.isEmpty()) {
                         patternUnsatisfiable = true; // this recipe can't be fired; surfaces as missing
@@ -485,7 +535,7 @@ public final class FastCraftingPlanner {
                 multiplePaths[0] = true; // genuinely distinct recipes whose primary output is `key`
             }
         }
-        return true;
+        return durabilityConflicts;
     }
 
     /**
@@ -514,10 +564,60 @@ public final class FastCraftingPlanner {
         return new ArrayList<>(byKey.values());
     }
 
-    /** Result of a durability-slot probe: a usable chain, nothing, or a unit conflict (decline). */
-    private record ChainLookup(@Nullable DurabilityChain<AEKey> chain, boolean conflict) {
-        static final ChainLookup NONE = new ChainLookup(null, false);
-        static final ChainLookup CONFLICT = new ChainLookup(null, true);
+    /**
+     * Add concrete, currently stocked/craftable variants for durability items whose optimized chain
+     * representation conflicted elsewhere in the graph. Each variant remains an ordinary whole-item
+     * option, so all patterns share the same physical stock instead of receiving private token pools.
+     */
+    private static List<GenericStack> addConservativeDurabilityTemplates(
+            IPatternDetails.IInput in,
+            List<GenericStack> base,
+            ICraftingService craftingService,
+            ChildCraftingSimulationState snapshot,
+            Level level,
+            Set<Item> conservativeDurabilityItems) {
+        if (conservativeDurabilityItems.isEmpty()) {
+            return base;
+        }
+        Map<AEKey, GenericStack> byKey = new LinkedHashMap<>();
+        for (GenericStack template : base) {
+            byKey.putIfAbsent(template.what(), template);
+        }
+        for (GenericStack possible : in.getPossibleInputs()) {
+            if (!(possible.what() instanceof AEItemKey template)
+                    || !conservativeDurabilityItems.contains(template.getItem())) {
+                continue;
+            }
+            Item item = template.getItem();
+            if (craftingService.getFuzzyCraftable(template, k -> in.isValid(k, level))
+                    instanceof AEItemKey craftable
+                    && craftable.getItem() == item) {
+                byKey.putIfAbsent(craftable, new GenericStack(craftable, possible.amount()));
+            }
+            for (AEKey variant : snapshot.findFuzzyTemplates(template)) {
+                if (variant instanceof AEItemKey itemVariant
+                        && itemVariant.getItem() == item
+                        && in.isValid(variant, level)) {
+                    byKey.putIfAbsent(variant, new GenericStack(variant, possible.amount()));
+                }
+            }
+        }
+        return new ArrayList<>(byKey.values());
+    }
+
+    /** Result of a durability-slot probe: a usable chain, nothing, or an item-local unit conflict. */
+    private record ChainLookup(
+            @Nullable DurabilityChain<AEKey> chain,
+            @Nullable Item conflictItem) {
+        static final ChainLookup NONE = new ChainLookup(null, null);
+
+        static ChainLookup conflict(Item item) {
+            return new ChainLookup(null, item);
+        }
+
+        boolean conflict() {
+            return conflictItem != null;
+        }
     }
 
     /**
@@ -554,10 +654,10 @@ public final class FastCraftingPlanner {
      * start at different damage levels of the same tool yet connect into one chain, so pooling their
      * stock once is sound. If the step lands elsewhere (e.g. a 2-per-craft slot meeting a 1-per-craft
      * chain), the same physical tools would be priced in two incompatible "uses" units on one pool with
-     * no sound linear split, so it reports a {@linkplain ChainLookup#CONFLICT conflict} and declines to
-     * AE2. The same conflict is reported when a fresh chain's links overlap keys already priced as whole
-     * items ({@code itemUnitKeys}) or links owned by another chain: with the fullest-anchor above, any
-     * remaining overlap is a genuine unit-system clash, and declining is always safe.
+     * no sound linear split, so it reports an item-local conflict. The graph is then rebuilt with that
+     * item represented as concrete whole-item inputs; unrelated durability items retain their reduced
+     * chains. The same conflict is reported when a fresh chain's links overlap keys already priced as
+     * whole items ({@code itemUnitKeys}) or links owned by another chain.
      *
      * <p>Returns {@link ChainLookup#NONE} when this slot is not a reducible durability tool (plain
      * item, container, or a chain longer than {@link #FUZZY_CYCLE_STEPS}).
@@ -570,12 +670,16 @@ public final class FastCraftingPlanner {
                                                Map<AEKey, DurabilityChain<AEKey>> registry,
                                                Map<AEKey, DurabilityChain<AEKey>> linkOwner,
                                                Set<AEKey> itemUnitKeys,
+                                               Set<Item> conservativeDurabilityItems,
                                                @Nullable ReservedStockCraftingRequester reservedStock) {
         GenericStack[] possible = in.getPossibleInputs();
         if (possible.length == 0 || !(possible[0].what() instanceof AEItemKey template)) {
             return ChainLookup.NONE;
         }
         Item item = template.getItem();
+        if (conservativeDurabilityItems.contains(item)) {
+            return ChainLookup.NONE;
+        }
         AEItemKey full = fullestAnchor(in, craftingService, snapshot, level, template, item);
         AEKey remaining = in.getRemainingKey(full);
         // Classify the resolved craftable/stock anchor, not the declared template. AE2 permits a
@@ -600,8 +704,8 @@ public final class FastCraftingPlanner {
             int idx = links.indexOf(full);
             AEKey chainNext = idx >= 0 && idx + 1 < links.size() ? links.get(idx + 1) : null;
             return step.equals(chainNext)
-                    ? new ChainLookup(owner, false)
-                    : ChainLookup.CONFLICT; // same tool link, different per-craft granularity
+                    ? new ChainLookup(owner, null)
+                    : ChainLookup.conflict(item); // same tool link, different per-craft granularity
         }
         if (step == null) {
             return ChainLookup.NONE;
@@ -617,7 +721,7 @@ public final class FastCraftingPlanner {
         }
         for (AEKey link : chain.links()) {
             if (itemUnitKeys.contains(link) || linkOwner.containsKey(link)) {
-                return ChainLookup.CONFLICT; // stock already counted under another unit system / chain
+                return ChainLookup.conflict(item); // already counted under another unit system / chain
             }
         }
         registry.put(chain.carrier(), chain); // carrier == full == links[0]
@@ -625,7 +729,7 @@ public final class FastCraftingPlanner {
             linkOwner.put(link, chain);
         }
         builder.stock(full, chain.totalUses()); // carrier stock = aggregate uses (set once)
-        return new ChainLookup(chain, false);
+        return new ChainLookup(chain, null);
     }
 
     private static long usableStock(
@@ -873,7 +977,6 @@ public final class FastCraftingPlanner {
         chargeAvailableFuzzyStock(plan, usedItems, snapshot, reservedStock);
 
         KeyCounter missingItems = new KeyCounter();
-        Set<AEKey> fuzzyIntermediateMissing = fuzzyIntermediateMissing(plan);
         for (Map.Entry<AEKey, Long> e : plan.missing().entrySet()) {
             if (emittable.contains(e.getKey())) {
                 emittedItems.add(e.getKey(), e.getValue()); // emitter supplies the shortfall on demand
@@ -881,9 +984,11 @@ public final class FastCraftingPlanner {
             }
             DurabilityChain<AEKey> chain = durability.get(e.getKey());
             if (chain == null) {
-                if (!fuzzyIntermediateMissing.contains(e.getKey())) {
-                    missingItems.add(e.getKey(), e.getValue());
-                }
+                // CraftPlan.missing contains only the concrete route retained by the planner. A key
+                // accepted by a fuzzy slot must therefore remain visible even when another accepted
+                // candidate happens to be produced by some fired pattern. Suppressing the whole slot
+                // here could otherwise export simulation=true with an empty missingItems counter.
+                missingItems.add(e.getKey(), e.getValue());
             } else {
                 // Missing uses become full tools to craft/supply: ceil(uses / n).
                 missingItems.add(chain.carrier(), Sat.ceilDiv(e.getValue(), chain.n()));
@@ -901,33 +1006,6 @@ public final class FastCraftingPlanner {
                 emittedItems,
                 missingItems,
                 patternTimes);
-    }
-
-    private static Set<AEKey> fuzzyIntermediateMissing(CraftPlan<AEKey> plan) {
-        Set<AEKey> craftedOutputs = new HashSet<>();
-        Set<IPatternDetails> sources = java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<>());
-        for (CraftPattern<AEKey> pattern : plan.firings().keySet()) {
-            if (plan.firings().getOrDefault(pattern, 0L) > 0) {
-                craftedOutputs.add(pattern.output());
-                sources.add((IPatternDetails) pattern.source());
-            }
-        }
-
-        Set<AEKey> suppressed = new HashSet<>();
-        for (IPatternDetails source : sources) {
-            for (IPatternDetails.IInput slot : source.getInputs()) {
-                GenericStack[] possible = slot.getPossibleInputs();
-                if (possible.length <= 1) continue;
-                boolean routedThroughCraftableAlternative = Arrays.stream(possible)
-                        .anyMatch(option -> craftedOutputs.contains(option.what()));
-                if (routedThroughCraftableAlternative) {
-                    for (GenericStack option : possible) {
-                        suppressed.add(option.what());
-                    }
-                }
-            }
-        }
-        return suppressed;
     }
 
     private static void chargeAvailableFuzzyStock(
