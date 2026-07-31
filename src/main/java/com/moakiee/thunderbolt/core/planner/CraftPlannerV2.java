@@ -67,9 +67,11 @@ public final class CraftPlannerV2<K> {
 
     /** Upper guard for the graph-scaled {@code O(E log E)} default search budget. */
     public static final int DEFAULT_SEARCH_WORK_BUDGET =
-            Math.max(4_096, Integer.getInteger("thunderbolt.maxCraftSearchWork", 1_048_576));
+            Math.max(4_096, Integer.getInteger("thunderbolt.maxCraftSearchWork", 262_144));
 
     private static final int MIN_SEARCH_WORK_BUDGET = 4_096;
+    private static final int FALLBACK_WORK_PER_REACHABLE_UNIT = 64;
+    private static final int MAX_FALLBACK_WORK_BUDGET = 262_144;
 
     /**
      * Maximum number of alternate roots tried for a proven conservative conversion SCC. This is a
@@ -95,9 +97,11 @@ public final class CraftPlannerV2<K> {
     private final CraftGraph<K> graph;
     private final int visitCap;
     private final SearchBudget searchBudget;
+    private final FallbackBudget fallbackBudget;
     private final Map<K, CraftPattern<K>> routePreferences;
-    /** Bounded single-route pass used only to turn a search cutoff into actionable missing items. */
-    private final boolean diagnosticMode;
+    private final DiagnosticsCollector diagnostics;
+    /** Immutable graph analysis shared by every replay with the same cycle orientation. */
+    private PreparedGraph<K> preparedGraph;
     private final Set<K> cutOutputs = new LinkedHashSet<>();
     private final Map<CraftPattern<K>, Set<K>> suppressedPositiveFeedbackOutputs =
             new IdentityHashMap<>();
@@ -190,25 +194,38 @@ public final class CraftPlannerV2<K> {
             int visitCap,
             SearchBudget searchBudget,
             Map<K, CraftPattern<K>> routePreferences,
-            boolean diagnosticMode) {
+            DiagnosticsCollector diagnostics) {
         this.graph = graph;
         this.visitCap = Math.max(1, visitCap);
         this.searchBudget = searchBudget;
+        this.fallbackBudget = new FallbackBudget(diagnostics.fallbackBudgetLimit(), diagnostics);
         this.routePreferences = routePreferences;
-        this.diagnosticMode = diagnosticMode;
+        this.diagnostics = diagnostics;
+    }
+
+    private CraftPlannerV2(
+            PreparedGraph<K> preparedGraph,
+            int visitCap,
+            SearchBudget searchBudget,
+            Map<K, CraftPattern<K>> routePreferences,
+            DiagnosticsCollector diagnostics) {
+        this(preparedGraph.graph, visitCap, searchBudget, routePreferences, diagnostics);
+        this.preparedGraph = preparedGraph;
+        loadPreparedGraph(preparedGraph);
     }
 
     public static <K> CraftPlan<K> plan(CraftGraph<K> graph, K target, long amount) {
-        return plan(
-                graph,
-                target,
-                amount,
-                DEFAULT_VISIT_CAP,
-                scaledSearchWorkBudget(graph, target));
+        int reachableWork = reachableWorkEstimate(graph, target);
+        return planDetailed(
+                graph, target, amount, DEFAULT_VISIT_CAP,
+                scaledSearchWorkBudget(reachableWork), reachableWork).plan();
     }
 
     public static <K> CraftPlan<K> plan(CraftGraph<K> graph, K target, long amount, int visitCap) {
-        return plan(graph, target, amount, visitCap, scaledSearchWorkBudget(graph, target));
+        int reachableWork = reachableWorkEstimate(graph, target);
+        return planDetailed(
+                graph, target, amount, visitCap,
+                scaledSearchWorkBudget(reachableWork), reachableWork).plan();
     }
 
     static <K> CraftPlan<K> plan(
@@ -217,22 +234,62 @@ public final class CraftPlannerV2<K> {
             long amount,
             int visitCap,
             int searchWorkBudget) {
+        return planDetailed(graph, target, amount, visitCap, searchWorkBudget).plan();
+    }
+
+    /**
+     * Plans the request and returns measurements collected by that exact run. Diagnostics never cause
+     * a second traversal or a second planning pass.
+     */
+    public static <K> PlanningResult<K> planDetailed(
+            CraftGraph<K> graph, K target, long amount) {
+        int reachableWork = reachableWorkEstimate(graph, target);
+        return planDetailed(
+                graph, target, amount, DEFAULT_VISIT_CAP,
+                scaledSearchWorkBudget(reachableWork), reachableWork);
+    }
+
+    static <K> PlanningResult<K> planDetailed(
+            CraftGraph<K> graph,
+            K target,
+            long amount,
+            int visitCap,
+            int searchWorkBudget) {
+        return planDetailed(
+                graph, target, amount, visitCap, searchWorkBudget,
+                reachableWorkEstimate(graph, target));
+    }
+
+    private static <K> PlanningResult<K> planDetailed(
+            CraftGraph<K> graph,
+            K target,
+            long amount,
+            int visitCap,
+            int searchWorkBudget,
+            int reachableWork) {
+        long started = System.nanoTime();
+        DiagnosticsCollector diagnostics =
+                new DiagnosticsCollector(reachableWork, searchWorkBudget);
         if (amount <= 0) {
-            return new CraftPlan<>(true, true, Map.of(), Map.of(), Map.of(), Map.of(), Map.of(), 0, false);
+            CraftPlan<K> empty = new CraftPlan<>(
+                    true, true, Map.of(), Map.of(), Map.of(), Map.of(), Map.of(), 0, false);
+            return new PlanningResult<>(empty, diagnostics.finish(started, null));
         }
-        SearchBudget budget = new SearchBudget(searchWorkBudget);
-        int replayCharge = reachableWorkEstimate(graph, target);
+        SearchBudget budget = new SearchBudget(searchWorkBudget, diagnostics);
+        int replayCharge = reachableWork;
+        Map<List<K>, PreparedGraph<K>> preparedByOrientation = new HashMap<>();
         PlanVariant<K> firstVariant =
                 new PlanVariant<>(List.of(), Map.of(), 0, 0L);
         CraftPlannerV2<K> firstPlanner =
                 new CraftPlannerV2<>(
-                        graph, visitCap, budget, firstVariant.routePreferences(), false);
+                        graph, visitCap, budget, firstVariant.routePreferences(), diagnostics);
         CraftPlan<K> first = firstPlanner.run(target, amount, firstVariant.priorityRoots());
+        preparedByOrientation.put(firstVariant.priorityRoots(), firstPlanner.preparedGraph);
         if (first.feasible()) {
-            return first;
+            return finish(first, diagnostics, budget, started);
         }
         if (first.budgetExhausted()) {
-            return diagnosticAfterCutoff(graph, target, amount, visitCap);
+            return finish(first, diagnostics, budget, started);
         }
         CraftPlan<K> bestIncomplete = first;
 
@@ -270,29 +327,48 @@ public final class CraftPlannerV2<K> {
                 firstVariant, firstPlanner, frontier, queued, sequence, budget, replayCharge);
         sequence = enqueue.sequence();
         boolean frontierTruncated = enqueue.truncated();
+        diagnostics.recordFrontierSize(frontier.size());
 
         while (!frontier.isEmpty()) {
             PlanVariant<K> variant = frontier.poll();
             if (!budget.tryConsume(replayCharge)) {
-                return markBudgetExhausted(bestIncomplete);
+                return finish(markBudgetExhausted(bestIncomplete), diagnostics, budget, started);
             }
-            CraftPlannerV2<K> planner =
-                    new CraftPlannerV2<>(
-                            graph, visitCap, budget, variant.routePreferences(), false);
+            PreparedGraph<K> prepared = preparedByOrientation.get(variant.priorityRoots());
+            CraftPlannerV2<K> planner = prepared == null
+                    ? new CraftPlannerV2<>(
+                            graph, visitCap, budget, variant.routePreferences(), diagnostics)
+                    : new CraftPlannerV2<>(
+                            prepared, visitCap, budget, variant.routePreferences(), diagnostics);
             CraftPlan<K> candidate = planner.run(target, amount, variant.priorityRoots());
+            preparedByOrientation.putIfAbsent(variant.priorityRoots(), planner.preparedGraph);
             if (candidate.feasible()) {
-                return candidate;
+                return finish(candidate, diagnostics, budget, started);
             }
             if (candidate.budgetExhausted()) {
-                return markBudgetExhausted(bestIncomplete);
+                return finish(
+                        markBudgetExhausted(betterIncompletePlan(bestIncomplete, candidate)),
+                        diagnostics, budget, started);
             }
             bestIncomplete = betterIncompletePlan(bestIncomplete, candidate);
             enqueue = enqueueRouteVariants(
                     variant, planner, frontier, queued, sequence, budget, replayCharge);
             sequence = enqueue.sequence();
             frontierTruncated |= enqueue.truncated();
+            diagnostics.recordFrontierSize(frontier.size());
         }
-        return frontierTruncated ? markBudgetExhausted(bestIncomplete) : bestIncomplete;
+        CraftPlan<K> result = frontierTruncated
+                ? markBudgetExhausted(bestIncomplete)
+                : bestIncomplete;
+        return finish(result, diagnostics, budget, started);
+    }
+
+    private static <K> PlanningResult<K> finish(
+            CraftPlan<K> plan,
+            DiagnosticsCollector diagnostics,
+            SearchBudget budget,
+            long started) {
+        return new PlanningResult<>(plan, diagnostics.finish(started, budget));
     }
 
     /**
@@ -301,12 +377,20 @@ public final class CraftPlannerV2<K> {
      * keeps preprocessing plus fallback work near {@code O(E log E)}.
      */
     static <K> int scaledSearchWorkBudget(CraftGraph<K> graph, K target) {
-        int work = reachableWorkEstimate(graph, target);
+        return scaledSearchWorkBudget(reachableWorkEstimate(graph, target));
+    }
+
+    private static int scaledSearchWorkBudget(int work) {
         int log = 32 - Integer.numberOfLeadingZeros(Math.max(1, work));
         long scaled = (long) work * (log + 4L);
         return (int) Math.min(
                 DEFAULT_SEARCH_WORK_BUDGET,
                 Math.max(MIN_SEARCH_WORK_BUDGET, scaled));
+    }
+
+    private static int fallbackWorkBudget(int reachableWork) {
+        long scaled = (long) Math.max(1, reachableWork) * FALLBACK_WORK_PER_REACHABLE_UNIT;
+        return (int) Math.min(MAX_FALLBACK_WORK_BUDGET, Math.max(64L, scaled));
     }
 
     static <K> int reachableWorkEstimate(CraftGraph<K> graph, K target) {
@@ -366,37 +450,6 @@ public final class CraftPlannerV2<K> {
     }
 
     /**
-     * Search cutoffs still need to answer AE2's missing-material simulation. Run one deterministic
-     * capacity-first route with a fresh bounded budget; once that diagnostic budget is spent, unresolved
-     * intermediate nodes themselves become missing. This pass never enumerates alternatives.
-     */
-    private static <K> CraftPlan<K> diagnosticAfterCutoff(
-            CraftGraph<K> graph, K target, long amount, int visitCap) {
-        SearchBudget diagnosticBudget =
-                new SearchBudget(scaledSearchWorkBudget(graph, target), false);
-        CraftPlan<K> diagnostic = new CraftPlannerV2<>(
-                graph, visitCap, diagnosticBudget, Map.of(), true)
-                .run(target, amount, List.of());
-        if (diagnostic.feasible()) {
-            return diagnostic;
-        }
-        if (diagnostic.missing().isEmpty()) {
-            Map<K, Long> missingTarget = Map.of(target, amount);
-            diagnostic = new CraftPlan<>(
-                    true,
-                    false,
-                    diagnostic.firings(),
-                    diagnostic.usedStock(),
-                    diagnostic.usedReusableStock(),
-                    missingTarget,
-                    diagnostic.grossDemand(),
-                    diagnostic.itemsProcessed(),
-                    false);
-        }
-        return markBudgetExhausted(diagnostic);
-    }
-
-    /**
      * Prefer a diagnosis that asks the player to replenish fewer kinds, then fewer total units.
      * Quantities across item types are only a heuristic tie-breaker; every retained plan remains a
      * concrete, mass-balanced simulation candidate.
@@ -437,36 +490,45 @@ public final class CraftPlannerV2<K> {
     }
 
     private CraftPlan<K> run(K target, long amount, List<K> priorityRoots) {
+        diagnostics.recordPlanRun();
         if (amount <= 0) {
             return new CraftPlan<>(true, true, Map.of(), Map.of(), Map.of(), Map.of(), Map.of(), 0, false);
         }
 
-        identifyPositiveFeedbackByproducts(target);
+        List<K> order;
+        Set<K> items;
+        if (preparedGraph == null) {
+            long compileStarted = System.nanoTime();
+            identifyPositiveFeedbackByproducts(target);
 
-        // Build an acyclic view of the reachable recipe graph: a DFS from the target drops any recipe
-        // whose input is an ancestor still being expanded (a back-edge), i.e. AE2's "去头尾". For a
-        // compress/decompress pair (1 block ⇄ 9 ingots) this keeps the direction toward the target
-        // (compress when making blocks, decompress when making ingots) and cuts the reverse, so the
-        // other side falls back to stock/missing — exactly what a sane plan does. No cycle ever reaches
-        // the topological passes, so we never bail to AE2 just because a reverse recipe exists.
-        Set<K> items = new LinkedHashSet<>();
-        List<K> postOrder = new ArrayList<>();
-        buildDag(target, priorityRoots, postOrder, items);
-        if (!requiresSeedOrderedPlanning
-                && ordinaryReturnedSeedKeys.stream().anyMatch(reachableByproductKeys::contains)) {
-            // A byproduct might otherwise appear in the aggregate pool before the pattern that needs
-            // the catalyst is executable. Keep these graphs on the ordered path; this conservatively
-            // covers both direct and indirect feedback through a sibling branch.
-            requiresSeedOrderedPlanning = true;
+            // Build an acyclic view of the reachable recipe graph: a DFS from the target drops any
+            // recipe whose input is an ancestor still being expanded (a back-edge), i.e. AE2's
+            // "去头尾". The resulting graph facts are frozen and reused by every route replay with
+            // this cycle orientation.
+            items = new LinkedHashSet<>();
+            List<K> postOrder = new ArrayList<>();
+            buildDag(target, priorityRoots, postOrder, items);
+            if (!requiresSeedOrderedPlanning
+                    && ordinaryReturnedSeedKeys.stream().anyMatch(reachableByproductKeys::contains)) {
+                // A byproduct might otherwise appear in the aggregate pool before the pattern that
+                // needs the catalyst is executable.
+                requiresSeedOrderedPlanning = true;
+            }
+            order = new ArrayList<>(postOrder.size());
+            for (int i = postOrder.size() - 1; i >= 0; i--) {
+                order.add(postOrder.get(i));
+            }
+            this.capacity = capacityFromOrder(order, items.size());
+            indexCapacityOrder();
+            indexDirectRawConsumables();
+            indexEquivalentMaterialFootprints(order);
+            preparedGraph = snapshotPreparedGraph(order, items);
+            diagnostics.recordCompilation(preparedGraph, System.nanoTime() - compileStarted);
+        } else {
+            order = preparedGraph.order;
+            items = preparedGraph.items;
+            diagnostics.recordCompilationReuse();
         }
-        List<K> order = new ArrayList<>(postOrder.size()); // target-first topo order = reverse post-order
-        for (int i = postOrder.size() - 1; i >= 0; i--) {
-            order.add(postOrder.get(i));
-        }
-        this.capacity = capacityFromOrder(order, items.size());
-        indexCapacityOrder();
-        indexDirectRawConsumables();
-        indexEquivalentMaterialFootprints(order);
 
         // Returned catalysts must be acquired before the firing's outputs enter the shared pool.
         // The recursive path already has that execution order; the aggregate linear pass does not,
@@ -475,7 +537,9 @@ public final class CraftPlannerV2<K> {
             // 1) Linear backbone (v2-memo-deps / v2-lazy-deduct): one topological aggregation pass,
             //    each item resolved exactly once = O(n + E). Reservation-based capacity gives O(1)
             //    deduction (no recompute loop). When this fully succeeds, contention never mattered.
+            long linearStarted = System.nanoTime();
             CraftPlan<K> linear = linearPass(order, target, amount);
+            diagnostics.addLinearPassNanos(System.nanoTime() - linearStarted);
             if (linear.feasible()) {
                 return enforceCycleBootstrap(linear);
             }
@@ -485,15 +549,9 @@ public final class CraftPlannerV2<K> {
         for (K x : items) {
             stockLeft.put(x, graph.stock(x));
         }
-        int fallbackMark = trail.size();
+        long searchStarted = System.nanoTime();
         obtain(target, amount, true);
-        if (searchBudget.exhausted()) {
-            // Budget exhaustion is not a material proof. Discard every partial mutation so callers
-            // cannot accidentally turn an interrupted route into a missing-material diagnosis.
-            rollback(fallbackMark);
-            return new CraftPlan<>(true, false,
-                    Map.of(), Map.of(), Map.of(), Map.of(), Map.of(), processed, true);
-        }
+        diagnostics.addSearchNanos(System.nanoTime() - searchStarted);
         boolean feasible = missing.isEmpty();
         CraftPlan<K> fallback = new CraftPlan<>(true, feasible,
                 new IdentityHashMap<>(firings),
@@ -502,8 +560,76 @@ public final class CraftPlannerV2<K> {
                 new HashMap<>(missing),
                 new HashMap<>(grossDemand),
                 processed,
-                false);
+                searchBudget.exhausted() && !feasible);
         return enforceCycleBootstrap(fallback);
+    }
+
+    private PreparedGraph<K> snapshotPreparedGraph(List<K> order, Set<K> items) {
+        Map<K, List<CraftPattern<K>>> frozenPatterns = new HashMap<>();
+        patternsByOutput.forEach((key, value) -> frozenPatterns.put(key, List.copyOf(value)));
+
+        IdentityHashMap<CraftPattern<K>, Set<K>> frozenSuppressed = new IdentityHashMap<>();
+        suppressedPositiveFeedbackOutputs.forEach(
+                (pattern, outputs) -> frozenSuppressed.put(pattern, Set.copyOf(outputs)));
+        IdentityHashMap<CraftPattern<K>, List<FeedbackSeedBootstrap<K>>> frozenBootstraps =
+                new IdentityHashMap<>();
+        feedbackSeedBootstraps.forEach(
+                (pattern, values) -> frozenBootstraps.put(pattern, List.copyOf(values)));
+        IdentityHashMap<CraftPattern<K>, List<FeedbackSeedBootstrap<K>>> frozenConverters =
+                new IdentityHashMap<>();
+        feedbackSeedConverters.forEach(
+                (pattern, values) -> frozenConverters.put(pattern, List.copyOf(values)));
+
+        IdentityHashMap<CraftPattern<K>, Long> frozenScores = new IdentityHashMap<>();
+        frozenScores.putAll(capacityScoreByPattern);
+        IdentityHashMap<CraftPattern<K>, Map<K, Long>> frozenRaw = new IdentityHashMap<>();
+        frozenRaw.putAll(directRawConsumablesByPattern);
+        IdentityHashMap<CraftPattern<K>, Integer> frozenFootprints = new IdentityHashMap<>();
+        frozenFootprints.putAll(materialFootprintByPattern);
+
+        int patternCount = 0;
+        int inputCount = 0;
+        int contended = 0;
+        for (List<CraftPattern<K>> patterns : frozenPatterns.values()) {
+            patternCount += patterns.size();
+            if (patterns.size() > 1) contended++;
+            for (CraftPattern<K> pattern : patterns) {
+                inputCount += pattern.inputs().size();
+            }
+        }
+
+        return new PreparedGraph<>(
+                graph,
+                List.copyOf(order),
+                Set.copyOf(items),
+                Set.copyOf(cutOutputs),
+                frozenPatterns,
+                frozenSuppressed,
+                frozenBootstraps,
+                frozenConverters,
+                requiresSeedOrderedPlanning,
+                new HashMap<>(capacity),
+                frozenScores,
+                new HashMap<>(capacityOrderByOutput),
+                frozenRaw,
+                frozenFootprints,
+                patternCount,
+                inputCount,
+                contended);
+    }
+
+    private void loadPreparedGraph(PreparedGraph<K> prepared) {
+        cutOutputs.addAll(prepared.cutOutputs);
+        patternsByOutput.putAll(prepared.patternsByOutput);
+        suppressedPositiveFeedbackOutputs.putAll(prepared.suppressedPositiveFeedbackOutputs);
+        feedbackSeedBootstraps.putAll(prepared.feedbackSeedBootstraps);
+        feedbackSeedConverters.putAll(prepared.feedbackSeedConverters);
+        requiresSeedOrderedPlanning = prepared.seedOrdered;
+        capacity = prepared.capacity;
+        capacityScoreByPattern.putAll(prepared.capacityScoreByPattern);
+        capacityOrderByOutput.putAll(prepared.capacityOrderByOutput);
+        directRawConsumablesByPattern.putAll(prepared.directRawConsumablesByPattern);
+        materialFootprintByPattern.putAll(prepared.materialFootprintByPattern);
     }
 
     /**
@@ -1590,32 +1716,31 @@ public final class CraftPlannerV2<K> {
             return d;
         }
 
+        // Once alternative-search work is exhausted, finish the already-running plan through one
+        // deterministic capacity-first route. This reuses the current pools, reservations and parent
+        // results; it does not rebuild the graph or launch a separate diagnostic planner.
+        if (searchBudget.exhausted()) {
+            return commitFailure ? commitBudgetFallback(x, d) : d;
+        }
+
         // Depth is part of the proof identity: a route rejected only because it reached the stack
         // guard must remain eligible when the same node is later reached through a shorter parent path.
         SearchFailure<K> failureKey = new SearchFailure<>(x, d, availabilityState, depth);
         if (!commitFailure && failedSpeculativeSearches.contains(failureKey)) {
+            diagnostics.recordFailureMemoHit();
             return d;
         }
 
         if (!searchBudget.tryConsume()) {
-            if (diagnosticMode && commitFailure) {
-                addMissing(x, d);
-            }
-            return d;
+            return commitFailure ? commitBudgetFallback(x, d) : d;
         }
         if (processed < Integer.MAX_VALUE) {
             processed++;
         }
 
-        if (diagnosticMode) {
-            if (ps.size() == 1) {
-                return fire(x, ps.get(0), d, false);
-            }
-            return commitBestEffort(distinctMaterialBranches(capacityOrder(x)), x, d);
-        }
-
         int v = visit.getOrDefault(x, 0);
         if (v >= visitCap) {
+            diagnostics.recordHotNodeVisit();
             return obtainHot(x, d, commitFailure, failureKey);
         }
         visit.put(x, v + 1);
@@ -1646,7 +1771,7 @@ public final class CraftPlannerV2<K> {
                 continue;
             }
             if (!searchBudget.tryConsume()) {
-                return d;
+                return commitFailure ? commitBestEffort(distinctBranches, x, d) : d;
             }
             int mark = trail.size();
             long beforeMissing = missingTotal;
@@ -1654,7 +1779,7 @@ public final class CraftPlannerV2<K> {
             long unmet = fire(x, r, d, true);
             if (searchBudget.exhausted()) {
                 rollback(mark);
-                return d;
+                return commitFailure ? commitBestEffort(distinctBranches, x, d) : d;
             }
             if (unmet == 0 && missingTotal == beforeMissing) {
                 return unmet; // this recipe satisfied d without introducing any shortfall
@@ -1678,14 +1803,14 @@ public final class CraftPlannerV2<K> {
             K x, long d, boolean commitFailure, SearchFailure<K> failureKey) {
         List<CraftPattern<K>> distinctBranches = hotRouteOrder(x);
         if (searchBudget.exhausted()) {
-            return d;
+            return commitFailure ? commitBestEffort(distinctBranches, x, d) : d;
         }
         for (CraftPattern<K> route : distinctBranches) {
             if (hasProvenDirectConsumableShortfall(route, d)) {
                 continue;
             }
             if (!searchBudget.tryConsume()) {
-                return d;
+                return commitFailure ? commitBestEffort(distinctBranches, x, d) : d;
             }
             int mark = trail.size();
             long beforeMissing = missingTotal;
@@ -1693,7 +1818,7 @@ public final class CraftPlannerV2<K> {
             long unmet = fire(x, route, d, true);
             if (searchBudget.exhausted()) {
                 rollback(mark);
-                return d;
+                return commitFailure ? commitBestEffort(distinctBranches, x, d) : d;
             }
             if (unmet == 0 && missingTotal == beforeMissing) {
                 return 0L;
@@ -1768,6 +1893,7 @@ public final class CraftPlannerV2<K> {
             CraftPattern<K> pattern,
             Map<K, Long> memo,
             Set<K> evaluating) {
+        diagnostics.recordDynamicCapacityEvaluation();
         if (!searchBudget.tryConsume()) {
             return 0L;
         }
@@ -1831,7 +1957,21 @@ public final class CraftPlannerV2<K> {
                 distinct.add(pattern);
             }
         }
+        diagnostics.recordEquivalentRoutesPruned(ordered.size() - distinct.size());
         return distinct;
+    }
+
+    private long commitBudgetFallback(K x, long d) {
+        if (!fallbackBudget.tryConsume()) {
+            addMissing(x, d);
+            return d;
+        }
+        List<CraftPattern<K>> routes = distinctMaterialBranches(capacityOrder(x));
+        if (routes.isEmpty()) {
+            addMissing(x, d);
+            return d;
+        }
+        return commitBestEffort(routes, x, d);
     }
 
     private long commitBestEffort(List<CraftPattern<K>> ps, K x, long d) {
@@ -1888,7 +2028,7 @@ public final class CraftPlannerV2<K> {
                 }
             }
             inputUnmet = Sat.add(inputUnmet, unmet);
-            if (searchBudget.exhausted()) {
+            if (search && searchBudget.exhausted()) {
                 return inputUnmet;
             }
             if (detectSiblingConflict
@@ -2277,7 +2417,13 @@ public final class CraftPlannerV2<K> {
         alternatives = new ArrayList<>(promotePreferredRoute(key, alternatives));
         for (CraftPattern<K> alternative : alternatives) {
             if (!searchBudget.tryConsume()) {
-                return amount;
+                // The outer committed route will retain this deterministic dependency tree; a
+                // speculative parent will roll the same writes back at its own mark.
+                if (!fallbackBudget.tryConsume()) {
+                    return amount;
+                }
+                fire(key, alternative, amount, false);
+                return 0L;
             }
             int mark = trail.size();
             long beforeMissing = missingTotal;
@@ -2653,24 +2799,219 @@ public final class CraftPlannerV2<K> {
         }
     }
 
-    /**
-     * Monotonic plan-wide guard. Normal search records exhaustion only when work is actually denied, so
-     * a route that succeeds on the final permitted unit remains a valid completed proof. The bounded
-     * diagnostic pass uses the same counter without raising the global cutoff flag: denied nodes are
-     * converted into explicit intermediate missing items and the pass continues across sibling inputs.
-     */
-    private static final class SearchBudget {
-        private int remaining;
-        private final boolean recordExhaustion;
-        private boolean exhausted;
+    /** Immutable output of graph discovery/cycle cutting for one priority-root orientation. */
+    private static final class PreparedGraph<K> {
+        private final CraftGraph<K> graph;
+        private final List<K> order;
+        private final Set<K> items;
+        private final Set<K> cutOutputs;
+        private final Map<K, List<CraftPattern<K>>> patternsByOutput;
+        private final Map<CraftPattern<K>, Set<K>> suppressedPositiveFeedbackOutputs;
+        private final Map<CraftPattern<K>, List<FeedbackSeedBootstrap<K>>> feedbackSeedBootstraps;
+        private final Map<CraftPattern<K>, List<FeedbackSeedBootstrap<K>>> feedbackSeedConverters;
+        private final boolean seedOrdered;
+        private final Map<K, Long> capacity;
+        private final Map<CraftPattern<K>, Long> capacityScoreByPattern;
+        private final Map<K, List<CraftPattern<K>>> capacityOrderByOutput;
+        private final Map<CraftPattern<K>, Map<K, Long>> directRawConsumablesByPattern;
+        private final Map<CraftPattern<K>, Integer> materialFootprintByPattern;
+        private final int patternCount;
+        private final int inputCount;
+        private final int contendedOutputCount;
 
-        private SearchBudget(int work) {
-            this(work, true);
+        private PreparedGraph(
+                CraftGraph<K> graph,
+                List<K> order,
+                Set<K> items,
+                Set<K> cutOutputs,
+                Map<K, List<CraftPattern<K>>> patternsByOutput,
+                Map<CraftPattern<K>, Set<K>> suppressedPositiveFeedbackOutputs,
+                Map<CraftPattern<K>, List<FeedbackSeedBootstrap<K>>> feedbackSeedBootstraps,
+                Map<CraftPattern<K>, List<FeedbackSeedBootstrap<K>>> feedbackSeedConverters,
+                boolean seedOrdered,
+                Map<K, Long> capacity,
+                Map<CraftPattern<K>, Long> capacityScoreByPattern,
+                Map<K, List<CraftPattern<K>>> capacityOrderByOutput,
+                Map<CraftPattern<K>, Map<K, Long>> directRawConsumablesByPattern,
+                Map<CraftPattern<K>, Integer> materialFootprintByPattern,
+                int patternCount,
+                int inputCount,
+                int contendedOutputCount) {
+            this.graph = graph;
+            this.order = order;
+            this.items = items;
+            this.cutOutputs = cutOutputs;
+            this.patternsByOutput = patternsByOutput;
+            this.suppressedPositiveFeedbackOutputs = suppressedPositiveFeedbackOutputs;
+            this.feedbackSeedBootstraps = feedbackSeedBootstraps;
+            this.feedbackSeedConverters = feedbackSeedConverters;
+            this.seedOrdered = seedOrdered;
+            this.capacity = capacity;
+            this.capacityScoreByPattern = capacityScoreByPattern;
+            this.capacityOrderByOutput = capacityOrderByOutput;
+            this.directRawConsumablesByPattern = directRawConsumablesByPattern;
+            this.materialFootprintByPattern = materialFootprintByPattern;
+            this.patternCount = patternCount;
+            this.inputCount = inputCount;
+            this.contendedOutputCount = contendedOutputCount;
+        }
+    }
+
+    /** Mutable counters shared by all route replays; converted to a record without extra graph work. */
+    private static final class DiagnosticsCollector {
+        private final int reachableWorkEstimate;
+        private final int configuredSearchBudget;
+        private final int configuredFallbackBudget;
+        private int reachableItems;
+        private int reachablePatterns;
+        private int inputEdges;
+        private int contendedOutputs;
+        private int cycleCuts;
+        private boolean seedOrdered;
+        private int planRuns;
+        private int compiledOrientations;
+        private int reusedCompilations;
+        private int hotNodeVisits;
+        private int dynamicCapacityEvaluations;
+        private int equivalentRoutesPruned;
+        private int failureMemoHits;
+        private int frontierPeak;
+        private boolean searchCutoff;
+        private int consumedFallbackBudget;
+        private boolean fallbackCutoff;
+        private long graphCompileNanos;
+        private long linearPassNanos;
+        private long searchNanos;
+
+        private DiagnosticsCollector(int reachableWorkEstimate, int configuredSearchBudget) {
+            this.reachableWorkEstimate = reachableWorkEstimate;
+            this.configuredSearchBudget = Math.max(1, configuredSearchBudget);
+            this.configuredFallbackBudget = fallbackWorkBudget(reachableWorkEstimate);
         }
 
-        private SearchBudget(int work, boolean recordExhaustion) {
-            this.remaining = Math.max(1, work);
-            this.recordExhaustion = recordExhaustion;
+        private int fallbackBudgetLimit() {
+            return configuredFallbackBudget;
+        }
+
+        private void recordCompilation(PreparedGraph<?> prepared, long nanos) {
+            compiledOrientations = increment(compiledOrientations);
+            reachableItems = Math.max(reachableItems, prepared.items.size());
+            reachablePatterns = Math.max(reachablePatterns, prepared.patternCount);
+            inputEdges = Math.max(inputEdges, prepared.inputCount);
+            contendedOutputs = Math.max(contendedOutputs, prepared.contendedOutputCount);
+            cycleCuts = Math.max(cycleCuts, prepared.cutOutputs.size());
+            seedOrdered |= prepared.seedOrdered;
+            graphCompileNanos = addNanos(graphCompileNanos, nanos);
+        }
+
+        private void recordCompilationReuse() {
+            reusedCompilations = increment(reusedCompilations);
+        }
+
+        private void recordPlanRun() {
+            planRuns = increment(planRuns);
+        }
+
+        private void recordHotNodeVisit() {
+            hotNodeVisits = increment(hotNodeVisits);
+        }
+
+        private void recordDynamicCapacityEvaluation() {
+            dynamicCapacityEvaluations = increment(dynamicCapacityEvaluations);
+        }
+
+        private void recordEquivalentRoutesPruned(int count) {
+            if (count > 0) equivalentRoutesPruned = add(equivalentRoutesPruned, count);
+        }
+
+        private void recordFailureMemoHit() {
+            failureMemoHits = increment(failureMemoHits);
+        }
+
+        private void recordFrontierSize(int size) {
+            frontierPeak = Math.max(frontierPeak, size);
+        }
+
+        private void recordSearchCutoff() {
+            searchCutoff = true;
+        }
+
+        private void recordFallbackWork() {
+            consumedFallbackBudget = increment(consumedFallbackBudget);
+        }
+
+        private void recordFallbackCutoff() {
+            fallbackCutoff = true;
+        }
+
+        private void addLinearPassNanos(long nanos) {
+            linearPassNanos = addNanos(linearPassNanos, nanos);
+        }
+
+        private void addSearchNanos(long nanos) {
+            searchNanos = addNanos(searchNanos, nanos);
+        }
+
+        private PlanningDiagnostics finish(long started, SearchBudget budget) {
+            int consumed = budget == null ? 0 : budget.consumed();
+            return new PlanningDiagnostics(
+                    reachableWorkEstimate,
+                    reachableItems,
+                    reachablePatterns,
+                    inputEdges,
+                    contendedOutputs,
+                    cycleCuts,
+                    seedOrdered,
+                    configuredSearchBudget,
+                    consumed,
+                    configuredFallbackBudget,
+                    consumedFallbackBudget,
+                    planRuns,
+                    compiledOrientations,
+                    reusedCompilations,
+                    hotNodeVisits,
+                    dynamicCapacityEvaluations,
+                    equivalentRoutesPruned,
+                    failureMemoHits,
+                    frontierPeak,
+                    searchCutoff,
+                    fallbackCutoff,
+                    graphCompileNanos,
+                    linearPassNanos,
+                    searchNanos,
+                    Math.max(0L, System.nanoTime() - started));
+        }
+
+        private static int increment(int value) {
+            return value == Integer.MAX_VALUE ? value : value + 1;
+        }
+
+        private static int add(int left, int right) {
+            return left > Integer.MAX_VALUE - right ? Integer.MAX_VALUE : left + right;
+        }
+
+        private static long addNanos(long left, long right) {
+            long nonNegativeRight = Math.max(0L, right);
+            return left > Long.MAX_VALUE - nonNegativeRight
+                    ? Long.MAX_VALUE
+                    : left + nonNegativeRight;
+        }
+    }
+
+    /**
+     * Monotonic plan-wide alternative-search guard. Once a request is denied, callers stop exploring
+     * alternatives and finish the current plan through a deterministic capacity-first route.
+     */
+    private static final class SearchBudget {
+        private final int initial;
+        private int remaining;
+        private final DiagnosticsCollector diagnostics;
+        private boolean exhausted;
+
+        private SearchBudget(int work, DiagnosticsCollector diagnostics) {
+            this.initial = Math.max(1, work);
+            this.remaining = initial;
+            this.diagnostics = diagnostics;
         }
 
         private boolean tryConsume() {
@@ -2680,8 +3021,9 @@ public final class CraftPlannerV2<K> {
         private boolean tryConsume(int work) {
             int requested = Math.max(1, work);
             if (remaining < requested) {
-                if (recordExhaustion) {
+                if (!exhausted) {
                     exhausted = true;
+                    diagnostics.recordSearchCutoff();
                 }
                 return false;
             }
@@ -2695,6 +3037,31 @@ public final class CraftPlannerV2<K> {
 
         private int remaining() {
             return remaining;
+        }
+
+        private int consumed() {
+            return initial - remaining;
+        }
+    }
+
+    /** Bounds the deterministic tail after alternative search has stopped. */
+    private static final class FallbackBudget {
+        private int remaining;
+        private final DiagnosticsCollector diagnostics;
+
+        private FallbackBudget(int work, DiagnosticsCollector diagnostics) {
+            this.remaining = Math.max(1, work);
+            this.diagnostics = diagnostics;
+        }
+
+        private boolean tryConsume() {
+            if (remaining <= 0) {
+                diagnostics.recordFallbackCutoff();
+                return false;
+            }
+            remaining--;
+            diagnostics.recordFallbackWork();
+            return true;
         }
     }
 

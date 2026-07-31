@@ -704,6 +704,41 @@ class CraftPlannerV2Test {
     }
 
     @Test
+    void fallbackBudgetBoundsSeedOrderedDiamondExpansion() {
+        int depth = 26;
+        ReusableStockSource source = new ReusableStockSource("host", "pool");
+        CraftGraph.Builder<String> builder = CraftGraph.builder();
+        for (int i = 0; i < depth; i++) {
+            List<CraftInput<String>> leftInputs = new ArrayList<>();
+            leftInputs.add(CraftInput.of("A" + (i + 1), 1));
+            leftInputs.add(CraftInput.of("B" + (i + 1), 1));
+            if (i == 0) {
+                leftInputs.add(CraftInput.returnedFrom("tool", 1, source));
+            }
+            builder.pattern("A" + i, 1, leftInputs);
+            builder.pattern("B" + i, 1, List.of(
+                    CraftInput.of("A" + (i + 1), 1),
+                    CraftInput.of("B" + (i + 1), 1)));
+        }
+        builder.stock("A" + depth, 1)
+                .stock("B" + depth, 1)
+                .reusableStock("host", "tool", 1)
+                .reusableStockRoute(source, "tool", List.of("tool"));
+
+        PlanningResult<String> planning = assertTimeoutPreemptively(
+                Duration.ofSeconds(2),
+                () -> CraftPlannerV2.planDetailed(builder.build(), "A0", 1, 1, 1));
+
+        assertFalse(planning.plan().feasible());
+        assertTrue(planning.plan().budgetExhausted());
+        assertTrue(planning.diagnostics().searchCutoff());
+        assertTrue(planning.diagnostics().fallbackCutoff());
+        assertEquals(
+                planning.diagnostics().configuredFallbackBudget(),
+                planning.diagnostics().consumedFallbackBudget());
+    }
+
+    @Test
     void overflowSaturatesToMissingNotWraparound() {
         CraftGraph.Builder<String> b = CraftGraph.<String>builder();
         int depth = 25;
@@ -1021,6 +1056,28 @@ class CraftPlannerV2Test {
         assertEquals(1L, firingsOf(plan, seedFromA));
         assertEquals(amount, firingsOf(plan, contracted));
         assertTrue(plan.missing().isEmpty());
+    }
+
+    @Test
+    void cutoffGreedyTailStillBuildsAContractedLoopSeed() {
+        CraftPattern<String> seedFromA = new CraftPattern<>(
+                "seed", 1, List.of(CraftInput.of("A", 1)), "A_to_seed");
+        CraftPattern<String> contracted = new CraftPattern<>(
+                "seed", 1, List.of(CraftInput.returned("seed", 1)), "contractedSelfGain");
+        CraftGraph<String> graph = CraftGraph.<String>builder()
+                .pattern(seedFromA)
+                .pattern(contracted)
+                .stock("A", 1)
+                .build();
+
+        PlanningResult<String> planning =
+                CraftPlannerV2.planDetailed(graph, "seed", 1_000, 1, 1);
+
+        assertTrue(planning.plan().feasible());
+        assertFalse(planning.plan().budgetExhausted());
+        assertTrue(planning.diagnostics().searchCutoff());
+        assertEquals(1L, firingsOf(planning.plan(), seedFromA));
+        assertEquals(1_000L, firingsOf(planning.plan(), contracted));
     }
 
     @Test
@@ -1844,8 +1901,8 @@ class CraftPlannerV2Test {
 
     /**
      * Exhausting the global work guard is not a proof that every route needs the same leaf, but AE2's
-     * simulation still needs an actionable replenishment target. A fresh bounded single-route pass
-     * must discard speculative mutations and return one concrete partial plan.
+     * simulation still needs an actionable replenishment target. The current run must roll back only
+     * its speculative branch and finish one concrete route without launching a diagnostic replan.
      */
     @Test
     void globalSearchBudgetExhaustionReturnsABoundedMissingDiagnosis() {
@@ -1860,7 +1917,9 @@ class CraftPlannerV2Test {
                 .stock("good", 1)
                 .build();
 
-        CraftPlan<String> plan = CraftPlannerV2.plan(graph, "target", 1, 1, 1);
+        PlanningResult<String> planning =
+                CraftPlannerV2.planDetailed(graph, "target", 1, 1, 1);
+        CraftPlan<String> plan = planning.plan();
 
         assertFalse(plan.feasible());
         assertTrue(plan.budgetExhausted());
@@ -1869,6 +1928,10 @@ class CraftPlannerV2Test {
         assertEquals(1L, plan.missing().get("shared"));
         assertFalse(plan.usedStock().containsKey("good"),
                 "the discarded speculative alternative must not leak into the diagnosis");
+        assertEquals(1, planning.diagnostics().planRuns(),
+                "a cutoff must finish the current run, not launch a diagnostic replan");
+        assertEquals(1, planning.diagnostics().compiledOrientations());
+        assertTrue(planning.diagnostics().searchCutoff());
 
         CraftGraph<String> replenished = CraftGraph.<String>builder()
                 .pattern("X", 1, List.of(CraftInput.of("shared", 1)))
@@ -1926,7 +1989,7 @@ class CraftPlannerV2Test {
     }
 
     @Test
-    void anytimeReplayCutoffKeepsTheBestCompletedMissingCandidate() {
+    void anytimeReplayCutoffFinishesTheSelectedReplayGreedily() {
         ReusableStockSource source = new ReusableStockSource("host", "pool");
         CraftPattern<String> xShared = new CraftPattern<>(
                 "X", 1, List.of(CraftInput.of("shared", 1)), "X-shared");
@@ -1946,14 +2009,23 @@ class CraftPlannerV2Test {
                 .reusableStockRoute(source, "tool", List.of("tool"))
                 .build();
 
-        CraftPlan<String> plan = CraftPlannerV2.plan(graph, "target", 1, 1, 20);
+        PlanningResult<String> planning =
+                CraftPlannerV2.planDetailed(graph, "target", 1, 1, 20);
+        CraftPlan<String> plan = planning.plan();
 
-        assertFalse(plan.feasible());
-        assertTrue(plan.budgetExhausted());
-        assertEquals(1L, firingsOf(plan, xShared));
-        assertEquals(0L, firingsOf(plan, xSpecial));
+        assertTrue(plan.feasible(),
+                "budget exhaustion stops alternate search but must not kill the selected replay");
+        assertFalse(plan.budgetExhausted(),
+                "the deterministic tail produced a complete executable proof");
+        assertEquals(0L, firingsOf(plan, xShared));
+        assertEquals(1L, firingsOf(plan, xSpecial));
         assertEquals(1L, plan.usedStock().get("shared"));
-        assertEquals(1L, plan.missing().get("shared"));
+        assertEquals(1L, plan.usedStock().get("special"));
+        assertTrue(plan.missing().isEmpty());
+        assertTrue(planning.diagnostics().searchCutoff());
+        assertEquals(1, planning.diagnostics().compiledOrientations());
+        assertTrue(planning.diagnostics().reusedCompilations() >= 1,
+                "route replay must reuse the compiled DAG/capacity/footprint data");
     }
 
     @Test
