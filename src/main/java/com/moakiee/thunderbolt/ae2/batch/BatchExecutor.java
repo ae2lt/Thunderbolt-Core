@@ -215,7 +215,17 @@ public final class BatchExecutor {
                     }
                     continue;
                 }
-                if (capacity <= 0) continue;
+                // Capacity has a three-state meaning:
+                //   0: unavailable/busy (the ordinary path independently observes isBusy());
+                //   1: ordinary single-copy provider, let the CPU's bulk-extract/single-push
+                //      path handle it without paying BatchExecutor's per-copy bookkeeping;
+                //  >1: a real batch candidate.
+                //
+                // In particular, providers with a disabled batch feature commonly report 1.
+                // Treating that as a one-copy batch would bypass pushBulkForTask and repeat batch
+                // extraction, template cloning, power simulation and output registration for
+                // every physical dispatch.
+                if (!usesBatchPath(capacity)) continue;
                 if (dispatchMode == null) {
                     dispatchMode = BatchDispatchMode.NORMAL;
                 }
@@ -405,6 +415,10 @@ public final class BatchExecutor {
     private static long floorToLong(double value) {
         if (!Double.isFinite(value) || value >= Long.MAX_VALUE) return Long.MAX_VALUE;
         return value <= 0.0D ? 0L : (long) Math.floor(value);
+    }
+
+    static boolean usesBatchPath(long capacity) {
+        return capacity > 1L;
     }
 
     private record EligibleProvider(IBatchCraftingProvider provider, ICraftingProvider identity,

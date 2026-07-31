@@ -31,11 +31,13 @@ public interface IBatchCraftingProvider extends ICraftingProvider {
      * <p>This is only an advisory upper bound on how many copies the CPU pre-extracts before
      * calling {@link #pushBatch}; it is NOT a correctness constraint. {@code pushBatch} is the
      * real gatekeeper (it returns the leftover it could not accept), and the CPU's own op budget
-     * also limits dispatch. Returning {@code 0} opts this provider out for now (busy / full /
-     * offline). The default returns {@link Long#MAX_VALUE} when not busy, i.e. "no extra cap
-     * beyond what pushBatch and the CPU budget already enforce". Override with a tighter, accurate
-     * value if you want to stop the CPU from over-extracting inputs that pushBatch would only
-     * reinject.
+     * also limits dispatch. Returning {@code 0} means temporarily unavailable (busy / full /
+     * offline) and must agree with {@link #isBusy()}. Returning {@code 1} selects the CPU's
+     * optimized ordinary single-copy dispatch path instead of this batch interface. Values greater
+     * than {@code 1} opt into batch dispatch.
+     * The default returns {@link Long#MAX_VALUE} when not busy, i.e. "no extra cap beyond what
+     * pushBatch and the CPU budget already enforce". Override with a tighter, accurate value if
+     * you want to stop the CPU from over-extracting inputs that pushBatch would only reinject.
      */
     default long getBatchCapacity(IPatternDetails details) {
         return isBusy() ? 0L : Long.MAX_VALUE;
