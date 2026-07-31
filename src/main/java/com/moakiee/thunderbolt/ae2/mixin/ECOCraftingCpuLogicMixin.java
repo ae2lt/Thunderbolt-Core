@@ -247,33 +247,33 @@ public abstract class ECOCraftingCpuLogicMixin {
         var providerDetails = CraftingPatternDelegates.forProviderLookup(details);
         var overloadDetails = providerDetails instanceof OverloadedProviderOnlyPatternDetails overload
                 ? overload : null;
-        if (overloadDetails == null
-                && OverloadCpuInsertSupport.hasPendingCollisionWithOrdinaryPattern(this, details)) {
+        if (overloadDetails == null) {
+            if (OverloadCpuInsertSupport.hasPendingCollisionWithOrdinaryPattern(this, details)) {
+                return false;
+            }
+            return original.call(provider, details, inputHolder);
+        }
+
+        var activeJob = ae2lt$getJob();
+        var waitingFor = activeJob != null ? ae2lt$getJobWaitingFor(activeJob) : null;
+        if (waitingFor == null
+                || OverloadCpuInsertSupport.hasStrictCollisionWithOverloadPattern(
+                        this, details, overloadDetails, waitingFor.list)) {
             return false;
         }
-        OverloadPatternReference patternReference = null;
-        if (overloadDetails != null) {
-            var activeJob = ae2lt$getJob();
-            var waitingFor = activeJob != null ? ae2lt$getJobWaitingFor(activeJob) : null;
-            if (waitingFor == null
-                    || OverloadCpuInsertSupport.hasStrictCollisionWithOverloadPattern(
-                            this, details, overloadDetails, waitingFor.list)) {
-                return false;
-            }
-            patternReference = new OverloadPatternReference(
-                    overloadDetails.overloadPatternIdentity(),
-                    overloadDetails.overloadPatternDetailsView().sourcePattern());
-            if (OverloadCpuStateManager.INSTANCE.hasAmbiguousOutputRegistration(
-                    this,
-                    patternReference,
-                    overloadDetails.overloadPatternDetailsView())) {
-                return false;
-            }
+        var patternReference = new OverloadPatternReference(
+                overloadDetails.overloadPatternIdentity(),
+                overloadDetails.overloadPatternDetailsView().sourcePattern());
+        if (OverloadCpuStateManager.INSTANCE.hasAmbiguousOutputRegistration(
+                this,
+                patternReference,
+                overloadDetails.overloadPatternDetailsView())) {
+            return false;
         }
 
         boolean pushed = original.call(provider, details, inputHolder);
         var job = ae2lt$getJob();
-        if (pushed && overloadDetails != null && job != null) {
+        if (pushed && job != null) {
             GenericStack finalOutput = ae2lt$getJobFinalOutput(job);
             AEKey finalOutputKey = finalOutput != null ? finalOutput.what() : null;
             CraftingLink link = ae2lt$getJobLink(job);
@@ -282,11 +282,7 @@ public abstract class ECOCraftingCpuLogicMixin {
                 OverloadCpuStateManager.INSTANCE.registerExpectedOutputs(
                         this,
                         craftingId,
-                        patternReference != null
-                                ? patternReference
-                                : new OverloadPatternReference(
-                                        overloadDetails.overloadPatternIdentity(),
-                                        overloadDetails.overloadPatternDetailsView().sourcePattern()),
+                        patternReference,
                         overloadDetails.overloadPatternDetailsView(),
                         details.getOutputs(),
                         finalOutputKey,

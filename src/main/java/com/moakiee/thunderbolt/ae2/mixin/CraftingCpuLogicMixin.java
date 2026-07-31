@@ -156,34 +156,34 @@ public abstract class CraftingCpuLogicMixin {
         var providerDetails = CraftingPatternDelegates.forProviderLookup(details);
         var overloadDetails = providerDetails instanceof OverloadedProviderOnlyPatternDetails overload
                 ? overload : null;
-        if (overloadDetails == null
-                && OverloadCpuInsertSupport.hasPendingCollisionWithOrdinaryPattern(logic, details)) {
+        if (overloadDetails == null) {
+            if (OverloadCpuInsertSupport.hasPendingCollisionWithOrdinaryPattern(logic, details)) {
+                return false;
+            }
+            return original.call(provider, details, inputHolder);
+        }
+
+        var activeJob = ((CraftingCpuLogicAccessor) logic).getJob();
+        if (activeJob == null
+                || OverloadCpuInsertSupport.hasStrictCollisionWithOverloadPattern(
+                        logic,
+                        details,
+                        overloadDetails,
+                        ((ExecutingCraftingJobAccessor) activeJob).getWaitingFor().list)) {
             return false;
         }
-        OverloadPatternReference patternReference = null;
-        if (overloadDetails != null) {
-            var activeJob = ((CraftingCpuLogicAccessor) logic).getJob();
-            if (activeJob == null
-                    || OverloadCpuInsertSupport.hasStrictCollisionWithOverloadPattern(
-                            logic,
-                            details,
-                            overloadDetails,
-                            ((ExecutingCraftingJobAccessor) activeJob).getWaitingFor().list)) {
-                return false;
-            }
-            patternReference = new OverloadPatternReference(
-                    overloadDetails.overloadPatternIdentity(),
-                    overloadDetails.overloadPatternDetailsView().sourcePattern());
-            if (OverloadCpuStateManager.INSTANCE.hasAmbiguousOutputRegistration(
-                    logic,
-                    patternReference,
-                    overloadDetails.overloadPatternDetailsView())) {
-                return false;
-            }
+        var patternReference = new OverloadPatternReference(
+                overloadDetails.overloadPatternIdentity(),
+                overloadDetails.overloadPatternDetailsView().sourcePattern());
+        if (OverloadCpuStateManager.INSTANCE.hasAmbiguousOutputRegistration(
+                logic,
+                patternReference,
+                overloadDetails.overloadPatternDetailsView())) {
+            return false;
         }
 
         boolean pushed = original.call(provider, details, inputHolder);
-        if (pushed && overloadDetails != null) {
+        if (pushed) {
             var job = ((CraftingCpuLogicAccessor) logic).getJob();
             var finalOutput = job != null
                     ? ((ExecutingCraftingJobAccessor) job).getFinalOutput()
@@ -191,11 +191,7 @@ public abstract class CraftingCpuLogicMixin {
             var finalOutputKey = finalOutput != null ? finalOutput.what() : null;
             OverloadCpuStateManager.INSTANCE.registerExpectedOutputs(
                     logic,
-                    patternReference != null
-                            ? patternReference
-                            : new OverloadPatternReference(
-                                    overloadDetails.overloadPatternIdentity(),
-                                    overloadDetails.overloadPatternDetailsView().sourcePattern()),
+                    patternReference,
                     overloadDetails.overloadPatternDetailsView(),
                     details.getOutputs(),
                     finalOutputKey,
