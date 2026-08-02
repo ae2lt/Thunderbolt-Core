@@ -2,6 +2,7 @@ package com.moakiee.thunderbolt.ae2.batch;
 
 import java.util.Iterator;
 import java.util.Map;
+import java.util.UUID;
 
 import net.pedroksl.advanced_ae.common.logic.ExecutingCraftingJob;
 
@@ -68,6 +69,11 @@ public final class AaeBatchJobView implements BatchJobView, BatchTaskHandle, Ite
     @Override
     public ListCraftingInventory waitingFor() {
         return ((AaeExecutingCraftingJobAccessor) (Object) job).getWaitingFor();
+    }
+
+    @Override
+    public UUID craftingId() {
+        return ((AaeExecutingCraftingJobAccessor) (Object) job).getLink().getCraftingID();
     }
 
     @Override

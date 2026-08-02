@@ -3314,6 +3314,11 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
         }
 
         @Override
+        public UUID craftingId() {
+            return activeJob.link.getCraftingID();
+        }
+
+        @Override
         public void insertWaitingFor(AEKey what, long amount) {
             Ae2LtTimeWheelCraftingCpuLogic.this.insertWaitingFor(activeJob, what, amount);
         }

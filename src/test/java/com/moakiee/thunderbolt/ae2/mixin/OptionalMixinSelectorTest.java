@@ -19,6 +19,7 @@ class OptionalMixinSelectorTest {
         assertFalse(OptionalMixinSelector.shouldApply("ECOCraftingCpuLogicBatchMixin", ignored -> false));
         assertFalse(OptionalMixinSelector.shouldApply("ECOCraftingCpuLogicMixin", ignored -> false));
         assertFalse(OptionalMixinSelector.shouldApply("ECOCraftingCpuAccessor", ignored -> false));
+        assertFalse(OptionalMixinSelector.shouldApply("NeoEcoPatternBusBatchMixin", ignored -> false));
     }
 
     @Test
@@ -34,6 +35,7 @@ class OptionalMixinSelectorTest {
         assertTrue(OptionalMixinSelector.shouldApply("AdvCraftingCpuAccessor", "advanced_ae"::equals));
         assertTrue(OptionalMixinSelector.shouldApply("ECOCraftingCpuLogicBatchMixin", "neoecoae"::equals));
         assertTrue(OptionalMixinSelector.shouldApply("ECOCraftingCpuLogicMixin", "neoecoae"::equals));
+        assertTrue(OptionalMixinSelector.shouldApply("NeoEcoPatternBusBatchMixin", "neoecoae"::equals));
     }
 
     @Test

@@ -58,6 +58,14 @@ public interface IBatchCraftingProvider extends ICraftingProvider {
      */
     long pushBatch(IPatternDetails details, KeyCounter[] oneCopyTemplate, long maxCraft);
 
+    /**
+     * Context-aware variant used by the CPU dispatcher. Existing providers keep the original
+     * contract; integrations that persist work ownership may override this method.
+     */
+    default long pushBatch(BatchDispatchContext context) {
+        return pushBatch(context.details(), context.oneCopyTemplate(), context.maxCraft());
+    }
+
     @Override
     default boolean pushPattern(IPatternDetails patternDetails, KeyCounter[] inputHolder) {
         return pushBatch(patternDetails, inputHolder, 1L) == 0L;

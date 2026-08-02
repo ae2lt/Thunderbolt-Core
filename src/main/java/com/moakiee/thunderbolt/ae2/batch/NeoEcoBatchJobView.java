@@ -5,11 +5,13 @@ import java.lang.reflect.Method;
 import java.util.Collections;
 import java.util.Iterator;
 import java.util.Map;
+import java.util.UUID;
 
 import org.jetbrains.annotations.Nullable;
 
 import appeng.api.crafting.IPatternDetails;
 import appeng.api.stacks.AEKeyType;
+import appeng.crafting.CraftingLink;
 import appeng.crafting.inv.ListCraftingInventory;
 
 import com.moakiee.thunderbolt.ae2.util.MixinReflectionSupport;
@@ -35,6 +37,8 @@ public final class NeoEcoBatchJobView implements BatchJobView, BatchTaskHandle, 
             MixinReflectionSupport.findDeclaredFieldSafe(JOB_CLASS, "waitingFor");
     private static final @Nullable Field TIME_TRACKER_FIELD =
             MixinReflectionSupport.findDeclaredFieldSafe(JOB_CLASS, "timeTracker");
+    private static final @Nullable Field LINK_FIELD =
+            MixinReflectionSupport.findDeclaredFieldSafe(JOB_CLASS, "link");
     private static final @Nullable Field TASK_VALUE_FIELD =
             MixinReflectionSupport.findDeclaredFieldSafe(TASK_PROGRESS_CLASS, "value");
     private static final @Nullable Method ADD_MAX_ITEMS_METHOD =
@@ -56,6 +60,7 @@ public final class NeoEcoBatchJobView implements BatchJobView, BatchTaskHandle, 
                 && TASKS_FIELD != null
                 && WAITING_FOR_FIELD != null
                 && TIME_TRACKER_FIELD != null
+                && LINK_FIELD != null
                 && TASK_VALUE_FIELD != null
                 && ADD_MAX_ITEMS_METHOD != null;
     }
@@ -120,6 +125,14 @@ public final class NeoEcoBatchJobView implements BatchJobView, BatchTaskHandle, 
             return inventory;
         }
         throw new IllegalStateException("NeoECO crafting job has no compatible waitingFor inventory");
+    }
+
+    @Override
+    public @Nullable UUID craftingId() {
+        Object link = MixinReflectionSupport.getFieldValueSafe(LINK_FIELD, job);
+        return link instanceof CraftingLink craftingLink
+                ? craftingLink.getCraftingID()
+                : null;
     }
 
     @Override

@@ -17,6 +17,7 @@ import appeng.crafting.inv.ListCraftingInventory;
 import appeng.me.service.CraftingService;
 
 import com.moakiee.thunderbolt.ae2.api.crafting.IBatchCraftingProvider;
+import com.moakiee.thunderbolt.ae2.api.crafting.BatchDispatchContext;
 import com.moakiee.thunderbolt.ae2.api.crafting.BatchDispatchMode;
 import com.moakiee.thunderbolt.ae2.api.crafting.CraftingPatternDelegates;
 import com.moakiee.thunderbolt.ae2.crafting.ExecuteLoopPattern;
@@ -327,7 +328,8 @@ public final class BatchExecutor {
 
                 long subLeftover;
                 try {
-                    subLeftover = batch.pushBatch(executionDetails, oneCopy, slice);
+                    subLeftover = batch.pushBatch(new BatchDispatchContext(
+                            executionDetails, oneCopy, slice, level, job.craftingId()));
                 } catch (Throwable t) {
                     appeng.core.AELog.warn("[ae2lt] IBatchCraftingProvider %s threw during pushBatch; treating as full leftover. %s",
                             batch, t);
