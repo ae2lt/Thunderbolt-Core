@@ -1625,6 +1625,38 @@ class CraftPlannerV2Test {
     }
 
     @Test
+    void multiStepContainerCycleCraftsOneBootstrapState() {
+        CraftPattern<String> finish = new CraftPattern<>(
+                "result", 1, List.of(CraftInput.consumedReturning("full", 1, "empty")),
+                List.of(CraftOutput.of("empty", 1)), "finish");
+        CraftPattern<String> fill = new CraftPattern<>(
+                "full", 1, List.of(CraftInput.of("dusted", 1)), "fill");
+        CraftPattern<String> dust = new CraftPattern<>(
+                "dusted", 1, List.of(CraftInput.of("empty", 1), CraftInput.of("dust", 2)), "dust");
+        CraftPattern<String> makeEmpty = new CraftPattern<>(
+                "empty", 1, List.of(CraftInput.of("gem", 3)), "makeEmpty");
+        CraftGraph<String> graph = CraftGraph.<String>builder()
+                .pattern(finish)
+                .pattern(fill)
+                .pattern(dust)
+                .pattern(makeEmpty)
+                .stock("dust", 20)
+                .stock("gem", 3)
+                .build();
+
+        CraftPlan<String> plan = CraftPlannerV2.plan(graph, "result", 10);
+
+        assertTrue(plan.feasible(), plan.toString());
+        assertEquals(10L, firingsOf(plan, finish));
+        assertEquals(10L, firingsOf(plan, fill));
+        assertEquals(10L, firingsOf(plan, dust));
+        assertEquals(1L, firingsOf(plan, makeEmpty));
+        assertEquals(20L, plan.usedStock().get("dust"));
+        assertEquals(3L, plan.usedStock().get("gem"));
+        assertTrue(plan.missing().isEmpty());
+    }
+
+    @Test
     void decompressCycleMakesIngotsFromBlockStock() {
         // Same pair, opposite direction: target = ingot, stock = blocks. Now the compress recipe is the
         // back-edge that gets cut, so ingots come from decompressing blocks.

@@ -105,6 +105,9 @@ public final class CraftPlannerV2<K> {
     private final Set<K> cutOutputs = new LinkedHashSet<>();
     private final Map<CraftPattern<K>, Set<K>> suppressedPositiveFeedbackOutputs =
             new IdentityHashMap<>();
+    /** One physical remainder batch withheld from linear byproduct credit to start a feedback path. */
+    private final Map<CraftPattern<K>, Map<K, Long>> linearContainerBootstrapReserves =
+            new IdentityHashMap<>();
     private final Map<K, Long> reservedSelfSeeds = new HashMap<>();
     /**
      * A narrowly proven two-node startup path for a contracted loop:
@@ -518,6 +521,7 @@ public final class CraftPlannerV2<K> {
             for (int i = postOrder.size() - 1; i >= 0; i--) {
                 order.add(postOrder.get(i));
             }
+            indexLinearContainerBootstrapReserves();
             this.capacity = capacityFromOrder(order, items.size());
             indexCapacityOrder();
             indexDirectRawConsumables();
@@ -571,6 +575,10 @@ public final class CraftPlannerV2<K> {
         IdentityHashMap<CraftPattern<K>, Set<K>> frozenSuppressed = new IdentityHashMap<>();
         suppressedPositiveFeedbackOutputs.forEach(
                 (pattern, outputs) -> frozenSuppressed.put(pattern, Set.copyOf(outputs)));
+        IdentityHashMap<CraftPattern<K>, Map<K, Long>> frozenContainerReserves =
+                new IdentityHashMap<>();
+        linearContainerBootstrapReserves.forEach(
+                (pattern, reserves) -> frozenContainerReserves.put(pattern, Map.copyOf(reserves)));
         IdentityHashMap<CraftPattern<K>, List<FeedbackSeedBootstrap<K>>> frozenBootstraps =
                 new IdentityHashMap<>();
         feedbackSeedBootstraps.forEach(
@@ -605,6 +613,7 @@ public final class CraftPlannerV2<K> {
                 Set.copyOf(cutOutputs),
                 frozenPatterns,
                 frozenSuppressed,
+                frozenContainerReserves,
                 frozenBootstraps,
                 frozenConverters,
                 requiresSeedOrderedPlanning,
@@ -622,6 +631,7 @@ public final class CraftPlannerV2<K> {
         cutOutputs.addAll(prepared.cutOutputs);
         patternsByOutput.putAll(prepared.patternsByOutput);
         suppressedPositiveFeedbackOutputs.putAll(prepared.suppressedPositiveFeedbackOutputs);
+        linearContainerBootstrapReserves.putAll(prepared.linearContainerBootstrapReserves);
         feedbackSeedBootstraps.putAll(prepared.feedbackSeedBootstraps);
         feedbackSeedConverters.putAll(prepared.feedbackSeedConverters);
         requiresSeedOrderedPlanning = prepared.seedOrdered;
@@ -939,6 +949,52 @@ public final class CraftPlannerV2<K> {
         return !suppressedPositiveFeedbackOutputs
                 .getOrDefault(pattern, Set.of())
                 .contains(key);
+    }
+
+    /**
+     * The linear pass aggregates all byproducts before resolving their consumers. For a path such as
+     * {@code full -> intermediate -> empty}, crediting every returned {@code empty} lets the path
+     * bootstrap itself from zero physical containers. Withhold one returned batch so ordinary demand
+     * obtains that bootstrap from stock or a real producer; the remaining returns still serve the
+     * rest of the batch.
+     */
+    private void indexLinearContainerBootstrapReserves() {
+        linearContainerBootstrapReserves.clear();
+        for (List<CraftPattern<K>> patterns : patternsByOutput.values()) {
+            for (CraftPattern<K> consumer : patterns) {
+                Map<K, Long> reserves = new HashMap<>();
+                for (CraftInput<K> transition : consumer.inputs()) {
+                    K remainder = transition.remainder();
+                    if (remainder == null || transition.key().equals(remainder)) continue;
+                    long returned = byproductAmount(consumer, remainder);
+                    if (returned <= 0 || !dependsOn(transition.key(), remainder)) continue;
+                    reserves.merge(remainder, transition.amount(), Sat::add);
+                }
+                reserves.replaceAll((key, required) ->
+                        Math.min(required, byproductAmount(consumer, key)));
+                reserves.values().removeIf(amount -> amount <= 0);
+                if (!reserves.isEmpty()) {
+                    linearContainerBootstrapReserves.put(consumer, Map.copyOf(reserves));
+                }
+            }
+        }
+    }
+
+    private boolean dependsOn(K output, K requiredInput) {
+        Set<K> seen = new HashSet<>();
+        Deque<K> queue = new ArrayDeque<>();
+        seen.add(output);
+        queue.add(output);
+        while (!queue.isEmpty()) {
+            K current = queue.removeFirst();
+            for (CraftPattern<K> pattern : patternsByOutput.getOrDefault(current, List.of())) {
+                for (CraftInput<K> input : pattern.inputs()) {
+                    if (requiredInput.equals(input.key())) return true;
+                    if (seen.add(input.key())) queue.addLast(input.key());
+                }
+            }
+        }
+        return false;
     }
 
     private boolean hasExternalBootstrapProducer(
@@ -1560,6 +1616,7 @@ public final class CraftPlannerV2<K> {
                             Map<K, Long> need, Map<K, Long> bp,
                             Map<K, Long> returnedSeedReserve,
                             Map<CraftPattern<K>, Long> fired) {
+        long previousFirings = fired.getOrDefault(r, 0L);
         fired.merge(r, t, Sat::add);
         for (CraftInput<K> in : r.inputs()) {
             long amt = in.unitsFor(t); // closed form: normal=amount·t, catalyst=amount, finite-use=amount·ceil(t/uses)
@@ -1575,9 +1632,23 @@ public final class CraftPlannerV2<K> {
                 need.merge(in.key(), amt, Sat::add);
             }
         }
+        Map<K, Long> bootstrapReserves = new HashMap<>(
+                linearContainerBootstrapReserves.getOrDefault(r, Map.of()));
+        bootstrapReserves.replaceAll((key, reserve) -> Math.max(
+                0L, reserve - Math.min(
+                        reserve, Sat.mul(byproductAmount(r, key), previousFirings))));
         for (CraftOutput<K> out : r.byproducts()) {
             if (mayReuseByproduct(r, out.key())) {
-                bp.merge(out.key(), Sat.mul(out.amount(), t), Sat::add);
+                long produced = Sat.mul(out.amount(), t);
+                long withheld = Math.min(
+                        produced, bootstrapReserves.getOrDefault(out.key(), 0L));
+                if (withheld > 0) {
+                    bootstrapReserves.put(out.key(),
+                            bootstrapReserves.get(out.key()) - withheld);
+                }
+                if (produced > withheld) {
+                    bp.merge(out.key(), produced - withheld, Sat::add);
+                }
             }
         }
         long surplus = Sat.mul(t, r.outputAmount()) - consumedOwn;
@@ -2807,6 +2878,7 @@ public final class CraftPlannerV2<K> {
         private final Set<K> cutOutputs;
         private final Map<K, List<CraftPattern<K>>> patternsByOutput;
         private final Map<CraftPattern<K>, Set<K>> suppressedPositiveFeedbackOutputs;
+        private final Map<CraftPattern<K>, Map<K, Long>> linearContainerBootstrapReserves;
         private final Map<CraftPattern<K>, List<FeedbackSeedBootstrap<K>>> feedbackSeedBootstraps;
         private final Map<CraftPattern<K>, List<FeedbackSeedBootstrap<K>>> feedbackSeedConverters;
         private final boolean seedOrdered;
@@ -2826,6 +2898,7 @@ public final class CraftPlannerV2<K> {
                 Set<K> cutOutputs,
                 Map<K, List<CraftPattern<K>>> patternsByOutput,
                 Map<CraftPattern<K>, Set<K>> suppressedPositiveFeedbackOutputs,
+                Map<CraftPattern<K>, Map<K, Long>> linearContainerBootstrapReserves,
                 Map<CraftPattern<K>, List<FeedbackSeedBootstrap<K>>> feedbackSeedBootstraps,
                 Map<CraftPattern<K>, List<FeedbackSeedBootstrap<K>>> feedbackSeedConverters,
                 boolean seedOrdered,
@@ -2843,6 +2916,7 @@ public final class CraftPlannerV2<K> {
             this.cutOutputs = cutOutputs;
             this.patternsByOutput = patternsByOutput;
             this.suppressedPositiveFeedbackOutputs = suppressedPositiveFeedbackOutputs;
+            this.linearContainerBootstrapReserves = linearContainerBootstrapReserves;
             this.feedbackSeedBootstraps = feedbackSeedBootstraps;
             this.feedbackSeedConverters = feedbackSeedConverters;
             this.seedOrdered = seedOrdered;
