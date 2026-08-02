@@ -25,6 +25,7 @@
     "AdvCraftingCpuAccessor",
     "ECOCraftingCpuLogicMixin",
     "ECOCraftingCpuAccessor",
+    "NeoEcoPatternBusBatchMixin",
     "ExecutingCraftingJobAccessor",
     "ElapsedTimeTrackerAccessor",
     "TaskProgressAccessor",

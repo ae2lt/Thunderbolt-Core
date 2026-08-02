@@ -21,7 +21,10 @@ import net.neoforged.neoforge.items.IItemHandler;
 
 import com.moakiee.thunderbolt.api.eject.EjectCapabilityRegistry;
 
-@Mixin(BlockCapability.class)
+// Run before third-party capability interceptors. Once a registered Thunderbolt EJECT endpoint
+// supplies a result, the cancellable HEAD injection returns from getCapability immediately and
+// lower-priority interceptors cannot replace ownership of that endpoint.
+@Mixin(value = BlockCapability.class, priority = 2000)
 public abstract class EjectCapabilityMixin<T, C> {
     @Unique
     private static final ThreadLocal<Boolean> THUNDERBOLT_PROXYING =

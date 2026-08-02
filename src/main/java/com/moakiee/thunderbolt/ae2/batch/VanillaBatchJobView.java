@@ -2,6 +2,7 @@ package com.moakiee.thunderbolt.ae2.batch;
 
 import java.util.Iterator;
 import java.util.Map;
+import java.util.UUID;
 
 import appeng.api.crafting.IPatternDetails;
 import appeng.api.stacks.AEKeyType;
@@ -67,6 +68,11 @@ public final class VanillaBatchJobView implements BatchJobView, BatchTaskHandle,
     @Override
     public ListCraftingInventory waitingFor() {
         return ((ExecutingCraftingJobAccessor) job).getWaitingFor();
+    }
+
+    @Override
+    public UUID craftingId() {
+        return ((ExecutingCraftingJobAccessor) job).getLink().getCraftingID();
     }
 
     @Override

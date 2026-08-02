@@ -9,11 +9,15 @@ import org.spongepowered.asm.mixin.gen.Accessor;
 import net.pedroksl.advanced_ae.common.logic.ElapsedTimeTracker;
 
 import appeng.api.crafting.IPatternDetails;
+import appeng.crafting.CraftingLink;
 import appeng.crafting.inv.ListCraftingInventory;
 
 @Pseudo
 @Mixin(targets = "net.pedroksl.advanced_ae.common.logic.ExecutingCraftingJob", remap = false)
 public interface AaeExecutingCraftingJobAccessor {
+    @Accessor("link")
+    CraftingLink getLink();
+
     @Accessor("tasks")
     Map<IPatternDetails, ?> getTasks();
 

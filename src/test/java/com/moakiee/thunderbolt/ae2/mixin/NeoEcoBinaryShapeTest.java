@@ -58,6 +58,42 @@ class NeoEcoBinaryShapeTest {
             assertProviderLookupCount(logic, EXECUTE_CRAFTING, 0);
             assertProviderLookupCount(logic, COLLECT_AVAILABLE_PROVIDERS, 1);
             assertWaitingForExtractCount(logic, 3);
+
+            var bus = shape(jar,
+                    "cn/dancingsnow/neoecoae/blocks/entity/crafting/"
+                            + "ECOCraftingPatternBusBlockEntity.class");
+            assertTrue(bus.methods.contains("getAvailableThreadSlots()I"));
+            assertTrue(bus.methods.contains(
+                    "findBatchFastPathOffer("
+                            + "Lcn/dancingsnow/neoecoae/impl/crafting/fastpath/"
+                            + "ECOExtractedPatternExecution;I)"
+                            + "Lcn/dancingsnow/neoecoae/blocks/entity/crafting/"
+                            + "ECOCraftingPatternBusBlockEntity$BatchFastPathOffer;"));
+            assertTrue(bus.methods.contains(
+                    "pushPattern("
+                            + "Lcn/dancingsnow/neoecoae/impl/crafting/fastpath/"
+                            + "ECOExtractedPatternExecution;Ljava/util/UUID;)Z"));
+            assertTrue(bus.methods.contains(
+                    "pushBatch("
+                            + "Lcn/dancingsnow/neoecoae/impl/crafting/fastpath/"
+                            + "ECOBatchCraftingRequest;"
+                            + "Lcn/dancingsnow/neoecoae/blocks/entity/crafting/"
+                            + "ECOCraftingPatternBusBlockEntity$BatchFastPathOffer;)Z"));
+
+            var execution = shape(jar,
+                    "cn/dancingsnow/neoecoae/impl/crafting/fastpath/"
+                            + "ECOExtractedPatternExecution.class");
+            assertTrue(execution.methods.contains(
+                    "create(Lappeng/api/crafting/IPatternDetails;"
+                            + "[Lappeng/api/stacks/KeyCounter;"
+                            + "Lappeng/api/stacks/KeyCounter;"
+                            + "Lappeng/api/stacks/KeyCounter;"
+                            + "Lnet/minecraft/world/level/Level;)"
+                            + "Lcn/dancingsnow/neoecoae/impl/crafting/fastpath/"
+                            + "ECOExtractedPatternExecution;"));
+            assertTrue(execution.methods.contains("fastPathEligible()Z"));
+            assertTrue(execution.methods.contains(
+                    "key()Lcn/dancingsnow/neoecoae/impl/crafting/fastpath/ECOFastPathKey;"));
         }
     }
 
