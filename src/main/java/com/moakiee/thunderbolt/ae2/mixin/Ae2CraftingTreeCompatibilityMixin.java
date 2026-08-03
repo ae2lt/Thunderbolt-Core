@@ -7,24 +7,20 @@ import org.spongepowered.asm.mixin.injection.ModifyVariable;
 import appeng.api.networking.crafting.ICraftingPlan;
 import appeng.menu.me.crafting.CraftingPlanSummary;
 
-import com.moakiee.thunderbolt.ae2.crafting.LoopCraftingPlan;
+import com.moakiee.thunderbolt.ae2.crafting.CraftingPlanSummaryAdapter;
 
 /**
- * Keeps AE2: Crafting Tree's confirmation-summary hook compatible with closed-loop plans.
+ * Keeps AE2: Crafting Tree's confirmation-summary hook compatible with custom plans.
  *
  * <p>AE2CT declares its hook parameter as {@link ICraftingPlan}, but then unconditionally casts it
- * to AE2's final {@code CraftingPlan} record. A loop plan cannot inherit from that record. The
- * summary only reads the ordinary plan data, so expose the loop plan's delegate inside this one
- * method call. {@code CraftConfirmMenu.result} still retains the original {@link LoopCraftingPlan}
- * and submits that restricted plan to the time-wheel CPU.
+ * to AE2's final {@code CraftingPlan} record. Third-party plans cannot inherit from that record.
+ * This mixin substitutes a concrete, isolated snapshot only for this summary call. The confirmation
+ * menu and CPU submission retain the original plan and all of its private execution metadata.
  */
-@Mixin(value = CraftingPlanSummary.class, remap = false)
+@Mixin(value = CraftingPlanSummary.class, priority = 2000, remap = false)
 public abstract class Ae2CraftingTreeCompatibilityMixin {
-    @ModifyVariable(method = "fromJob", at = @At("HEAD"), argsOnly = true)
-    private static ICraftingPlan thunderbolt$unwrapLoopPlanForAe2CraftingTree(ICraftingPlan job) {
-        if (job instanceof LoopCraftingPlan loopPlan) {
-            return loopPlan.delegate();
-        }
-        return job;
+    @ModifyVariable(method = "fromJob", at = @At("HEAD"), argsOnly = true, index = 2)
+    private static ICraftingPlan thunderbolt$adaptPlanForAe2CraftingTree(ICraftingPlan job) {
+        return CraftingPlanSummaryAdapter.adapt(job);
     }
 }

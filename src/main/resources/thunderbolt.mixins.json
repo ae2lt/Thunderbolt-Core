@@ -9,7 +9,6 @@
     "CraftingCalculationMixin",
     "CraftingLinkNexusMixin",
     "CraftingServiceAccessor",
-    "LoopCraftingPlanSummaryMixin",
     "EjectCapabilityMixin",
     "EjectGhostBlockEntityMixin",
     "GridConnectionMaxChannelsMixin",
