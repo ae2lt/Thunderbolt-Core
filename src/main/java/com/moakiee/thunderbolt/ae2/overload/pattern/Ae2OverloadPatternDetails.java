@@ -43,7 +43,13 @@ public final class Ae2OverloadPatternDetails
         for (int slot = 0; slot < sourceInputs.length; slot++) {
             this.inputs[slot] = wrapInput(sourceInputs[slot], overloadDetails.inputMode(slot));
         }
-        this.outputs = List.copyOf(sourceDetails.getOutputs());
+        var sourceOutputs = sourceDetails.getOutputs();
+        var normalizedOutputs = new ArrayList<GenericStack>(sourceOutputs.size());
+        for (int slot = 0; slot < sourceOutputs.size(); slot++) {
+            normalizedOutputs.add(normalizeTemplate(
+                    sourceOutputs.get(slot), overloadDetails.outputMode(slot)));
+        }
+        this.outputs = List.copyOf(normalizedOutputs);
     }
 
     @Override
@@ -110,19 +116,21 @@ public final class Ae2OverloadPatternDetails
     private static final class OverloadInput implements IInput {
         private final IInput sourceInput;
         private final MatchMode matchMode;
+        private final GenericStack[] sourcePossibleInputs;
         private final GenericStack[] possibleInputs;
         private final List<AEItemKey> itemKeys;
 
         private OverloadInput(IInput sourceInput, MatchMode matchMode) {
             this.sourceInput = sourceInput;
             this.matchMode = matchMode;
-            this.possibleInputs = sourceInput.getPossibleInputs();
-            this.itemKeys = collectItemKeys(possibleInputs);
+            this.sourcePossibleInputs = sourceInput.getPossibleInputs();
+            this.possibleInputs = normalizeTemplates(sourcePossibleInputs, matchMode);
+            this.itemKeys = collectItemKeys(sourcePossibleInputs);
         }
 
         @Override
         public GenericStack[] getPossibleInputs() {
-            return possibleInputs;
+            return possibleInputs.clone();
         }
 
         @Override
@@ -146,9 +154,10 @@ public final class Ae2OverloadPatternDetails
             }
 
             if (template instanceof AEItemKey itemKey) {
-                for (var possible : itemKeys) {
-                    if (possible.getItem() == itemKey.getItem()) {
-                        var remaining = sourceInput.getRemainingKey(possible);
+                for (var possible : sourcePossibleInputs) {
+                    if (possible.what() instanceof AEItemKey possibleItem
+                            && possibleItem.getItem() == itemKey.getItem()) {
+                        var remaining = sourceInput.getRemainingKey(possible.what());
                         if (remaining != null) {
                             return remaining;
                         }
@@ -228,6 +237,22 @@ public final class Ae2OverloadPatternDetails
             return sourceInput;
         }
         return new OverloadInput(sourceInput, matchMode);
+    }
+
+    private static GenericStack[] normalizeTemplates(GenericStack[] templates, MatchMode matchMode) {
+        var result = new GenericStack[templates.length];
+        for (int slot = 0; slot < templates.length; slot++) {
+            result[slot] = normalizeTemplate(templates[slot], matchMode);
+        }
+        return result;
+    }
+
+    /** ID_ONLY is encoded as the item's primary identity, never one arbitrary component variant. */
+    static GenericStack normalizeTemplate(GenericStack template, MatchMode matchMode) {
+        if (matchMode == MatchMode.ID_ONLY) {
+            return new GenericStack(template.what().dropSecondary(), template.amount());
+        }
+        return template;
     }
 
     private static boolean hasItemVariants(GenericStack[] possibleInputs) {
