@@ -2,6 +2,7 @@ package com.moakiee.thunderbolt.ae2.mixin;
 
 import java.util.IdentityHashMap;
 import java.util.Map;
+import java.util.concurrent.TimeUnit;
 
 import org.jetbrains.annotations.Nullable;
 import org.spongepowered.asm.mixin.Mixin;
@@ -81,6 +82,24 @@ public abstract class CraftingCalculationMixin implements FastCraftingControl {
     private Map<ReusableStockUsageKey<AEKey>, Long>
             thunderbolt$cachedFullSimulationReusableStock = Map.of();
 
+    @Unique
+    private long thunderbolt$calculationStartedNanos;
+
+    @Unique
+    private int thunderbolt$attempts;
+
+    @Unique
+    private int thunderbolt$fastHandledAttempts;
+
+    @Unique
+    private int thunderbolt$fastFallbackAttempts;
+
+    @Unique
+    private int thunderbolt$cachedSimulationAttempts;
+
+    @Unique
+    private int thunderbolt$fastFailures;
+
     @Override
     public void ae2lt$setFastPlanningEnabled(boolean enabled) {
         this.ae2lt$fastPlanningInitialized = true;
@@ -90,6 +109,19 @@ public abstract class CraftingCalculationMixin implements FastCraftingControl {
     @Override
     public boolean ae2lt$isFastPlanningEnabled() {
         return this.ae2lt$fastPlanningInitialized && this.ae2lt$fastPlanningEnabled;
+    }
+
+    @Inject(method = "run", at = @At("HEAD"), remap = false)
+    private void thunderbolt$startCalculationTiming(CallbackInfoReturnable<ICraftingPlan> cir) {
+        thunderbolt$calculationStartedNanos = System.nanoTime();
+        thunderbolt$attempts = 0;
+        thunderbolt$fastHandledAttempts = 0;
+        thunderbolt$fastFallbackAttempts = 0;
+        thunderbolt$cachedSimulationAttempts = 0;
+        thunderbolt$fastFailures = 0;
+        ThunderboltCore.LOGGER.info(
+                "[Thunderbolt Core][crafting-timing] started: output={} requested={} fastEnabled={}",
+                output, requestedAmount, ae2lt$isFastPlanningEnabled());
     }
 
     @Inject(method = "run", at = @At("RETURN"), cancellable = true, remap = false)
@@ -103,17 +135,33 @@ public abstract class CraftingCalculationMixin implements FastCraftingControl {
         cir.setReturnValue(LoopCraftingPlan.wrapIfNeeded(result, usedReusableStock));
         reusableStockByAttempt.clear();
         thunderbolt$clearSimulationFallback();
+        long elapsedNanos = thunderbolt$calculationStartedNanos == 0L
+                ? 0L
+                : Math.max(0L, System.nanoTime() - thunderbolt$calculationStartedNanos);
+        double wallMs = TimeUnit.NANOSECONDS.toMicros(elapsedNanos) / 1_000.0D;
+        ThunderboltCore.LOGGER.info(
+                "[Thunderbolt Core][crafting-timing] finished: output={} requested={} wallMs={} "
+                        + "fastEnabled={} attempts={} fastHandled={} fastFallback={} cachedSimulation={} "
+                        + "fastFailures={} result={}",
+                output, requestedAmount, wallMs, ae2lt$isFastPlanningEnabled(), thunderbolt$attempts,
+                thunderbolt$fastHandledAttempts, thunderbolt$fastFallbackAttempts,
+                thunderbolt$cachedSimulationAttempts, thunderbolt$fastFailures,
+                result == null ? "null" : result.getClass().getSimpleName());
+        thunderbolt$calculationStartedNanos = 0L;
     }
 
     @Inject(method = "runCraftAttempt", at = @At("HEAD"), cancellable = true, remap = false)
     private void ae2ltCore$fastAttempt(boolean simulate, long amount,
                                        CallbackInfoReturnable<CraftingPlan> cir) {
+        thunderbolt$attempts++;
         if (!ae2lt$isFastPlanningEnabled()) {
             return;
         }
         if (simulate
                 && amount == requestedAmount
                 && thunderbolt$cachedFullSimulationPlan != null) {
+            thunderbolt$fastHandledAttempts++;
+            thunderbolt$cachedSimulationAttempts++;
             this.simulate = true;
             thunderbolt$getReusableStockByAttempt().put(
                     thunderbolt$cachedFullSimulationPlan,
@@ -124,6 +172,7 @@ public abstract class CraftingCalculationMixin implements FastCraftingControl {
         }
         var gridNode = simRequester.getGridNode();
         if (gridNode == null) {
+            thunderbolt$fastFallbackAttempts++;
             return;
         }
         var craftingService = gridNode.getGrid().getCraftingService();
@@ -136,6 +185,7 @@ public abstract class CraftingCalculationMixin implements FastCraftingControl {
                     simRequester instanceof com.moakiee.thunderbolt.ae2.crafting.ReservedStockCraftingRequester reserved
                             ? reserved : null);
             if (attempt.handled()) {
+                thunderbolt$fastHandledAttempts++;
                 // Reproduce the side effect of the real method body we are skipping, so that
                 // CraftingCalculation#isSimulation() reflects the attempt that produced this plan.
                 this.simulate = simulate;
@@ -150,8 +200,12 @@ public abstract class CraftingCalculationMixin implements FastCraftingControl {
                             attempt.plan(), attempt.usedReusableStock());
                 }
                 cir.setReturnValue(attempt.plan());
+            } else {
+                thunderbolt$fastFallbackAttempts++;
             }
         } catch (Throwable t) {
+            thunderbolt$fastFailures++;
+            thunderbolt$fastFallbackAttempts++;
             // Never let the optimization break a craft: fall back to AE2. Log at WARN with full context
             // so an unexpected fast-path failure is easy to pinpoint instead of silently degrading.
             ThunderboltCore.LOGGER.warn(

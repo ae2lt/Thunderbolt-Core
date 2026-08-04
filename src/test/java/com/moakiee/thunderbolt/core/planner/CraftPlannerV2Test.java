@@ -104,11 +104,16 @@ class CraftPlannerV2Test {
 
         CraftPlan<String> plan = CraftPlannerV2.plan(g, "A", 3);
 
-        assertTrue(plan.feasible(), "should backtrack from the shared recipe to the iron recipe");
-        assertEquals(3L, firingsOf(plan, r2));
-        assertEquals(0L, firingsOf(plan, r1));
-        assertEquals(3L, plan.usedStock().get("iron"));
-        assertNull(plan.usedStock().get("shared")); // the failed branch was fully rolled back
+        // The allocation search may now legitimately SPLIT demand across A's routes (e.g. 2 via the
+        // shared recipe + 1 via iron) instead of rolling the shared branch back wholesale; assert
+        // feasibility and mass balance rather than one specific route assignment.
+        assertTrue(plan.feasible(), "should recover via the iron recipe (fully or by splitting)");
+        long viaShared = firingsOf(plan, r1);
+        long viaIron = firingsOf(plan, r2);
+        assertEquals(3L, viaShared + viaIron);
+        assertEquals(2L * viaShared, plan.usedStock().getOrDefault("shared", 0L));
+        assertEquals(viaIron, (long) plan.usedStock().getOrDefault("iron", 0L));
+        assertTrue(plan.usedStock().getOrDefault("shared", 0L) <= 4);
         assertTrue(plan.missing().isEmpty());
     }
 
