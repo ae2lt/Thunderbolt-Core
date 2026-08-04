@@ -655,7 +655,7 @@ class CraftPlannerV2Test {
     }
 
     @Test
-    void fallbackBudgetBoundsSeedOrderedDiamondExpansion() {
+    void seedOrderedBoundaryDoesNotPoisonOrdinaryDiamondDescendants() {
         int depth = 26;
         ReusableStockSource source = new ReusableStockSource("host", "pool");
         CraftGraph.Builder<String> builder = CraftGraph.builder();
@@ -671,6 +671,43 @@ class CraftPlannerV2Test {
                     CraftInput.of("A" + (i + 1), 1),
                     CraftInput.of("B" + (i + 1), 1)));
         }
+        long leafStock = 1L << depth;
+        builder.stock("A" + depth, leafStock)
+                .stock("B" + depth, leafStock)
+                .reusableStock("host", "tool", 1)
+                .reusableStockRoute(source, "tool", List.of("tool"));
+
+        PlanningResult<String> planning = assertTimeoutPreemptively(
+                Duration.ofSeconds(2),
+                () -> CraftPlannerV2.planDetailed(builder.build(), "A0", 1, 1, 1));
+
+        assertTrue(planning.plan().feasible());
+        assertFalse(planning.plan().budgetExhausted());
+        assertTrue(planning.plan().missing().isEmpty());
+        assertFalse(planning.diagnostics().searchCutoff());
+        assertEquals(0, planning.diagnostics().consumedSearchBudget(),
+                "one deterministic seed boundary is resolution work, not route search");
+        assertEquals(1, planning.diagnostics().consumedResolutionBudget());
+        assertFalse(planning.diagnostics().fallbackCutoff());
+        assertEquals(0, planning.diagnostics().consumedFallbackBudget());
+        assertTrue(planning.plan().itemsProcessed() <= 4 * depth,
+                "ordinary descendants should be aggregated per boundary, got "
+                        + planning.plan().itemsProcessed());
+    }
+
+    @Test
+    void resolutionBudgetBoundsAllSeedOrderedDiamondWithoutChargingSearch() {
+        int depth = 18;
+        ReusableStockSource source = new ReusableStockSource("host", "pool");
+        CraftGraph.Builder<String> builder = CraftGraph.builder();
+        for (int i = 0; i < depth; i++) {
+            List<CraftInput<String>> inputs = List.of(
+                    CraftInput.of("A" + (i + 1), 1),
+                    CraftInput.of("B" + (i + 1), 1),
+                    CraftInput.returnedFrom("tool", 1, source));
+            builder.pattern("A" + i, 1, inputs);
+            builder.pattern("B" + i, 1, inputs);
+        }
         builder.stock("A" + depth, 1)
                 .stock("B" + depth, 1)
                 .reusableStock("host", "tool", 1)
@@ -682,11 +719,12 @@ class CraftPlannerV2Test {
 
         assertFalse(planning.plan().feasible());
         assertTrue(planning.plan().budgetExhausted());
-        assertTrue(planning.diagnostics().searchCutoff());
-        assertTrue(planning.diagnostics().fallbackCutoff());
+        assertEquals(0, planning.diagnostics().consumedSearchBudget());
+        assertFalse(planning.diagnostics().searchCutoff());
+        assertTrue(planning.diagnostics().resolutionCutoff());
         assertEquals(
-                planning.diagnostics().configuredFallbackBudget(),
-                planning.diagnostics().consumedFallbackBudget());
+                planning.diagnostics().configuredResolutionBudget(),
+                planning.diagnostics().consumedResolutionBudget());
     }
 
     @Test
@@ -1010,7 +1048,7 @@ class CraftPlannerV2Test {
     }
 
     @Test
-    void cutoffGreedyTailStillBuildsAContractedLoopSeed() {
+    void oneSearchCandidateStillBuildsAContractedLoopSeedWithoutFalseCutoff() {
         CraftPattern<String> seedFromA = new CraftPattern<>(
                 "seed", 1, List.of(CraftInput.of("A", 1)), "A_to_seed");
         CraftPattern<String> contracted = new CraftPattern<>(
@@ -1026,7 +1064,9 @@ class CraftPlannerV2Test {
 
         assertTrue(planning.plan().feasible());
         assertFalse(planning.plan().budgetExhausted());
-        assertTrue(planning.diagnostics().searchCutoff());
+        assertFalse(planning.diagnostics().searchCutoff(),
+                "using the one admitted candidate is not a budget cutoff");
+        assertEquals(1, planning.diagnostics().consumedSearchBudget());
         assertEquals(1L, firingsOf(planning.plan(), seedFromA));
         assertEquals(1_000L, firingsOf(planning.plan(), contracted));
     }
@@ -1940,7 +1980,7 @@ class CraftPlannerV2Test {
     }
 
     @Test
-    void anytimeReplayCutoffFinishesTheSelectedReplayGreedily() {
+    void anytimeReplayFinishesWithinBudgetWithoutFalseCutoff() {
         ReusableStockSource source = new ReusableStockSource("host", "pool");
         CraftPattern<String> xShared = new CraftPattern<>(
                 "X", 1, List.of(CraftInput.of("shared", 1)), "X-shared");
@@ -1973,7 +2013,8 @@ class CraftPlannerV2Test {
         assertEquals(1L, plan.usedStock().get("shared"));
         assertEquals(1L, plan.usedStock().get("special"));
         assertTrue(plan.missing().isEmpty());
-        assertTrue(planning.diagnostics().searchCutoff());
+        assertFalse(planning.diagnostics().searchCutoff(),
+                "a successful replay that fits the budget must not be reported as cut off");
         assertEquals(1, planning.diagnostics().compiledOrientations());
         assertTrue(planning.diagnostics().reusedCompilations() >= 1,
                 "route replay must reuse the compiled DAG/capacity/footprint data");
@@ -2252,6 +2293,46 @@ class CraftPlannerV2Test {
         assertEquals(4L, firingsOf(plan, viaX));
         assertEquals(6L, plan.usedStock().get("y"));
         assertEquals(4L, plan.usedStock().get("x"));
+        assertTrue(plan.missing().isEmpty());
+    }
+
+    /**
+     * One fuzzy B input expands to the concrete A1/A2 producer routes. Both routes share E, so a
+     * greedy all-A2 allocation makes only three B; the exact feasible split is 3 x A1 plus 1 x A2.
+     */
+    @Test
+    void linearPassSplitsFuzzyProducerRoutesAroundSharedStock() {
+        CraftPattern<String> bViaA1 = new CraftPattern<>(
+                "B", 1, List.of(CraftInput.of("A1", 1)), "B-via-A1");
+        CraftPattern<String> bViaA2 = new CraftPattern<>(
+                "B", 1, List.of(CraftInput.of("A2", 1)), "B-via-A2");
+        CraftPattern<String> makeA1 = new CraftPattern<>(
+                "A1", 1, List.of(CraftInput.of("C", 1), CraftInput.of("E", 1)), "make-A1");
+        CraftPattern<String> makeA2 = new CraftPattern<>(
+                "A2", 1, List.of(CraftInput.of("D", 1), CraftInput.of("E", 2)), "make-A2");
+        CraftGraph<String> graph = CraftGraph.<String>builder()
+                .pattern(bViaA1)
+                .pattern(bViaA2)
+                .pattern(makeA1)
+                .pattern(makeA2)
+                .stock("C", 3)
+                .stock("D", 4)
+                .stock("E", 5)
+                .build();
+
+        PlanningResult<String> planning = CraftPlannerV2.planDetailed(graph, "B", 4);
+        CraftPlan<String> plan = planning.plan();
+
+        assertTrue(plan.feasible());
+        assertEquals(3L, firingsOf(plan, bViaA1));
+        assertEquals(1L, firingsOf(plan, bViaA2));
+        assertEquals(3L, firingsOf(plan, makeA1));
+        assertEquals(1L, firingsOf(plan, makeA2));
+        assertEquals(3L, plan.usedStock().get("C"));
+        assertEquals(1L, plan.usedStock().get("D"));
+        assertEquals(5L, plan.usedStock().get("E"));
+        assertEquals(0, planning.diagnostics().consumedSearchBudget(),
+                "the capacity split is solved by the deterministic linear allocation pass");
         assertTrue(plan.missing().isEmpty());
     }
 

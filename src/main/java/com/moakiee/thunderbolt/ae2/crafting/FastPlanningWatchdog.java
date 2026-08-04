@@ -132,8 +132,10 @@ public final class FastPlanningWatchdog {
                 + ", contended=" + diagnostics.contendedOutputs()
                 + ", cuts=" + diagnostics.cycleCuts()
                 + ", seedOrdered=" + diagnostics.seedOrdered()
-                + ", budget=" + diagnostics.consumedSearchBudget() + "/"
+                + ", search=" + diagnostics.consumedSearchBudget() + "/"
                 + diagnostics.configuredSearchBudget()
+                + ", resolution=" + diagnostics.consumedResolutionBudget() + "/"
+                + diagnostics.configuredResolutionBudget()
                 + ", fallback=" + diagnostics.consumedFallbackBudget() + "/"
                 + diagnostics.configuredFallbackBudget()
                 + ", runs=" + diagnostics.planRuns()
@@ -144,7 +146,8 @@ public final class FastPlanningWatchdog {
                 + ", equivalentPruned=" + diagnostics.equivalentRoutesPruned()
                 + ", memoHits=" + diagnostics.failureMemoHits()
                 + ", frontierPeak=" + diagnostics.frontierPeak()
-                + ", cutoff=" + diagnostics.searchCutoff()
+                + ", cutoff(search/resolution/fallback)=" + diagnostics.searchCutoff()
+                + "/" + diagnostics.resolutionCutoff()
                 + "/" + diagnostics.fallbackCutoff()
                 + ", phasesMs=" + nanosToMillis(diagnostics.graphCompileNanos()) + "/"
                 + nanosToMillis(diagnostics.linearPassNanos()) + "/"
