@@ -1,0 +1,365 @@
+package com.moakiee.thunderbolt.core.planner;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+
+import java.time.Duration;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+
+import org.junit.jupiter.api.Test;
+
+class GenericLowWidthConflictSolverTest {
+
+    @Test
+    void sharedResourceSelectsConcreteMissingRoute() {
+        CraftPattern<String> viaA = new CraftPattern<>(
+                "D", 1, List.of(CraftInput.of("A", 1), CraftInput.of("C", 2)), "viaA");
+        CraftPattern<String> viaB = new CraftPattern<>(
+                "D", 1, List.of(CraftInput.of("B", 1), CraftInput.of("C", 1)), "viaB");
+        CraftGraph<String> graph = CraftGraph.<String>builder()
+                .pattern(viaA)
+                .pattern(viaB)
+                .build();
+
+        PlanningResult<String> result = CraftPlannerV2.planDetailed(graph, "D", 1);
+
+        assertFalse(result.plan().feasible());
+        assertEquals(Map.of("B", 1L, "C", 1L), result.plan().missing());
+        assertEquals(0, result.diagnostics().lowWidthAttempts(),
+                "one local fork keeps the established bounded-search semantics");
+        assertEquals(0, result.diagnostics().consumedFallbackBudget());
+    }
+
+    @Test
+    void aFeasiblePrivateRouteStillBeatsLowerSharedConsumption() {
+        CraftPattern<String> viaA = new CraftPattern<>(
+                "D", 1, List.of(CraftInput.of("A", 1), CraftInput.of("C", 2)), "viaA");
+        CraftPattern<String> viaB = new CraftPattern<>(
+                "D", 1, List.of(CraftInput.of("B", 1), CraftInput.of("C", 1)), "viaB");
+        CraftPlan<String> plan = CraftPlannerV2.plan(
+                CraftGraph.<String>builder()
+                        .pattern(viaA)
+                        .pattern(viaB)
+                        .stock("A", 1)
+                        .stock("C", 2)
+                        .build(),
+                "D",
+                1);
+
+        assertTrue(plan.feasible());
+        assertEquals(1L, plan.firings().getOrDefault(viaA, 0L));
+        assertEquals(0L, plan.firings().getOrDefault(viaB, 0L));
+    }
+
+    @Test
+    void starvedRenamedTwoRouteRecurrenceUsesSameWidthThreeProof() {
+        long amount = 1_000_000_000L;
+        PlanningResult<String> first = assertStarvedRecurrence("left-", 30, amount);
+        PlanningResult<String> renamed = assertStarvedRecurrence("renamed-", 30, amount);
+
+        assertEquals(baseMissing(first.plan(), "left-"), baseMissing(renamed.plan(), "renamed-"));
+        assertEquals(first.diagnostics().separatorWidthPeak(), renamed.diagnostics().separatorWidthPeak());
+        assertEquals(first.plan().itemsProcessed(), renamed.plan().itemsProcessed());
+    }
+
+    @Test
+    void longRequestWithPartialBaseInventoryStaysOnLinearPath() {
+        int depth = 30;
+        long amount = 1_000_000_000L;
+        CraftGraph.Builder<String> builder = twoRouteRecurrence("partial-", depth);
+        // The stable first route only reaches bases 1 and 2. This is deliberately partial by item
+        // type, while the quantities are large enough to prove work does not scale with Q.
+        builder.stock("partial-1", Sat.SAT).stock("partial-2", Sat.SAT);
+
+        PlanningResult<String> result = CraftPlannerV2.planDetailed(
+                builder.build(), "partial-" + (depth - 1), amount);
+
+        assertTrue(result.plan().feasible(), () -> "missing=" + result.plan().missing());
+        assertEquals(0, result.diagnostics().lowWidthAttempts());
+        assertEquals(0, result.diagnostics().consumedFallbackBudget());
+        assertEquals(1, result.diagnostics().planRuns());
+    }
+
+    @Test
+    void longMultiLevelRecurrenceUsesOneGenericIntegerFlowSolve() {
+        long amount = 1_000_000_000L;
+
+        PlanningResult<String> result = org.junit.jupiter.api.Assertions.assertTimeoutPreemptively(
+                Duration.ofSeconds(2), () -> CraftPlannerV2.planDetailed(
+                        twoRouteRecurrence("mixed-", 7)
+                                .stock("mixed-1", 2 * amount)
+                                .stock("mixed-2", 2 * amount)
+                                .build(),
+                        "mixed-6",
+                        amount));
+
+        assertTrue(result.plan().feasible(), () -> "missing=" + result.plan().missing());
+        assertEquals(3, result.plan().firings().size());
+        assertTrue(result.plan().firings().values().stream().allMatch(value -> value == amount));
+        assertEquals(3, result.diagnostics().separatorWidthPeak());
+        assertEquals(1, result.diagnostics().lowWidthSolved());
+        assertTrue(result.diagnostics().lowWidthIntegerNodes() <= 8);
+        assertEquals(0, result.diagnostics().dynamicCapacityEvaluations());
+        assertEquals(0, result.diagnostics().consumedFallbackBudget());
+    }
+
+    @Test
+    void coefficientVariantsUseTheSameWidthBoundAndCapacityProof() {
+        int[][] variants = {
+                {1, 2, 1, 1},
+                {2, 2, 1, 1},
+                {1, 1, 1, 2},
+                {1, 2, 2, 1}
+        };
+        long amount = 1_000_000_000L;
+
+        for (int variant = 0; variant < variants.length; variant++) {
+            int[] coefficients = variants[variant];
+            String prefix = "weighted-" + variant + "-";
+            PlanningResult<String> result = CraftPlannerV2.planDetailed(
+                    twoRouteRecurrence(prefix, 30, coefficients).build(),
+                    prefix + "29",
+                    amount);
+
+            assertFalse(result.plan().feasible());
+            assertTrue(result.plan().missing().keySet().stream()
+                    .allMatch(key -> key.equals(prefix + "0")
+                            || key.equals(prefix + "1")
+                            || key.equals(prefix + "2")));
+            assertEquals(3, result.diagnostics().separatorWidthPeak());
+            assertEquals(1, result.diagnostics().lowWidthInfeasible());
+            assertEquals(0, result.diagnostics().lowWidthAttempts());
+            assertEquals(0, result.diagnostics().consumedFallbackBudget());
+        }
+    }
+
+    @Test
+    void genericIntegerFlowRejectsDoubleCountedSharedCapacity() {
+        CraftPattern<String> viaShared = new CraftPattern<>(
+                "A", 1, List.of(CraftInput.of("B", 1), CraftInput.of("D", 1)), "viaShared");
+        CraftPattern<String> viaIron = new CraftPattern<>(
+                "A", 1, List.of(CraftInput.of("iron", 1)), "viaIron");
+        CraftPattern<String> targetViaA = new CraftPattern<>(
+                "target", 1, List.of(CraftInput.of("A", 1)), "targetViaA");
+        CraftPattern<String> targetViaDeadEnd = new CraftPattern<>(
+                "target", 1, List.of(CraftInput.of("dead", 1)), "targetViaDeadEnd");
+        CraftGraph<String> graph = CraftGraph.<String>builder()
+                .pattern(targetViaA)
+                .pattern(targetViaDeadEnd)
+                .pattern(viaShared)
+                .pattern(viaIron)
+                .pattern("B", 1, List.of(CraftInput.of("shared", 1)))
+                .pattern("D", 1, List.of(CraftInput.of("shared", 1)))
+                .stock("shared", 4)
+                .stock("iron", 3)
+                .build();
+
+        PlanningResult<String> result = CraftPlannerV2.planDetailed(graph, "target", 3);
+
+        assertTrue(result.plan().feasible(), () -> "missing=" + result.plan().missing());
+        assertEquals(0L, result.plan().firings().getOrDefault(viaShared, 0L));
+        assertEquals(3L, result.plan().firings().getOrDefault(viaIron, 0L));
+        assertEquals(3L, result.plan().firings().getOrDefault(targetViaA, 0L));
+        assertEquals(0L, result.plan().firings().getOrDefault(targetViaDeadEnd, 0L));
+        assertEquals(1, result.diagnostics().lowWidthSolved());
+        assertEquals(0, result.diagnostics().dynamicCapacityEvaluations());
+        assertTrue(result.diagnostics().lowWidthIntegerNodes() <= 8);
+    }
+
+    @Test
+    void ordinaryDagDoesNotCreateLowWidthIntegerWork() {
+        CraftGraph.Builder<String> builder = CraftGraph.builder();
+        int depth = 2_000;
+        for (int i = 0; i < depth; i++) {
+            builder.pattern("n" + i, 1, List.of(CraftInput.of("n" + (i + 1), 1)));
+        }
+        builder.stock("n" + depth, 1);
+
+        PlanningResult<String> result = CraftPlannerV2.planDetailed(builder.build(), "n0", 1);
+
+        assertTrue(result.plan().feasible());
+        assertEquals(0, result.diagnostics().lowWidthAttempts());
+        assertEquals(0, result.diagnostics().lowWidthIntegerNodes());
+    }
+
+    @Test
+    void globallyWideFrontierStillSolvesEveryIndependentNarrowComponent() {
+        CraftGraph.Builder<String> builder = CraftGraph.builder();
+        List<CraftInput<String>> roots = new ArrayList<>();
+        int componentCount = 11;
+        for (int component = 0; component < componentCount; component++) {
+            String prefix = "independent-" + component + "-";
+            appendTwoRouteRecurrence(builder, prefix, null, 7, new int[] {1, 1, 1, 1});
+            builder.stock(prefix + "1", 2).stock(prefix + "2", 2);
+            roots.add(CraftInput.of(prefix + "6", 1));
+        }
+        // A monolithic separator reaches 13 here: eleven roots plus the active recurrence frontier.
+        // Component-local measurement must remain three and solve every kernel independently.
+        builder.pattern("independent-root", 1, roots);
+
+        PlanningResult<String> result = CraftPlannerV2.planDetailed(
+                builder.build(), "independent-root", 1);
+
+        assertTrue(result.plan().feasible(), () -> "missing=" + result.plan().missing());
+        assertEquals(3, result.diagnostics().separatorWidthPeak());
+        assertEquals(componentCount, result.diagnostics().lowWidthAttempts());
+        assertEquals(componentCount, result.diagnostics().lowWidthSolved());
+        assertEquals(0, result.diagnostics().dynamicCapacityEvaluations());
+        assertEquals(0, result.diagnostics().consumedFallbackBudget());
+    }
+
+    @Test
+    void widthSixteenComponentDoesNotVetoTwoWidthEightSiblings() {
+        CraftGraph.Builder<String> builder = CraftGraph.builder();
+        List<CraftInput<String>> wideInputs = new ArrayList<>();
+        for (int i = 0; i < 15; i++) {
+            String raw = "wide-raw-" + i;
+            wideInputs.add(CraftInput.of(raw, 1));
+            builder.stock(raw, 1);
+        }
+        CraftPattern<String> wideFeasible = new CraftPattern<>(
+                "wide-top", 1, wideInputs, "wide-feasible");
+        CraftPattern<String> wideDead = new CraftPattern<>(
+                "wide-top", 1, List.of(CraftInput.of("wide-dead", 1)), "wide-dead");
+        builder.pattern(wideFeasible).pattern(wideDead);
+
+        appendWidthEightRecurrence(builder, "narrow-a-");
+        appendWidthEightRecurrence(builder, "narrow-b-");
+        builder.pattern("mixed-root", 1, List.of(
+                CraftInput.of("wide-top", 1),
+                CraftInput.of("narrow-a-6", 1),
+                CraftInput.of("narrow-b-6", 1)));
+
+        PlanningResult<String> result = CraftPlannerV2.planDetailed(
+                builder.build(), "mixed-root", 1);
+
+        assertTrue(result.plan().feasible(), () -> "missing=" + result.plan().missing());
+        assertEquals(16, result.diagnostics().separatorWidthPeak());
+        assertEquals(2, result.diagnostics().lowWidthAttempts());
+        assertEquals(2, result.diagnostics().lowWidthSolved());
+        assertEquals(1L, result.plan().firings().getOrDefault(wideFeasible, 0L));
+        assertEquals(0L, result.plan().firings().getOrDefault(wideDead, 0L));
+        assertEquals(0, result.diagnostics().consumedFallbackBudget());
+    }
+
+    @Test
+    void sharedInventoryRowsMergeDecisionConesBeforeSolving() {
+        CraftGraph.Builder<String> builder = CraftGraph.builder();
+        appendTwoRouteRecurrence(
+                builder, "merged-a-", "merged-base-", 7, new int[] {1, 1, 1, 1});
+        appendTwoRouteRecurrence(
+                builder, "merged-b-", "merged-base-", 7, new int[] {1, 1, 1, 1});
+        builder.stock("merged-base-1", 4).stock("merged-base-2", 4);
+        builder.pattern("merged-root", 1, List.of(
+                CraftInput.of("merged-a-6", 1), CraftInput.of("merged-b-6", 1)));
+
+        PlanningResult<String> result = CraftPlannerV2.planDetailed(
+                builder.build(), "merged-root", 1);
+
+        assertTrue(result.plan().feasible(), () -> "missing=" + result.plan().missing());
+        assertEquals(1, result.diagnostics().lowWidthAttempts(),
+                "shared base inventory is one coupled component, not two independent solves");
+        assertEquals(1, result.diagnostics().lowWidthSolved());
+        assertTrue(result.diagnostics().separatorWidthPeak() <= 12);
+    }
+
+    private static PlanningResult<String> assertStarvedRecurrence(
+            String prefix, int depth, long amount) {
+        return org.junit.jupiter.api.Assertions.assertTimeoutPreemptively(
+                Duration.ofSeconds(2), () -> {
+                    PlanningResult<String> result = CraftPlannerV2.planDetailed(
+                            twoRouteRecurrence(prefix, depth).build(),
+                            prefix + (depth - 1),
+                            amount);
+                    assertFalse(result.plan().feasible());
+                    assertFalse(result.plan().budgetExhausted());
+                    assertTrue(result.plan().missing().keySet().stream()
+                            .allMatch(key -> key.equals(prefix + "0")
+                                    || key.equals(prefix + "1")
+                                    || key.equals(prefix + "2")));
+                    assertEquals(3, result.diagnostics().separatorWidthPeak());
+                    assertEquals(1, result.diagnostics().lowWidthInfeasible());
+                    assertEquals(0, result.diagnostics().lowWidthAttempts());
+                    assertEquals(0, result.diagnostics().dynamicCapacityEvaluations());
+                    assertEquals(0, result.diagnostics().consumedFallbackBudget());
+                    return result;
+                });
+    }
+
+    private static CraftGraph.Builder<String> twoRouteRecurrence(String prefix, int depth) {
+        return twoRouteRecurrence(prefix, depth, new int[] {1, 1, 1, 1});
+    }
+
+    private static CraftGraph.Builder<String> twoRouteRecurrence(
+            String prefix, int depth, int[] coefficients) {
+        CraftGraph.Builder<String> builder = CraftGraph.builder();
+        appendTwoRouteRecurrence(builder, prefix, null, depth, coefficients);
+        return builder;
+    }
+
+    private static void appendTwoRouteRecurrence(
+            CraftGraph.Builder<String> builder,
+            String prefix,
+            String sharedBasePrefix,
+            int depth,
+            int[] coefficients) {
+        for (int i = 3; i < depth; i++) {
+            builder.pattern(new CraftPattern<>(
+                    recurrenceKey(prefix, sharedBasePrefix, i),
+                    1,
+                    List.of(
+                            CraftInput.of(
+                                    recurrenceKey(prefix, sharedBasePrefix, i - 1), coefficients[0]),
+                            CraftInput.of(
+                                    recurrenceKey(prefix, sharedBasePrefix, i - 2), coefficients[1])),
+                    "route-1-" + i));
+            builder.pattern(new CraftPattern<>(
+                    recurrenceKey(prefix, sharedBasePrefix, i),
+                    1,
+                    List.of(
+                            CraftInput.of(
+                                    recurrenceKey(prefix, sharedBasePrefix, i - 2), coefficients[2]),
+                            CraftInput.of(
+                                    recurrenceKey(prefix, sharedBasePrefix, i - 3), coefficients[3])),
+                    "route-2-" + i));
+        }
+    }
+
+    /** Width-three recurrence plus five live top-level leaves: stable separator width is eight. */
+    private static void appendWidthEightRecurrence(
+            CraftGraph.Builder<String> builder, String prefix) {
+        appendTwoRouteRecurrence(builder, prefix, null, 6, new int[] {1, 1, 1, 1});
+        List<CraftInput<String>> routeOne = new ArrayList<>();
+        List<CraftInput<String>> routeTwo = new ArrayList<>();
+        routeOne.add(CraftInput.of(prefix + "5", 1));
+        routeOne.add(CraftInput.of(prefix + "4", 1));
+        routeTwo.add(CraftInput.of(prefix + "4", 1));
+        routeTwo.add(CraftInput.of(prefix + "3", 1));
+        for (int i = 0; i < 5; i++) {
+            String padding = prefix + "padding-" + i;
+            routeOne.add(CraftInput.of(padding, 1));
+            routeTwo.add(CraftInput.of(padding, 1));
+            builder.stock(padding, 1);
+        }
+        builder.pattern(new CraftPattern<>(prefix + "6", 1, routeOne, "route-1-6"));
+        builder.pattern(new CraftPattern<>(prefix + "6", 1, routeTwo, "route-2-6"));
+        builder.stock(prefix + "1", 2).stock(prefix + "2", 2);
+    }
+
+    private static String recurrenceKey(String prefix, String sharedBasePrefix, int level) {
+        return sharedBasePrefix != null && level < 3
+                ? sharedBasePrefix + level
+                : prefix + level;
+    }
+
+    private static List<Long> baseMissing(CraftPlan<String> plan, String prefix) {
+        List<Long> result = new ArrayList<>(3);
+        for (int i = 0; i < 3; i++) {
+            result.add(plan.missing().getOrDefault(prefix + i, 0L));
+        }
+        return result;
+    }
+}

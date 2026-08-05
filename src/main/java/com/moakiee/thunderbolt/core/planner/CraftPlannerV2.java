@@ -70,6 +70,11 @@ public final class CraftPlannerV2<K> {
     private static final int MIN_SEARCH_WORK_BUDGET = 4_096;
     private static final int FALLBACK_WORK_PER_REACHABLE_UNIT = 64;
     private static final int MAX_FALLBACK_WORK_BUDGET = 262_144;
+    /** Generic exact-flow gate; ordinary and individually wide components skip dense solving. */
+    private static final int MAX_LOW_WIDTH_SEPARATOR = 12;
+    private static final int MAX_LOW_WIDTH_VARIABLES = 96;
+    private static final int MAX_LOW_WIDTH_CONSTRAINTS = 128;
+    private static final int MAX_LOW_WIDTH_INTEGER_NODES = 64;
 
     /**
      * Maximum number of alternate roots tried for a proven conservative conversion SCC. This is a
@@ -179,6 +184,9 @@ public final class CraftPlannerV2<K> {
     private final Map<K, Long> missing = new HashMap<>();     // unmet at raw leaves
     private final Map<K, Long> grossDemand = new HashMap<>(); // pre-extraction request totals (bytes)
     private final Map<CraftPattern<K>, Long> firings = new IdentityHashMap<>();
+    /** Exact component quotas retained when only an unresolved sibling reaches recursive fallback. */
+    private final Map<CraftPattern<K>, Long> fixedFiringQuota = new IdentityHashMap<>();
+    private final Set<K> fixedFallbackItems = new HashSet<>();
     /** Successful/committed contended decisions on the current trail, in execution order. */
     private final List<RouteDecision<K>> routeDecisions = new ArrayList<>();
     /** Decisions implicated in a later sibling's stock shortfall; these alone merit whole-plan replay. */
@@ -561,6 +569,8 @@ public final class CraftPlannerV2<K> {
         // The recursive path already has that execution order; the aggregate linear pass does not,
         // so using it here could let a positive macro output bootstrap its own seed algebraically.
         CraftPlan<K> linearDiagnosis = null;
+        Map<CraftPattern<K>, Long> fixedFirings = new IdentityHashMap<>();
+        Set<K> fixedItems = new HashSet<>();
         if (!requiresSeedOrderedPlanning) {
             // 1) Linear backbone (v2-memo-deps / v2-lazy-deduct): one topological aggregation pass,
             //    each item resolved exactly once = O(n + E). Reservation-based capacity gives O(1)
@@ -572,6 +582,52 @@ public final class CraftPlannerV2<K> {
                 return enforceCycleBootstrap(linear);
             }
             linearDiagnosis = linear;
+            LowWidthAnalysis<K> lowWidth = analyzeLowWidthComponents(
+                    order, target, amount, linearDiagnosis.firings());
+            if (lowWidth != null && lowWidth.optimisticTargetCapacity() < amount) {
+                // Sum-of-routes capacity deliberately double-counts shared stock, so falling below
+                // the request is a proof of infeasibility, not a heuristic. This turns a completely
+                // starved deep contention graph into one additional O(V+E) pass instead of recursive
+                // route enumeration, while preserving the linear pass's fully expanded leaf Missing.
+                diagnostics.recordLowWidthCapacityProof();
+                return enforceCycleBootstrap(linearDiagnosis);
+            }
+
+            if (lowWidth != null) {
+                for (LowWidthComponent<K> component : lowWidth.components()) {
+                    if (!component.exactSolverEligible()
+                            || !searchBudget.tryConsume(component.workCharge())) {
+                        continue;
+                    }
+                    diagnostics.recordLowWidthAttempt();
+                    LowWidthSolve<K> exact = solveLowWidthComponent(component);
+                    diagnostics.recordLowWidthResult(exact.status(), exact.integerNodes());
+                    if (exact.status() == BoundedIntegerLinearSolver.Status.INFEASIBLE) {
+                        // Components are joined whenever they share a decision dependency or an
+                        // inventory row. Therefore one component's fixed external demand cannot be
+                        // rescued by a sibling component, and this is a whole-request proof.
+                        return enforceCycleBootstrap(linearDiagnosis);
+                    }
+                    if (exact.firings() != null) {
+                        fixedFirings.putAll(exact.firings());
+                        fixedItems.addAll(component.items());
+                    }
+                }
+            }
+
+            if (!fixedItems.isEmpty()) {
+                // Replay the complete request once. Solved components use their exact firing vector;
+                // wide/cutoff components keep the ordinary dynamic-capacity allocation. This is the
+                // common fast path for a globally wide graph made from independent narrow kernels.
+                LinearPassState<K> pinned = linearPassState(
+                        order, target, amount, Map.of(), fixedFirings, fixedItems);
+                if (!pinned.fixedAllocationFailed() && pinned.miss().isEmpty()) {
+                    CraftPlan<K> exactHybrid = new CraftPlan<>(
+                            true, true, pinned.fired(), pinned.used(), Map.of(), Map.of(),
+                            pinned.gross(), pinned.done(), false);
+                    return enforceCycleBootstrap(exactHybrid);
+                }
+            }
             // 1b) Allocation repair: search over the contended outputs' route allocations only,
             //     each candidate evaluated by one O(E) sweep. The sweep is the same aggregation
             //     the linear backbone uses, so this applies exactly where the backbone's feasible
@@ -580,7 +636,8 @@ public final class CraftPlannerV2<K> {
             //     gain/feedback loops keep their compile-time bookkeeping. Unlike the recursive
             //     search this can SPLIT one product's demand across routes; the cycle-bootstrap
             //     check afterwards may still veto a plan, in which case the recursion runs.
-            CraftPlan<K> repaired = allocationRepair(order, target, amount);
+            CraftPlan<K> repaired = allocationRepair(
+                    order, target, amount, fixedFirings, fixedItems);
             if (repaired != null && repaired.feasible()) {
                 CraftPlan<K> bootstrapped = enforceCycleBootstrap(repaired);
                 if (bootstrapped.feasible()) {
@@ -590,6 +647,8 @@ public final class CraftPlannerV2<K> {
         }
 
         // 2) Contended cone only: fall back to the budgeted recursive search (trail + rollback).
+        fixedFiringQuota.putAll(fixedFirings);
+        fixedFallbackItems.addAll(fixedItems);
         for (K x : items) {
             stockLeft.put(x, graph.stock(x));
         }
@@ -1597,7 +1656,8 @@ public final class CraftPlannerV2<K> {
             Map<K, Long> miss,
             Map<K, Long> gross,
             Map<CraftPattern<K>, Long> allocatedUnits,
-            int done) {
+            int done,
+            boolean fixedAllocationFailed) {
     }
 
     /**
@@ -1611,8 +1671,18 @@ public final class CraftPlannerV2<K> {
      * rather than with root-to-leaf path counts. Returns {@code null} when repair gave up — the
      * recursive search then runs unchanged.
      */
-    private CraftPlan<K> allocationRepair(List<K> order, K target, long amount) {
-        int contended = preparedGraph.contendedOutputCount;
+    private CraftPlan<K> allocationRepair(
+            List<K> order,
+            K target,
+            long amount,
+            Map<CraftPattern<K>, Long> fixedFirings,
+            Set<K> fixedItems) {
+        int contended = 0;
+        for (K output : order) {
+            if (!fixedItems.contains(output) && isContendedOutput(output)) {
+                contended++;
+            }
+        }
         if (contended == 0) {
             return null; // nothing to reallocate; the plain pass already had the only answer
         }
@@ -1625,12 +1695,16 @@ public final class CraftPlannerV2<K> {
                 return null;
             }
             diagnostics.recordDynamicCapacityEvaluation();
-            LinearPassState<K> pass = linearPassState(order, target, amount, caps);
+            LinearPassState<K> pass = linearPassState(
+                    order, target, amount, caps, fixedFirings, fixedItems);
+            if (pass.fixedAllocationFailed()) {
+                return null;
+            }
             if (pass.miss().isEmpty()) {
                 return new CraftPlan<>(true, true, pass.fired(), pass.used(), Map.of(), Map.of(),
                         pass.gross(), pass.done(), false);
             }
-            if (!tightenBlamedRoute(pass, caps, ineffective)) {
+            if (!tightenBlamedRoute(pass, caps, ineffective, fixedItems)) {
                 return null;
             }
         }
@@ -1648,7 +1722,8 @@ public final class CraftPlannerV2<K> {
     private boolean tightenBlamedRoute(
             LinearPassState<K> pass,
             Map<CraftPattern<K>, Long> caps,
-            Set<CraftPattern<K>> ineffective) {
+            Set<CraftPattern<K>> ineffective,
+            Set<K> fixedItems) {
         K shortLeaf = null;
         long shortfall = 0L;
         for (Map.Entry<K, Long> entry : pass.miss().entrySet()) {
@@ -1697,7 +1772,10 @@ public final class CraftPlannerV2<K> {
                 if (share <= 0.0) {
                     continue;
                 }
-                if (isContendedOutput(r.output()) && !ineffective.contains(r) && share > blamedShare) {
+                if (!fixedItems.contains(r.output())
+                        && isContendedOutput(r.output())
+                        && !ineffective.contains(r)
+                        && share > blamedShare) {
                     blamed = r;
                     blamedShare = share;
                 }
@@ -1720,7 +1798,7 @@ public final class CraftPlannerV2<K> {
         Long existing = caps.get(blamed);
         if (existing != null && existing <= newCap) {
             ineffective.add(blamed);
-            return tightenBlamedRoute(pass, caps, ineffective);
+            return tightenBlamedRoute(pass, caps, ineffective, fixedItems);
         }
         caps.put(blamed, newCap);
         return true;
@@ -1732,6 +1810,263 @@ public final class CraftPlannerV2<K> {
     }
 
     /**
+     * Discovers independent normal-input conflict components in one topological sweep. Decision
+     * cones are unioned only when one contains another decision or both touch the same item row; a
+     * deterministic parent that merely requests two independent products does not join them. Thus
+     * width and dense-solver limits are local rather than properties of the whole AE2 network.
+     */
+    private LowWidthAnalysis<K> analyzeLowWidthComponents(
+            List<K> order,
+            K target,
+            long amount,
+            Map<CraftPattern<K>, Long> baselineFirings) {
+        if (preparedGraph.contendedOutputCount < 2
+                || requiresSeedOrderedPlanning
+                || !cutOutputs.isEmpty()) {
+            return null;
+        }
+
+        // The integer model is intentionally generic but only for ordinary single-output material
+        // flow. Stateful seeds, containers and byproducts retain their established ordered planner.
+        for (K output : order) {
+            for (CraftPattern<K> pattern : patternsByOutput.getOrDefault(output, List.of())) {
+                if (!pattern.byproducts().isEmpty()) {
+                    return null;
+                }
+                for (CraftInput<K> input : pattern.inputs()) {
+                    if (input.returned() || input.remainder() != null
+                            || input.reusableStockSource() != null) {
+                        return null;
+                    }
+                }
+            }
+        }
+
+        Map<K, Integer> decisionByOutput = new HashMap<>();
+        for (K output : order) {
+            if (isContendedOutput(output)) {
+                decisionByOutput.put(output, decisionByOutput.size());
+            }
+        }
+        // Preserve the old one-local-fork boundary. Once a request has multiple real decisions,
+        // however, each independent one-decision component may be solved on its own.
+        if (decisionByOutput.size() < 2) {
+            return null;
+        }
+
+        IntDisjointSet unions = new IntDisjointSet(decisionByOutput.size());
+        Map<K, Integer> ownerByItem = new HashMap<>(order.size() * 2);
+        for (K output : order) {
+            Integer owner = ownerByItem.get(output);
+            Integer decision = decisionByOutput.get(output);
+            if (decision != null) {
+                if (owner != null) {
+                    unions.union(owner, decision);
+                }
+                owner = decision;
+                ownerByItem.put(output, decision);
+            }
+            if (owner == null) {
+                continue;
+            }
+            for (CraftPattern<K> pattern : patternsByOutput.getOrDefault(output, List.of())) {
+                for (CraftInput<K> input : pattern.inputs()) {
+                    Integer existing = ownerByItem.putIfAbsent(input.key(), owner);
+                    if (existing != null) {
+                        unions.union(owner, existing);
+                    }
+                }
+            }
+        }
+
+        Map<K, Integer> componentByItem = new HashMap<>(ownerByItem.size() * 2);
+        Map<Integer, List<K>> itemsByComponent = new HashMap<>();
+        List<Integer> componentOrder = new ArrayList<>();
+        Set<Integer> seenComponents = new HashSet<>();
+        for (K item : order) {
+            Integer owner = ownerByItem.get(item);
+            if (owner == null) {
+                continue;
+            }
+            int component = unions.find(owner);
+            componentByItem.put(item, component);
+            itemsByComponent.computeIfAbsent(component, ignored -> new ArrayList<>()).add(item);
+            if (seenComponents.add(component)) {
+                componentOrder.add(component);
+            }
+        }
+
+        Map<Integer, List<CraftPattern<K>>> patternsByComponent = new HashMap<>();
+        Map<Integer, Long> inputsByComponent = new HashMap<>();
+        for (Map.Entry<Integer, List<K>> entry : itemsByComponent.entrySet()) {
+            List<CraftPattern<K>> componentPatterns = new ArrayList<>();
+            long inputCount = 0L;
+            for (K output : entry.getValue()) {
+                List<CraftPattern<K>> outputPatterns =
+                        patternsByOutput.getOrDefault(output, List.of());
+                componentPatterns.addAll(outputPatterns);
+                for (CraftPattern<K> pattern : outputPatterns) {
+                    inputCount = Math.min(
+                            Integer.MAX_VALUE, inputCount + pattern.inputs().size());
+                }
+            }
+            patternsByComponent.put(entry.getKey(), componentPatterns);
+            inputsByComponent.put(entry.getKey(), inputCount);
+        }
+
+        // Firings outside a component are deterministic prefix work. Their consumption, plus the
+        // requested target when it belongs to the component, is the component's fixed boundary load.
+        Map<Integer, Map<K, Long>> externalByComponent = new HashMap<>();
+        Integer targetComponent = componentByItem.get(target);
+        if (targetComponent != null) {
+            externalByComponent.computeIfAbsent(targetComponent, ignored -> new HashMap<>())
+                    .merge(target, amount, Sat::add);
+        }
+        for (Map.Entry<CraftPattern<K>, Long> firing : baselineFirings.entrySet()) {
+            if (firing.getValue() <= 0) {
+                continue;
+            }
+            Integer outputComponent = componentByItem.get(firing.getKey().output());
+            for (CraftInput<K> input : firing.getKey().inputs()) {
+                Integer inputComponent = componentByItem.get(input.key());
+                if (inputComponent != null && !inputComponent.equals(outputComponent)) {
+                    externalByComponent.computeIfAbsent(inputComponent, ignored -> new HashMap<>())
+                            .merge(input.key(), input.unitsFor(firing.getValue()), Sat::add);
+                }
+            }
+        }
+
+        List<LowWidthComponent<K>> components = new ArrayList<>(componentOrder.size());
+        for (int component : componentOrder) {
+            List<K> items = itemsByComponent.get(component);
+            List<CraftPattern<K>> patterns = patternsByComponent.get(component);
+            Set<K> boundary = new HashSet<>();
+            int width = 0;
+            for (K output : items) {
+                boundary.remove(output);
+                for (CraftPattern<K> pattern
+                        : patternsByOutput.getOrDefault(output, List.of())) {
+                    for (CraftInput<K> input : pattern.inputs()) {
+                        if (Integer.valueOf(component).equals(componentByItem.get(input.key()))) {
+                            boundary.add(input.key());
+                        }
+                    }
+                }
+                width = Math.max(width, boundary.size());
+            }
+            diagnostics.recordSeparatorWidth(width);
+
+            boolean exactEligible = !patterns.isEmpty()
+                    && width <= MAX_LOW_WIDTH_SEPARATOR
+                    && patterns.size() <= MAX_LOW_WIDTH_VARIABLES
+                    && items.size() <= MAX_LOW_WIDTH_CONSTRAINTS;
+            long inputCount = inputsByComponent.getOrDefault(component, 0L);
+            long denseCells = (long) items.size() * patterns.size();
+            int workCharge = (int) Math.min(
+                    Integer.MAX_VALUE,
+                    Math.max(
+                            1L,
+                            (long) items.size() + patterns.size() + inputCount + denseCells));
+            components.add(new LowWidthComponent<>(
+                    List.copyOf(items),
+                    List.copyOf(patterns),
+                    Map.copyOf(externalByComponent.getOrDefault(component, Map.of())),
+                    width,
+                    exactEligible,
+                    workCharge));
+        }
+
+        return new LowWidthAnalysis<>(
+                List.copyOf(components), optimisticTargetCapacity(order, target));
+    }
+
+    /** Safe route-summing upper bound; shared stock is deliberately counted more than once. */
+    private long optimisticTargetCapacity(List<K> order, K target) {
+        Map<K, Long> optimistic = new HashMap<>(order.size() * 2);
+        for (int i = order.size() - 1; i >= 0; i--) {
+            K output = order.get(i);
+            long total = graph.stock(output);
+            for (CraftPattern<K> pattern : patternsByOutput.getOrDefault(output, List.of())) {
+                long firings = Sat.SAT;
+                for (CraftInput<K> input : pattern.inputs()) {
+                    firings = Math.min(
+                            firings,
+                            optimistic.getOrDefault(input.key(), graph.stock(input.key()))
+                                    / input.amount());
+                    if (firings == 0) {
+                        break;
+                    }
+                }
+                total = Sat.add(total, Sat.mul(firings, pattern.outputAmount()));
+            }
+            optimistic.put(output, total);
+        }
+        return optimistic.getOrDefault(target, graph.stock(target));
+    }
+
+    private LowWidthSolve<K> solveLowWidthComponent(LowWidthComponent<K> model) {
+        int variableCount = model.patterns().size();
+        Map<K, Integer> rowByItem = new HashMap<>(model.items().size() * 2);
+        for (int row = 0; row < model.items().size(); row++) {
+            rowByItem.put(model.items().get(row), row);
+        }
+        long[][] coefficients = new long[model.items().size()][variableCount];
+        try {
+            for (int variable = 0; variable < variableCount; variable++) {
+                CraftPattern<K> pattern = model.patterns().get(variable);
+                Integer outputRow = rowByItem.get(pattern.output());
+                if (outputRow == null) {
+                    return LowWidthSolve.unsupported();
+                }
+                coefficients[outputRow][variable] = Math.addExact(
+                        coefficients[outputRow][variable], pattern.outputAmount());
+                for (CraftInput<K> input : pattern.inputs()) {
+                    Integer inputRow = rowByItem.get(input.key());
+                    if (inputRow == null) {
+                        return LowWidthSolve.unsupported();
+                    }
+                    coefficients[inputRow][variable] = Math.subtractExact(
+                            coefficients[inputRow][variable], input.amount());
+                }
+            }
+        } catch (ArithmeticException ignored) {
+            return LowWidthSolve.unsupported();
+        }
+
+        List<BoundedIntegerLinearSolver.Constraint> constraints =
+                new ArrayList<>(model.items().size());
+        for (int row = 0; row < model.items().size(); row++) {
+            K item = model.items().get(row);
+            long external = model.externalDemand().getOrDefault(item, 0L);
+            long minimum;
+            try {
+                minimum = Math.subtractExact(external, graph.stock(item));
+            } catch (ArithmeticException ignored) {
+                return LowWidthSolve.unsupported();
+            }
+            constraints.add(new BoundedIntegerLinearSolver.Constraint(
+                    coefficients[row], minimum));
+        }
+
+        int nodeBudget = Math.min(
+                MAX_LOW_WIDTH_INTEGER_NODES,
+                Math.max(16, 2 * variableCount + 4 * model.separatorWidth()));
+        BoundedIntegerLinearSolver.Result result = BoundedIntegerLinearSolver.solve(
+                variableCount, constraints, Sat.SAT, nodeBudget);
+        if (!result.solved()) {
+            return new LowWidthSolve<>(result.status(), null, result.visitedNodes());
+        }
+        Map<CraftPattern<K>, Long> fired = new IdentityHashMap<>();
+        long[] values = result.values();
+        for (int i = 0; i < values.length; i++) {
+            if (values[i] > 0L) {
+                fired.put(model.patterns().get(i), values[i]);
+            }
+        }
+        return new LowWidthSolve<>(result.status(), fired, result.visitedNodes());
+    }
+
+    /**
      * One topological aggregation sweep. {@code capUnits} (possibly empty) bounds how many units of
      * its own output each pattern may be allocated; the bound is soft — demand nobody has capacity
      * or cap room for is still pushed down the primary recipe so shortfalls always surface at raw
@@ -1739,6 +2074,16 @@ public final class CraftPlannerV2<K> {
      */
     private LinearPassState<K> linearPassState(
             List<K> order, K target, long amount, Map<CraftPattern<K>, Long> capUnits) {
+        return linearPassState(order, target, amount, capUnits, Map.of(), Set.of());
+    }
+
+    private LinearPassState<K> linearPassState(
+            List<K> order,
+            K target,
+            long amount,
+            Map<CraftPattern<K>, Long> capUnits,
+            Map<CraftPattern<K>, Long> fixedFirings,
+            Set<K> fixedItems) {
         Map<K, Long> need = new HashMap<>();
         Map<K, Long> bp = new HashMap<>();       // byproduct / surplus pool
         Map<K, Long> stockL = new HashMap<>();   // remaining inventory
@@ -1752,6 +2097,7 @@ public final class CraftPlannerV2<K> {
         Map<CraftPattern<K>, Long> allocatedUnits = new IdentityHashMap<>();
         need.put(target, amount);
         int done = 0;
+        boolean fixedAllocationFailed = false;
 
         for (K x : order) {
             long d = need.getOrDefault(x, 0L);
@@ -1776,6 +2122,24 @@ public final class CraftPlannerV2<K> {
                 continue;
             }
 
+            if (fixedItems.contains(x)) {
+                long unmet = allocateFixedLinear(
+                        x,
+                        d,
+                        patternsByOutput.getOrDefault(x, List.of()),
+                        need,
+                        bp,
+                        returnedSeedReserve,
+                        fired,
+                        allocatedUnits,
+                        fixedFirings);
+                if (unmet > 0) {
+                    miss.merge(x, unmet, Sat::add);
+                    fixedAllocationFailed = true;
+                }
+                continue;
+            }
+
             List<CraftPattern<K>> ps = patternsByOutput.getOrDefault(x, List.of());
             if (ps.isEmpty()) {
                 miss.merge(x, d, Sat::add);
@@ -1784,7 +2148,42 @@ public final class CraftPlannerV2<K> {
             allocateLinear(x, d, ps, need, bp, returnedSeedReserve, fired, capUnits, allocatedUnits);
         }
 
-        return new LinearPassState<>(need, fired, used, miss, gross, allocatedUnits, done);
+        return new LinearPassState<>(
+                need, fired, used, miss, gross, allocatedUnits, done, fixedAllocationFailed);
+    }
+
+    /** Replays one solved component's integer firing vector without reopening its route choices. */
+    private long allocateFixedLinear(
+            K output,
+            long demand,
+            List<CraftPattern<K>> patterns,
+            Map<K, Long> need,
+            Map<K, Long> bp,
+            Map<K, Long> returnedSeedReserve,
+            Map<CraftPattern<K>, Long> fired,
+            Map<CraftPattern<K>, Long> allocatedUnits,
+            Map<CraftPattern<K>, Long> fixedFirings) {
+        long remaining = demand;
+        for (CraftPattern<K> pattern : patterns) {
+            long times = fixedFirings.getOrDefault(pattern, 0L);
+            if (times <= 0L) {
+                continue;
+            }
+            long produced = Sat.mul(times, pattern.outputAmount());
+            long consumed = Math.min(remaining, produced);
+            allocatedUnits.merge(pattern, consumed, Sat::add);
+            fireLinear(
+                    output,
+                    pattern,
+                    times,
+                    consumed,
+                    need,
+                    bp,
+                    returnedSeedReserve,
+                    fired);
+            remaining -= consumed;
+        }
+        return remaining;
     }
 
     /** Split {@code d} of {@code x} across recipes by current remaining capacity (dynamic balance). */
@@ -1817,13 +2216,88 @@ public final class CraftPlannerV2<K> {
             d -= consumed;
         }
         // Leftover nobody had capacity for: push demand down the primary recipe; the deficit surfaces
-        // at the raw leaves (same optimistic behaviour as AE2's simulation).
+        // at the raw leaves. When sibling routes share a direct constrained input, prefer a route
+        // that is component-wise no worse on those shared inputs. Route-private inputs affect
+        // capacity above, but are not mixed into this diagnostic comparison.
         if (d > 0) {
-            CraftPattern<K> r0 = ps.get(0);
+            CraftPattern<K> r0 = diagnosticRoute(d, ordered, need);
             long t = Sat.ceilDiv(d, r0.outputAmount());
             allocatedUnits.merge(r0, d, Sat::add);
             fireLinear(x, r0, t, d, need, bp, returnedSeedReserve, fired);
         }
+    }
+
+    private CraftPattern<K> diagnosticRoute(
+            long demand, List<CraftPattern<K>> ordered, Map<K, Long> need) {
+        if (ordered.size() <= 1) {
+            return ordered.get(0);
+        }
+        Map<K, Integer> routeCounts = new HashMap<>();
+        for (CraftPattern<K> pattern : ordered) {
+            Set<K> seen = new HashSet<>();
+            for (CraftInput<K> input : pattern.inputs()) {
+                if (!input.returned() && seen.add(input.key())) {
+                    routeCounts.merge(input.key(), 1, Integer::sum);
+                }
+            }
+        }
+        Set<K> shared = new HashSet<>();
+        routeCounts.forEach((key, count) -> {
+            if (count > 1) {
+                shared.add(key);
+            }
+        });
+        if (shared.isEmpty()) {
+            return ordered.get(0);
+        }
+
+        CraftPattern<K> best = ordered.get(0);
+        for (int i = 1; i < ordered.size(); i++) {
+            CraftPattern<K> candidate = ordered.get(i);
+            if (projectedSharedBetter(candidate, best, demand, need, shared)) {
+                best = candidate;
+            }
+        }
+        return best;
+    }
+
+    private boolean projectedSharedBetter(
+            CraftPattern<K> candidate,
+            CraftPattern<K> current,
+            long demand,
+            Map<K, Long> need,
+            Set<K> shared) {
+        boolean strict = false;
+        for (K key : shared) {
+            long available = Math.max(
+                    0L,
+                    capacity.getOrDefault(key, graph.stock(key)) - need.getOrDefault(key, 0L));
+            long candidateUnits = routeInputUnits(candidate, key, demand);
+            long currentUnits = routeInputUnits(current, key, demand);
+            long candidateMissing = Math.max(0L, candidateUnits - available);
+            long currentMissing = Math.max(0L, currentUnits - available);
+            if (candidateMissing > currentMissing
+                    || (candidateMissing == currentMissing && candidateUnits > currentUnits)) {
+                return false;
+            }
+            if (candidateMissing < currentMissing
+                    || (candidateMissing == currentMissing && candidateUnits < currentUnits)) {
+                strict = true;
+            }
+        }
+        return strict;
+    }
+
+    private static <K> long routeInputUnits(
+            CraftPattern<K> pattern, K key, long outputDemand) {
+        long firings = Sat.ceilDiv(outputDemand, pattern.outputAmount());
+        long total = 0L;
+        for (CraftInput<K> input : pattern.inputs()) {
+            if (!input.returned() && input.key().equals(key)) {
+                total = Sat.add(total, input.unitsFor(firings));
+            }
+        }
+        return total;
     }
 
     private void fireLinear(K x, CraftPattern<K> r, long t, long consumedOwn,
@@ -1892,6 +2366,10 @@ public final class CraftPlannerV2<K> {
         d -= drawPools(x, d);
         if (d <= 0) {
             return 0;
+        }
+
+        if (fixedFallbackItems.contains(x)) {
+            return obtainFixedComponent(x, d, commitFailure);
         }
 
         // This is a branch-local safety guard. Report only the unstocked remainder as missing so the
@@ -1997,6 +2475,44 @@ public final class CraftPlannerV2<K> {
         }
         // Root/final route: commit the highest-capacity one and record its concrete missing leaves.
         return commitBestEffort(distinctBranches, x, d);
+    }
+
+    /**
+     * Recursive counterpart of the pinned linear replay. It consumes only the remaining firing
+     * quotas proven for this independent exact component, so search in a wide sibling cannot reopen
+     * or overwrite the component's route allocation. Quota writes use the ordinary trail and are
+     * therefore rollback-safe if an unresolved ancestor is speculative.
+     */
+    private long obtainFixedComponent(K output, long demand, boolean commitFailure) {
+        if (processed < Integer.MAX_VALUE) {
+            processed++;
+        }
+        long remaining = demand;
+        long inputUnmet = 0L;
+        for (CraftPattern<K> pattern
+                : patternsByOutput.getOrDefault(output, List.of())) {
+            long quota = get(fixedFiringQuota, pattern);
+            if (quota <= 0L || remaining <= 0L) {
+                continue;
+            }
+            long times = Math.min(quota, Sat.ceilDiv(remaining, pattern.outputAmount()));
+            long produced = Sat.mul(times, pattern.outputAmount());
+            long requested = Math.min(remaining, produced);
+            put(fixedFiringQuota, pattern, quota - times);
+            long unmet = fire(output, pattern, requested, !commitFailure);
+            inputUnmet = Sat.add(inputUnmet, unmet);
+            remaining -= requested;
+            if (!commitFailure && unmet > 0L) {
+                return Sat.add(inputUnmet, remaining);
+            }
+        }
+        if (remaining > 0L) {
+            if (commitFailure) {
+                addMissing(output, remaining);
+            }
+            inputUnmet = Sat.add(inputUnmet, remaining);
+        }
+        return inputUnmet;
     }
 
     /**
@@ -2325,8 +2841,9 @@ public final class CraftPlannerV2<K> {
     }
 
     private long commitBestEffort(List<CraftPattern<K>> ps, K x, long d) {
-        recordRouteDecision(x, ps.get(0), ps);
-        return fire(x, ps.get(0), d, false);
+        CraftPattern<K> selected = diagnosticRoute(d, ps, Map.of());
+        recordRouteDecision(x, selected, ps);
+        return fire(x, selected, d, false);
     }
 
     /**
@@ -2999,7 +3516,8 @@ public final class CraftPlannerV2<K> {
                 || map == reusableBorrowedDemand
                 || map == reusablePrivatePool
                 || map == reusablePool
-                || map == pinnedExactReusableStock;
+                || map == pinnedExactReusableStock
+                || map == fixedFiringQuota;
     }
 
     private <T> void bump(Map<T, Long> m, T k, long delta) {
@@ -3133,6 +3651,35 @@ public final class CraftPlannerV2<K> {
     private record EnqueueResult(long sequence, boolean truncated) {
     }
 
+    private record LowWidthAnalysis<K>(
+            List<LowWidthComponent<K>> components,
+            long optimisticTargetCapacity) {
+    }
+
+    private record LowWidthComponent<K>(
+            List<K> items,
+            List<CraftPattern<K>> patterns,
+            Map<K, Long> externalDemand,
+            int separatorWidth,
+            boolean exactSolverEligible,
+            int workCharge) {
+    }
+
+    private record LowWidthSolve<K>(
+            BoundedIntegerLinearSolver.Status status,
+            Map<CraftPattern<K>, Long> firings,
+            int integerNodes) {
+
+        private static <K> LowWidthSolve<K> unsupported() {
+            return unsupported(0);
+        }
+
+        private static <K> LowWidthSolve<K> unsupported(int nodes) {
+            return new LowWidthSolve<>(
+                    BoundedIntegerLinearSolver.Status.INVALID_INPUT, null, nodes);
+        }
+    }
+
     private record VariantKey<K>(
             List<K> priorityRoots, Map<K, CraftPattern<K>> routePreferences) {
     }
@@ -3234,6 +3781,12 @@ public final class CraftPlannerV2<K> {
         private int equivalentRoutesPruned;
         private int failureMemoHits;
         private int frontierPeak;
+        private int separatorWidthPeak;
+        private int lowWidthAttempts;
+        private int lowWidthSolved;
+        private int lowWidthInfeasible;
+        private int lowWidthCutoffs;
+        private int lowWidthIntegerNodes;
         private boolean searchCutoff;
         private int consumedResolutionBudget;
         private boolean resolutionCutoff;
@@ -3291,6 +3844,31 @@ public final class CraftPlannerV2<K> {
 
         private void recordFrontierSize(int size) {
             frontierPeak = Math.max(frontierPeak, size);
+        }
+
+        private void recordSeparatorWidth(int width) {
+            separatorWidthPeak = Math.max(separatorWidthPeak, Math.max(0, width));
+        }
+
+        private void recordLowWidthAttempt() {
+            lowWidthAttempts = increment(lowWidthAttempts);
+        }
+
+        private void recordLowWidthResult(
+                BoundedIntegerLinearSolver.Status status, int integerNodes) {
+            lowWidthIntegerNodes = add(lowWidthIntegerNodes, Math.max(0, integerNodes));
+            switch (status) {
+                case SOLVED -> lowWidthSolved = increment(lowWidthSolved);
+                case INFEASIBLE -> lowWidthInfeasible = increment(lowWidthInfeasible);
+                case BUDGET_EXHAUSTED -> lowWidthCutoffs = increment(lowWidthCutoffs);
+                default -> {
+                    // Unsupported/overflow/internal results simply retain the ordinary fallback.
+                }
+            }
+        }
+
+        private void recordLowWidthCapacityProof() {
+            lowWidthInfeasible = increment(lowWidthInfeasible);
         }
 
         private void recordSearchCutoff() {
@@ -3356,7 +3934,13 @@ public final class CraftPlannerV2<K> {
                     graphCompileNanos,
                     linearPassNanos,
                     searchNanos,
-                    Math.max(0L, System.nanoTime() - started));
+                    Math.max(0L, System.nanoTime() - started),
+                    separatorWidthPeak,
+                    lowWidthAttempts,
+                    lowWidthSolved,
+                    lowWidthInfeasible,
+                    lowWidthCutoffs,
+                    lowWidthIntegerNodes);
         }
 
         private static int increment(int value) {
@@ -3459,6 +4043,49 @@ public final class CraftPlannerV2<K> {
                     owner.storageScope(),
                     owner.poolScope(),
                     new ReusableBootstrapRoute<>(owner.routingScope(), seedInput.key()));
+        }
+    }
+
+    /** Tiny union-find used only during the O(V+E) conflict-component discovery pass. */
+    private static final class IntDisjointSet {
+        private final int[] parent;
+        private final byte[] rank;
+
+        private IntDisjointSet(int size) {
+            parent = new int[size];
+            rank = new byte[size];
+            for (int i = 0; i < size; i++) {
+                parent[i] = i;
+            }
+        }
+
+        private int find(int value) {
+            int root = value;
+            while (parent[root] != root) {
+                root = parent[root];
+            }
+            while (parent[value] != value) {
+                int next = parent[value];
+                parent[value] = root;
+                value = next;
+            }
+            return root;
+        }
+
+        private void union(int left, int right) {
+            int leftRoot = find(left);
+            int rightRoot = find(right);
+            if (leftRoot == rightRoot) {
+                return;
+            }
+            if (rank[leftRoot] < rank[rightRoot]) {
+                parent[leftRoot] = rightRoot;
+            } else if (rank[leftRoot] > rank[rightRoot]) {
+                parent[rightRoot] = leftRoot;
+            } else {
+                parent[rightRoot] = leftRoot;
+                rank[leftRoot]++;
+            }
         }
     }
 
