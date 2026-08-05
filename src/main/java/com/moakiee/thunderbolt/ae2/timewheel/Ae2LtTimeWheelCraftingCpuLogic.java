@@ -139,6 +139,8 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
     private final KeyCounter seedReturnQuota = new KeyCounter();
     private final KeyCounter retainedFinalOutputs = new KeyCounter();
     private final KeyCounter pendingRequesterOutputs = new KeyCounter();
+    private final PendingRequesterOutputWarning pendingRequesterOutputWarning =
+            new PendingRequesterOutputWarning();
     private final LoopSeedLedgerBook loopSeedLedgers = new LoopSeedLedgerBook();
 
     @Nullable
@@ -279,6 +281,7 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
         seedReturnQuota.clear();
         retainedFinalOutputs.clear();
         pendingRequesterOutputs.clear();
+        pendingRequesterOutputWarning.reset();
         for (var entry : seedRequirements) {
             seedReturnQuota.add(entry.getKey(), entry.getLongValue());
         }
@@ -1297,6 +1300,7 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
         seedReturnQuotaFinalized = false;
         retainedFinalOutputs.clear();
         pendingRequesterOutputs.clear();
+        pendingRequesterOutputWarning.reset();
         clearLoopSeedState();
         patternPowerCache.clear();
         clearTaskWheel();
@@ -1367,6 +1371,7 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
         OverloadCpuStateManager.INSTANCE.clear(this);
         seedReturnQuota.clear();
         pendingRequesterOutputs.clear();
+        pendingRequesterOutputWarning.reset();
         seedReturnQuotaFinalized = false;
         clearLoopSeedState();
         clearTaskWheel();
@@ -1587,10 +1592,14 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
     private void flushPendingRequesterOutputs(TimeWheelJob activeJob) {
         if (activeJob == null || activeJob.link.isStandalone()
                 || activeJob.softCancelling) {
+            pendingRequesterOutputWarning.reset();
             return;
         }
         capPendingRequesterOutputsToRemaining(activeJob.remainingAmount, null);
-        if (pendingRequesterOutputs.isEmpty()) return;
+        if (pendingRequesterOutputs.isEmpty()) {
+            pendingRequesterOutputWarning.reset();
+            return;
+        }
 
         var pending = new ArrayList<GenericStack>();
         for (var entry : pendingRequesterOutputs) {
@@ -1635,7 +1644,8 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
             }
         }
 
-        if (!pendingRequesterOutputs.isEmpty()) {
+        if (pendingRequesterOutputWarning.update(
+                TickHandler.instance().getCurrentTick(), !pendingRequesterOutputs.isEmpty())) {
             cantStoreItems = true;
         }
     }
@@ -1867,6 +1877,7 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
         seedReturnQuota.clear();
         retainedFinalOutputs.clear();
         pendingRequesterOutputs.clear();
+        pendingRequesterOutputWarning.reset();
         seedReturnQuotaFinalized = data.getBoolean(TAG_SEED_RETURN_QUOTA_FINALIZED);
         clearLoopSeedState();
         if (data.contains(TAG_SEED_RETURN_QUOTA, Tag.TAG_LIST)) {
