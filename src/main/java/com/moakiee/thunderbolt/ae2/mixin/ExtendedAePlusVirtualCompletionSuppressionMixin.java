@@ -17,7 +17,9 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
  * this guard, ExtendedAE Plus can complete an unrelated vanilla or AdvancedAE CPU using the same
  * pattern before the provider call returns.
  */
-@Mixin(value = PatternProviderLogic.class, priority = 800, remap = false)
+// EAEP adds both eap$compat* methods from a priority-500 mixin. This mixin must run afterwards so
+// those synthetic target methods already exist when Mixin resolves the injections.
+@Mixin(value = PatternProviderLogic.class, priority = 400, remap = false)
 public abstract class ExtendedAePlusVirtualCompletionSuppressionMixin {
     @Dynamic("Added to PatternProviderLogic by ExtendedAE Plus")
     @Inject(
