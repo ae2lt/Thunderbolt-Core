@@ -40,7 +40,7 @@ server.
 .\gradlew.bat publishToMavenLocal
 ```
 
-Maven coordinate: `com.moakiee.thunderbolt:thunderbolt:1.0.1`.
+Maven coordinate: `com.moakiee.thunderbolt:thunderbolt:1.0.2`.
 
 Issues: [GitHub Issues](https://github.com/ae2lt/Thunderbolt-Core/issues) ·
 License: [GNU LGPL 3.0](LICENSE)
