@@ -266,6 +266,105 @@ class GenericLowWidthConflictSolverTest {
         assertTrue(result.diagnostics().separatorWidthPeak() <= 12);
     }
 
+    @Test
+    void reusableByproductFeedsContendedSiblingAndSurplusIsDiscarded() {
+        CraftPattern<String> producesToken = new CraftPattern<>(
+                "P",
+                1,
+                List.of(CraftInput.of("raw", 1)),
+                List.of(CraftOutput.of("token", 10), CraftOutput.of("unused-waste", 1_000)),
+                "produces-token");
+        CraftPattern<String> deadP = new CraftPattern<>(
+                "P", 1, List.of(CraftInput.of("dead-p", 1)), "dead-p");
+        CraftPattern<String> consumesToken = new CraftPattern<>(
+                "Q", 1, List.of(CraftInput.of("token", 1)), "consumes-token");
+        CraftPattern<String> deadQ = new CraftPattern<>(
+                "Q", 1, List.of(CraftInput.of("dead-q", 1)), "dead-q");
+        CraftPattern<String> root = new CraftPattern<>(
+                "root", 1, List.of(CraftInput.of("P", 1), CraftInput.of("Q", 1)), "root");
+
+        PlanningResult<String> result = CraftPlannerV2.planDetailed(
+                CraftGraph.<String>builder()
+                        .pattern(root)
+                        .pattern(producesToken)
+                        .pattern(deadP)
+                        .pattern(consumesToken)
+                        .pattern(deadQ)
+                        .stock("raw", 1)
+                        .build(),
+                "root",
+                1);
+
+        assertTrue(result.plan().feasible(), () -> "missing=" + result.plan().missing());
+        assertEquals(1L, result.plan().firings().getOrDefault(producesToken, 0L));
+        assertEquals(1L, result.plan().firings().getOrDefault(consumesToken, 0L));
+        assertEquals(0L, result.plan().usedStock().getOrDefault("token", 0L));
+        assertEquals(0L, result.plan().usedStock().getOrDefault("unused-waste", 0L));
+        assertEquals(0, result.diagnostics().lowWidthSolved(),
+                "an acyclic producer-before-consumer order should finish in the linear backbone");
+    }
+
+    @Test
+    void unrelatedByproductDoesNotDisableIndependentNarrowComponents() {
+        CraftGraph.Builder<String> builder = CraftGraph.builder();
+        appendTwoRouteRecurrence(
+                builder, "bp-independent-a-", null, 7, new int[] {1, 1, 1, 1});
+        appendTwoRouteRecurrence(
+                builder, "bp-independent-b-", null, 7, new int[] {1, 1, 1, 1});
+        builder.stock("bp-independent-a-1", 2)
+                .stock("bp-independent-a-2", 2)
+                .stock("bp-independent-b-1", 2)
+                .stock("bp-independent-b-2", 2)
+                .pattern(
+                        "bp-independent-root",
+                        1,
+                        List.of(
+                                CraftInput.of("bp-independent-a-6", 1),
+                                CraftInput.of("bp-independent-b-6", 1)),
+                        List.of(CraftOutput.of("irrelevant-waste", 1_000_000)));
+
+        PlanningResult<String> result = CraftPlannerV2.planDetailed(
+                builder.build(), "bp-independent-root", 1);
+
+        assertTrue(result.plan().feasible(), () -> "missing=" + result.plan().missing());
+        assertEquals(2, result.diagnostics().lowWidthAttempts());
+        assertEquals(2, result.diagnostics().lowWidthSolved());
+    }
+
+    @Test
+    void byproductCreditNeverJustifiesExtraPrimaryFirings() {
+        CraftPattern<String> producesTenTokens = new CraftPattern<>(
+                "P",
+                1,
+                List.of(CraftInput.of("raw", 1)),
+                List.of(CraftOutput.of("token", 10)),
+                "produces-ten-tokens");
+        CraftPattern<String> deadP = new CraftPattern<>(
+                "P", 1, List.of(CraftInput.of("dead-p", 1)), "dead-p");
+        CraftPattern<String> needsElevenTokens = new CraftPattern<>(
+                "Q", 1, List.of(CraftInput.of("token", 11)), "needs-eleven-tokens");
+        CraftPattern<String> deadQ = new CraftPattern<>(
+                "Q", 1, List.of(CraftInput.of("dead-q", 1)), "dead-q");
+
+        PlanningResult<String> result = CraftPlannerV2.planDetailed(
+                CraftGraph.<String>builder()
+                        .pattern("root", 1, List.of(
+                                CraftInput.of("P", 1), CraftInput.of("Q", 1)))
+                        .pattern(producesTenTokens)
+                        .pattern(deadP)
+                        .pattern(needsElevenTokens)
+                        .pattern(deadQ)
+                        .stock("raw", 2)
+                        .build(),
+                "root",
+                1);
+
+        assertFalse(result.plan().feasible());
+        assertTrue(result.plan().firings().getOrDefault(producesTenTokens, 0L) <= 1L,
+                "the second P firing would exist only to manufacture a byproduct");
+        assertEquals(1L, result.plan().missing().getOrDefault("token", 0L));
+    }
+
     private static PlanningResult<String> assertStarvedRecurrence(
             String prefix, int depth, long amount) {
         return org.junit.jupiter.api.Assertions.assertTimeoutPreemptively(

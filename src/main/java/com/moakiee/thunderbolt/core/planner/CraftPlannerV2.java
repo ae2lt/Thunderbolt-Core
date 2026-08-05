@@ -105,6 +105,8 @@ public final class CraftPlannerV2<K> {
     private final DiagnosticsCollector diagnostics;
     /** Immutable graph analysis shared by every replay with the same cycle orientation. */
     private PreparedGraph<K> preparedGraph;
+    /** Active producer-before-byproduct-row order for linear and aggregate sweeps in this run. */
+    private List<K> activeReplayOrder = List.of();
     private final Set<K> cutOutputs = new LinkedHashSet<>();
     private final Map<CraftPattern<K>, Set<K>> suppressedPositiveFeedbackOutputs =
             new IdentityHashMap<>();
@@ -568,22 +570,34 @@ public final class CraftPlannerV2<K> {
         // Returned catalysts must be acquired before the firing's outputs enter the shared pool.
         // The recursive path already has that execution order; the aggregate linear pass does not,
         // so using it here could let a positive macro output bootstrap its own seed algebraically.
+        ByproductSchedule<K> byproductSchedule = requiresSeedOrderedPlanning
+                ? new ByproductSchedule<>(List.copyOf(order), Map.of(), Set.of())
+                : lowWidthByproductSchedule(order);
+        List<K> replayOrder = byproductSchedule.order();
+        activeReplayOrder = replayOrder;
+
         CraftPlan<K> linearDiagnosis = null;
         Map<CraftPattern<K>, Long> fixedFirings = new IdentityHashMap<>();
         Set<K> fixedItems = new HashSet<>();
+        Set<CraftPattern<K>> speculativeByproductPatterns =
+                java.util.Collections.newSetFromMap(new IdentityHashMap<>());
+        Set<K> speculativeByproductItems = new HashSet<>();
         if (!requiresSeedOrderedPlanning) {
             // 1) Linear backbone (v2-memo-deps / v2-lazy-deduct): one topological aggregation pass,
             //    each item resolved exactly once = O(n + E). Reservation-based capacity gives O(1)
             //    deduction (no recompute loop). When this fully succeeds, contention never mattered.
             long linearStarted = System.nanoTime();
-            CraftPlan<K> linear = linearPass(order, target, amount);
+            CraftPlan<K> linear = linearPass(replayOrder, target, amount);
             diagnostics.addLinearPassNanos(System.nanoTime() - linearStarted);
             if (linear.feasible()) {
                 return enforceCycleBootstrap(linear);
             }
             linearDiagnosis = linear;
             LowWidthAnalysis<K> lowWidth = analyzeLowWidthComponents(
-                    order, target, amount, linearDiagnosis.firings());
+                    byproductSchedule, target, amount, linearDiagnosis.firings());
+            if (lowWidth != null) {
+                replayOrder = lowWidth.replayOrder();
+            }
             if (lowWidth != null && lowWidth.optimisticTargetCapacity() < amount) {
                 // Sum-of-routes capacity deliberately double-counts shared stock, so falling below
                 // the request is a proof of infeasibility, not a heuristic. This turns a completely
@@ -611,6 +625,10 @@ public final class CraftPlannerV2<K> {
                     if (exact.firings() != null) {
                         fixedFirings.putAll(exact.firings());
                         fixedItems.addAll(component.items());
+                        if (component.reusesByproducts()) {
+                            speculativeByproductPatterns.addAll(component.patterns());
+                            speculativeByproductItems.addAll(component.items());
+                        }
                     }
                 }
             }
@@ -620,12 +638,23 @@ public final class CraftPlannerV2<K> {
                 // wide/cutoff components keep the ordinary dynamic-capacity allocation. This is the
                 // common fast path for a globally wide graph made from independent narrow kernels.
                 LinearPassState<K> pinned = linearPassState(
-                        order, target, amount, Map.of(), fixedFirings, fixedItems);
+                        replayOrder, target, amount, Map.of(), fixedFirings, fixedItems);
                 if (!pinned.fixedAllocationFailed() && pinned.miss().isEmpty()) {
                     CraftPlan<K> exactHybrid = new CraftPlan<>(
                             true, true, pinned.fired(), pinned.used(), Map.of(), Map.of(),
                             pinned.gross(), pinned.done(), false);
                     return enforceCycleBootstrap(exactHybrid);
+                }
+                if (pinned.fixedAllocationFailed()) {
+                    // A balance-feasible byproduct vector may deliberately overproduce a primary
+                    // output solely to obtain its side output. Ordered replay validates that
+                    // relaxation. Reopen only rejected byproduct components; independent ordinary
+                    // components remain pinned.
+                    discardSpeculativeByproductFixes(
+                            fixedFirings,
+                            fixedItems,
+                            speculativeByproductPatterns,
+                            speculativeByproductItems);
                 }
             }
             // 1b) Allocation repair: search over the contended outputs' route allocations only,
@@ -637,13 +666,21 @@ public final class CraftPlannerV2<K> {
             //     search this can SPLIT one product's demand across routes; the cycle-bootstrap
             //     check afterwards may still veto a plan, in which case the recursion runs.
             CraftPlan<K> repaired = allocationRepair(
-                    order, target, amount, fixedFirings, fixedItems);
+                    replayOrder, target, amount, fixedFirings, fixedItems);
             if (repaired != null && repaired.feasible()) {
                 CraftPlan<K> bootstrapped = enforceCycleBootstrap(repaired);
                 if (bootstrapped.feasible()) {
                     return bootstrapped;
                 }
             }
+
+            // Recursive execution already has exact byproduct ordering. A relaxed aggregate vector
+            // that did not produce a complete replay must not become a hard recursive quota.
+            discardSpeculativeByproductFixes(
+                    fixedFirings,
+                    fixedItems,
+                    speculativeByproductPatterns,
+                    speculativeByproductItems);
         }
 
         // 2) Contended cone only: fall back to the budgeted recursive search (trail + rollback).
@@ -1102,6 +1139,49 @@ public final class CraftPlannerV2<K> {
         Frame(K node, List<K> children) {
             this.node = node;
             this.children = children;
+        }
+    }
+
+    private static final class SccFrame<K> {
+        final K node;
+        final List<K> neighbors;
+        int next;
+
+        private SccFrame(K node, List<K> neighbors) {
+            this.node = node;
+            this.neighbors = neighbors;
+        }
+    }
+
+    private static final class FixedPatternAllocation<K> {
+        private final CraftPattern<K> pattern;
+        private final long times;
+        private final long produced;
+        private final long minimumOwn;
+        private long allocated;
+
+        private FixedPatternAllocation(
+                CraftPattern<K> pattern, long times, long produced, long minimumOwn) {
+            this.pattern = pattern;
+            this.times = times;
+            this.produced = produced;
+            this.minimumOwn = minimumOwn;
+        }
+
+        private CraftPattern<K> pattern() {
+            return pattern;
+        }
+
+        private long times() {
+            return times;
+        }
+
+        private long produced() {
+            return produced;
+        }
+
+        private long minimumOwn() {
+            return minimumOwn;
         }
     }
 
@@ -1754,7 +1834,9 @@ public final class CraftPlannerV2<K> {
         blameByItem.put(shortLeaf, (double) shortfall);
         CraftPattern<K> blamed = null;
         double blamedShare = 0.0;
-        List<K> order = preparedGraph.order;
+        List<K> order = activeReplayOrder.isEmpty()
+                ? preparedGraph.order
+                : activeReplayOrder;
         for (int i = order.size() - 1; i >= 0; i--) {
             K item = order.get(i);
             Double blame = blameByItem.get(item);
@@ -1810,13 +1892,14 @@ public final class CraftPlannerV2<K> {
     }
 
     /**
-     * Discovers independent normal-input conflict components in one topological sweep. Decision
-     * cones are unioned only when one contains another decision or both touch the same item row; a
-     * deterministic parent that merely requests two independent products does not join them. Thus
-     * width and dense-solver limits are local rather than properties of the whole AE2 network.
+     * Discovers independent ordinary-material conflict components in one topological sweep. A
+     * reusable byproduct is another positive coefficient on its concrete item row: it joins decision
+     * cones that can exchange that supply, but surplus never creates a demand of its own. Stateful
+     * patterns disqualify only their local component; an unrelated byproduct or container no longer
+     * disables exact solving for the whole AE2 network.
      */
     private LowWidthAnalysis<K> analyzeLowWidthComponents(
-            List<K> order,
+            ByproductSchedule<K> byproductSchedule,
             K target,
             long amount,
             Map<CraftPattern<K>, Long> baselineFirings) {
@@ -1826,24 +1909,10 @@ public final class CraftPlannerV2<K> {
             return null;
         }
 
-        // The integer model is intentionally generic but only for ordinary single-output material
-        // flow. Stateful seeds, containers and byproducts retain their established ordered planner.
-        for (K output : order) {
-            for (CraftPattern<K> pattern : patternsByOutput.getOrDefault(output, List.of())) {
-                if (!pattern.byproducts().isEmpty()) {
-                    return null;
-                }
-                for (CraftInput<K> input : pattern.inputs()) {
-                    if (input.returned() || input.remainder() != null
-                            || input.reusableStockSource() != null) {
-                        return null;
-                    }
-                }
-            }
-        }
+        List<K> analysisOrder = byproductSchedule.order();
 
         Map<K, Integer> decisionByOutput = new HashMap<>();
-        for (K output : order) {
+        for (K output : analysisOrder) {
             if (isContendedOutput(output)) {
                 decisionByOutput.put(output, decisionByOutput.size());
             }
@@ -1855,8 +1924,8 @@ public final class CraftPlannerV2<K> {
         }
 
         IntDisjointSet unions = new IntDisjointSet(decisionByOutput.size());
-        Map<K, Integer> ownerByItem = new HashMap<>(order.size() * 2);
-        for (K output : order) {
+        Map<K, Integer> ownerByItem = new HashMap<>(analysisOrder.size() * 2);
+        for (K output : analysisOrder) {
             Integer owner = ownerByItem.get(output);
             Integer decision = decisionByOutput.get(output);
             if (decision != null) {
@@ -1871,9 +1940,11 @@ public final class CraftPlannerV2<K> {
             }
             for (CraftPattern<K> pattern : patternsByOutput.getOrDefault(output, List.of())) {
                 for (CraftInput<K> input : pattern.inputs()) {
-                    Integer existing = ownerByItem.putIfAbsent(input.key(), owner);
-                    if (existing != null) {
-                        unions.union(owner, existing);
+                    unionItemOwner(ownerByItem, unions, input.key(), owner);
+                }
+                for (CraftOutput<K> byproduct : pattern.byproducts()) {
+                    if (byproductSchedule.reuses(pattern, byproduct.key())) {
+                        unionItemOwner(ownerByItem, unions, byproduct.key(), owner);
                     }
                 }
             }
@@ -1881,9 +1952,9 @@ public final class CraftPlannerV2<K> {
 
         Map<K, Integer> componentByItem = new HashMap<>(ownerByItem.size() * 2);
         Map<Integer, List<K>> itemsByComponent = new HashMap<>();
-        List<Integer> componentOrder = new ArrayList<>();
+        List<Integer> componentSequence = new ArrayList<>();
         Set<Integer> seenComponents = new HashSet<>();
-        for (K item : order) {
+        for (K item : analysisOrder) {
             Integer owner = ownerByItem.get(item);
             if (owner == null) {
                 continue;
@@ -1892,56 +1963,90 @@ public final class CraftPlannerV2<K> {
             componentByItem.put(item, component);
             itemsByComponent.computeIfAbsent(component, ignored -> new ArrayList<>()).add(item);
             if (seenComponents.add(component)) {
-                componentOrder.add(component);
+                componentSequence.add(component);
             }
         }
 
         Map<Integer, List<CraftPattern<K>>> patternsByComponent = new HashMap<>();
-        Map<Integer, Long> inputsByComponent = new HashMap<>();
+        Map<Integer, Long> edgesByComponent = new HashMap<>();
+        Map<Integer, Boolean> ordinaryByComponent = new HashMap<>();
         for (Map.Entry<Integer, List<K>> entry : itemsByComponent.entrySet()) {
             List<CraftPattern<K>> componentPatterns = new ArrayList<>();
-            long inputCount = 0L;
+            long edgeCount = 0L;
+            boolean ordinary = true;
             for (K output : entry.getValue()) {
+                if (byproductSchedule.unsafeItems().contains(output)) {
+                    ordinary = false;
+                }
                 List<CraftPattern<K>> outputPatterns =
                         patternsByOutput.getOrDefault(output, List.of());
                 componentPatterns.addAll(outputPatterns);
                 for (CraftPattern<K> pattern : outputPatterns) {
-                    inputCount = Math.min(
-                            Integer.MAX_VALUE, inputCount + pattern.inputs().size());
+                    edgeCount = Math.min(
+                            Integer.MAX_VALUE, edgeCount + pattern.inputs().size());
+                    for (CraftInput<K> input : pattern.inputs()) {
+                        if (input.returned() || input.remainder() != null
+                                || input.reusableStockSource() != null) {
+                            ordinary = false;
+                        }
+                    }
+                    for (CraftOutput<K> byproduct : pattern.byproducts()) {
+                        if (byproductSchedule.reuses(pattern, byproduct.key())) {
+                            edgeCount = Math.min(Integer.MAX_VALUE, edgeCount + 1L);
+                        }
+                    }
                 }
             }
             patternsByComponent.put(entry.getKey(), componentPatterns);
-            inputsByComponent.put(entry.getKey(), inputCount);
+            edgesByComponent.put(entry.getKey(), edgeCount);
+            ordinaryByComponent.put(entry.getKey(), ordinary);
         }
 
-        // Firings outside a component are deterministic prefix work. Their consumption, plus the
-        // requested target when it belongs to the component, is the component's fixed boundary load.
-        Map<Integer, Map<K, Long>> externalByComponent = new HashMap<>();
+        // Firings outside a component are deterministic prefix work. Their consumption is fixed
+        // boundary demand; reusable byproducts they emit are fixed boundary supply. Keeping these as
+        // separate non-negative maps avoids signed saturation and makes unused excess harmless.
+        Map<Integer, Map<K, Long>> externalDemandByComponent = new HashMap<>();
+        Map<Integer, Map<K, Long>> externalSupplyByComponent = new HashMap<>();
         Integer targetComponent = componentByItem.get(target);
         if (targetComponent != null) {
-            externalByComponent.computeIfAbsent(targetComponent, ignored -> new HashMap<>())
+            externalDemandByComponent.computeIfAbsent(targetComponent, ignored -> new HashMap<>())
                     .merge(target, amount, Sat::add);
         }
         for (Map.Entry<CraftPattern<K>, Long> firing : baselineFirings.entrySet()) {
-            if (firing.getValue() <= 0) {
+            long times = firing.getValue();
+            if (times <= 0) {
                 continue;
             }
-            Integer outputComponent = componentByItem.get(firing.getKey().output());
-            for (CraftInput<K> input : firing.getKey().inputs()) {
+            CraftPattern<K> pattern = firing.getKey();
+            Integer outputComponent = componentByItem.get(pattern.output());
+            for (CraftInput<K> input : pattern.inputs()) {
                 Integer inputComponent = componentByItem.get(input.key());
                 if (inputComponent != null && !inputComponent.equals(outputComponent)) {
-                    externalByComponent.computeIfAbsent(inputComponent, ignored -> new HashMap<>())
-                            .merge(input.key(), input.unitsFor(firing.getValue()), Sat::add);
+                    externalDemandByComponent
+                            .computeIfAbsent(inputComponent, ignored -> new HashMap<>())
+                            .merge(input.key(), input.unitsFor(times), Sat::add);
+                }
+            }
+            for (CraftOutput<K> byproduct : pattern.byproducts()) {
+                if (!byproductSchedule.reuses(pattern, byproduct.key())) {
+                    continue;
+                }
+                Integer suppliedComponent = componentByItem.get(byproduct.key());
+                if (suppliedComponent != null && !suppliedComponent.equals(outputComponent)) {
+                    externalSupplyByComponent
+                            .computeIfAbsent(suppliedComponent, ignored -> new HashMap<>())
+                            .merge(byproduct.key(), Sat.mul(times, byproduct.amount()), Sat::add);
                 }
             }
         }
 
-        List<LowWidthComponent<K>> components = new ArrayList<>(componentOrder.size());
-        for (int component : componentOrder) {
+        List<LowWidthComponent<K>> components = new ArrayList<>(componentSequence.size());
+        for (int component : componentSequence) {
             List<K> items = itemsByComponent.get(component);
             List<CraftPattern<K>> patterns = patternsByComponent.get(component);
             Set<K> boundary = new HashSet<>();
             int width = 0;
+            IdentityHashMap<CraftPattern<K>, Set<K>> componentByproducts = new IdentityHashMap<>();
             for (K output : items) {
                 boundary.remove(output);
                 for (CraftPattern<K> pattern
@@ -1951,33 +2056,337 @@ public final class CraftPlannerV2<K> {
                             boundary.add(input.key());
                         }
                     }
+                    for (CraftOutput<K> byproduct : pattern.byproducts()) {
+                        if (byproductSchedule.reuses(pattern, byproduct.key())
+                                && Integer.valueOf(component).equals(
+                                        componentByItem.get(byproduct.key()))) {
+                            boundary.add(byproduct.key());
+                            componentByproducts
+                                    .computeIfAbsent(pattern, ignored -> new HashSet<>())
+                                    .add(byproduct.key());
+                        }
+                    }
                 }
                 width = Math.max(width, boundary.size());
             }
             diagnostics.recordSeparatorWidth(width);
 
             boolean exactEligible = !patterns.isEmpty()
+                    && ordinaryByComponent.getOrDefault(component, false)
                     && width <= MAX_LOW_WIDTH_SEPARATOR
                     && patterns.size() <= MAX_LOW_WIDTH_VARIABLES
                     && items.size() <= MAX_LOW_WIDTH_CONSTRAINTS;
-            long inputCount = inputsByComponent.getOrDefault(component, 0L);
+            long edgeCount = edgesByComponent.getOrDefault(component, 0L);
             long denseCells = (long) items.size() * patterns.size();
             int workCharge = (int) Math.min(
                     Integer.MAX_VALUE,
                     Math.max(
                             1L,
-                            (long) items.size() + patterns.size() + inputCount + denseCells));
+                            (long) items.size() + patterns.size() + edgeCount + denseCells));
             components.add(new LowWidthComponent<>(
                     List.copyOf(items),
                     List.copyOf(patterns),
-                    Map.copyOf(externalByComponent.getOrDefault(component, Map.of())),
+                    Map.copyOf(externalDemandByComponent.getOrDefault(component, Map.of())),
+                    Map.copyOf(externalSupplyByComponent.getOrDefault(component, Map.of())),
+                    freezeByproductMap(componentByproducts),
                     width,
                     exactEligible,
                     workCharge));
         }
 
+        long optimisticCapacity = byproductSchedule.hasRelevantByproducts()
+                ? Sat.SAT
+                : optimisticTargetCapacity(analysisOrder, target);
         return new LowWidthAnalysis<>(
-                List.copyOf(components), optimisticTargetCapacity(order, target));
+                List.copyOf(components), optimisticCapacity, List.copyOf(analysisOrder));
+    }
+
+    private static <K> void unionItemOwner(
+            Map<K, Integer> ownerByItem,
+            IntDisjointSet unions,
+            K item,
+            int owner) {
+        Integer existing = ownerByItem.putIfAbsent(item, owner);
+        if (existing != null) {
+            unions.union(owner, existing);
+        }
+    }
+
+    private static <K> void discardSpeculativeByproductFixes(
+            Map<CraftPattern<K>, Long> fixedFirings,
+            Set<K> fixedItems,
+            Set<CraftPattern<K>> speculativePatterns,
+            Set<K> speculativeItems) {
+        for (CraftPattern<K> pattern : speculativePatterns) {
+            fixedFirings.remove(pattern);
+        }
+        fixedItems.removeAll(speculativeItems);
+        speculativePatterns.clear();
+        speculativeItems.clear();
+    }
+
+    private static <K> Map<CraftPattern<K>, Set<K>> freezeByproductMap(
+            IdentityHashMap<CraftPattern<K>, Set<K>> mutable) {
+        IdentityHashMap<CraftPattern<K>, Set<K>> frozen = new IdentityHashMap<>();
+        mutable.forEach((pattern, keys) -> frozen.put(pattern, Set.copyOf(keys)));
+        return java.util.Collections.unmodifiableMap(frozen);
+    }
+
+    /**
+     * Builds one stable material-flow order that places a reusable byproduct producer before the
+     * corresponding item row whenever that precedence is acyclic. Candidate byproduct precedences
+     * that participate in an SCC are omitted as a group: finding a maximum acyclic subset would turn
+     * this linear preprocessing step into another combinatorial problem. Omitted outputs remain in the
+     * established shared pool and may still be consumed by recursive execution; the integer solver
+     * simply does not claim them as guaranteed supply.
+     */
+    private ByproductSchedule<K> lowWidthByproductSchedule(List<K> order) {
+        Set<K> nodes = new HashSet<>(order);
+        Map<K, LinkedHashSet<K>> consumersByInput = new HashMap<>();
+        List<ByproductLink<K>> candidates = new ArrayList<>();
+        for (K output : order) {
+            for (CraftPattern<K> pattern : patternsByOutput.getOrDefault(output, List.of())) {
+                for (CraftInput<K> input : pattern.inputs()) {
+                    if (nodes.contains(input.key())) {
+                        consumersByInput
+                                .computeIfAbsent(input.key(), ignored -> new LinkedHashSet<>())
+                                .add(output);
+                    }
+                }
+                for (CraftOutput<K> byproduct : pattern.byproducts()) {
+                    if (!nodes.contains(byproduct.key())
+                            || output.equals(byproduct.key())
+                            || !mayReuseByproduct(pattern, byproduct.key())) {
+                        continue;
+                    }
+                    candidates.add(new ByproductLink<>(pattern, output, byproduct.key()));
+                }
+            }
+        }
+        if (candidates.isEmpty()) {
+            return new ByproductSchedule<>(List.copyOf(order), Map.of(), Set.of());
+        }
+
+        Map<K, ScheduleItem<K>> itemNode = new HashMap<>(order.size() * 2);
+        for (K item : order) {
+            itemNode.put(item, new ScheduleItem<>(item));
+        }
+        Map<K, ByproductBarrier<K>> barrierNode = new HashMap<>();
+        for (ByproductLink<K> candidate : candidates) {
+            barrierNode.computeIfAbsent(candidate.key(), ByproductBarrier::new);
+        }
+
+        List<ScheduleNode<K>> scheduleNodes = new ArrayList<>(order.size() + barrierNode.size());
+        for (K item : order) {
+            ByproductBarrier<K> barrier = barrierNode.get(item);
+            if (barrier != null) {
+                scheduleNodes.add(barrier);
+            }
+            scheduleNodes.add(itemNode.get(item));
+        }
+
+        Map<ScheduleNode<K>, LinkedHashSet<ScheduleNode<K>>> normalEdges = new HashMap<>();
+        Map<ScheduleNode<K>, LinkedHashSet<ScheduleNode<K>>> allEdges = new HashMap<>();
+        for (ScheduleNode<K> node : scheduleNodes) {
+            normalEdges.put(node, new LinkedHashSet<>());
+            allEdges.put(node, new LinkedHashSet<>());
+        }
+        for (K output : order) {
+            ScheduleItem<K> from = itemNode.get(output);
+            for (CraftPattern<K> pattern : patternsByOutput.getOrDefault(output, List.of())) {
+                for (CraftInput<K> input : pattern.inputs()) {
+                    ScheduleItem<K> to = itemNode.get(input.key());
+                    if (to != null && !output.equals(input.key())) {
+                        normalEdges.get(from).add(to);
+                        allEdges.get(from).add(to);
+                    }
+                }
+            }
+        }
+        for (Map.Entry<K, ByproductBarrier<K>> entry : barrierNode.entrySet()) {
+            K key = entry.getKey();
+            ByproductBarrier<K> barrier = entry.getValue();
+            allEdges.get(barrier).add(itemNode.get(key));
+            for (K consumer : consumersByInput.getOrDefault(key, new LinkedHashSet<>())) {
+                allEdges.get(barrier).add(itemNode.get(consumer));
+            }
+        }
+        for (ByproductLink<K> candidate : candidates) {
+            allEdges.get(itemNode.get(candidate.output())).add(barrierNode.get(candidate.key()));
+        }
+
+        Map<ScheduleNode<K>, Integer> components = stronglyConnectedComponents(
+                scheduleNodes, freezeAdjacency(scheduleNodes, allEdges));
+        Map<Integer, Set<K>> itemsByScc = new HashMap<>();
+        for (K item : order) {
+            itemsByScc
+                    .computeIfAbsent(components.get(itemNode.get(item)), ignored -> new HashSet<>())
+                    .add(item);
+        }
+
+        IdentityHashMap<CraftPattern<K>, Set<K>> reusable = new IdentityHashMap<>();
+        Set<K> acceptedKeys = new HashSet<>();
+        Set<K> unsafeItems = new HashSet<>();
+        for (ByproductLink<K> candidate : candidates) {
+            int producerScc = components.get(itemNode.get(candidate.output()));
+            if (producerScc == components.get(barrierNode.get(candidate.key()))) {
+                unsafeItems.addAll(itemsByScc.getOrDefault(producerScc, Set.of()));
+                continue;
+            }
+            reusable.computeIfAbsent(candidate.pattern(), ignored -> new HashSet<>())
+                    .add(candidate.key());
+            acceptedKeys.add(candidate.key());
+        }
+        if (reusable.isEmpty()) {
+            return new ByproductSchedule<>(
+                    List.copyOf(order), Map.of(), Set.copyOf(unsafeItems));
+        }
+
+        Map<ScheduleNode<K>, LinkedHashSet<ScheduleNode<K>>> replayEdges = new HashMap<>();
+        for (ScheduleNode<K> node : scheduleNodes) {
+            replayEdges.put(node, new LinkedHashSet<>(normalEdges.get(node)));
+        }
+        for (K key : acceptedKeys) {
+            ByproductBarrier<K> barrier = barrierNode.get(key);
+            replayEdges.get(barrier).add(itemNode.get(key));
+            for (K consumer : consumersByInput.getOrDefault(key, new LinkedHashSet<>())) {
+                replayEdges.get(barrier).add(itemNode.get(consumer));
+            }
+        }
+        for (ByproductLink<K> candidate : candidates) {
+            if (reusable.getOrDefault(candidate.pattern(), Set.of()).contains(candidate.key())) {
+                replayEdges.get(itemNode.get(candidate.output())).add(barrierNode.get(candidate.key()));
+            }
+        }
+
+        List<ScheduleNode<K>> scheduled = stableTopologicalOrder(
+                scheduleNodes, freezeAdjacency(scheduleNodes, replayEdges));
+        if (scheduled.size() != scheduleNodes.size()) {
+            // Defensive fail-closed path. Normal edges are already acyclic and inter-SCC candidate
+            // edges cannot form a cycle, so this should be unreachable unless graph equality changed.
+            Set<K> allUnsafe = new HashSet<>(unsafeItems);
+            for (ByproductLink<K> candidate : candidates) {
+                allUnsafe.add(candidate.output());
+                allUnsafe.add(candidate.key());
+            }
+            return new ByproductSchedule<>(
+                    List.copyOf(order), Map.of(), Set.copyOf(allUnsafe));
+        }
+        List<K> replayOrder = new ArrayList<>(order.size());
+        for (ScheduleNode<K> node : scheduled) {
+            if (node instanceof ScheduleItem<?> item) {
+                @SuppressWarnings("unchecked")
+                K key = (K) item.key();
+                replayOrder.add(key);
+            }
+        }
+        return new ByproductSchedule<>(
+                List.copyOf(replayOrder), freezeByproductMap(reusable), Set.copyOf(unsafeItems));
+    }
+
+    private static <K> Map<K, List<K>> freezeAdjacency(
+            List<K> nodes, Map<K, LinkedHashSet<K>> mutable) {
+        Map<K, List<K>> frozen = new HashMap<>(nodes.size() * 2);
+        for (K node : nodes) {
+            frozen.put(node, List.copyOf(mutable.getOrDefault(node, new LinkedHashSet<>())));
+        }
+        return frozen;
+    }
+
+    /** Iterative Kosaraju pass: linear in the local item and material-edge counts. */
+    private static <K> Map<K, Integer> stronglyConnectedComponents(
+            List<K> nodes, Map<K, List<K>> adjacency) {
+        Set<K> seen = new HashSet<>();
+        List<K> finished = new ArrayList<>(nodes.size());
+        for (K start : nodes) {
+            if (!seen.add(start)) {
+                continue;
+            }
+            Deque<SccFrame<K>> stack = new ArrayDeque<>();
+            stack.push(new SccFrame<>(start, adjacency.getOrDefault(start, List.of())));
+            while (!stack.isEmpty()) {
+                SccFrame<K> frame = stack.peek();
+                if (frame.next < frame.neighbors.size()) {
+                    K next = frame.neighbors.get(frame.next++);
+                    if (seen.add(next)) {
+                        stack.push(new SccFrame<>(
+                                next, adjacency.getOrDefault(next, List.of())));
+                    }
+                } else {
+                    finished.add(frame.node);
+                    stack.pop();
+                }
+            }
+        }
+
+        Map<K, List<K>> reverse = new HashMap<>(nodes.size() * 2);
+        for (K node : nodes) {
+            reverse.put(node, new ArrayList<>());
+        }
+        adjacency.forEach((from, targets) -> {
+            for (K target : targets) {
+                reverse.computeIfAbsent(target, ignored -> new ArrayList<>()).add(from);
+            }
+        });
+
+        Map<K, Integer> component = new HashMap<>(nodes.size() * 2);
+        int nextComponent = 0;
+        for (int index = finished.size() - 1; index >= 0; index--) {
+            K start = finished.get(index);
+            if (component.containsKey(start)) {
+                continue;
+            }
+            Deque<K> stack = new ArrayDeque<>();
+            stack.push(start);
+            component.put(start, nextComponent);
+            while (!stack.isEmpty()) {
+                K node = stack.pop();
+                for (K previous : reverse.getOrDefault(node, List.of())) {
+                    if (!component.containsKey(previous)) {
+                        component.put(previous, nextComponent);
+                        stack.push(previous);
+                    }
+                }
+            }
+            nextComponent++;
+        }
+        return component;
+    }
+
+    private static <K> List<K> stableTopologicalOrder(
+            List<K> stableOrder, Map<K, List<K>> adjacency) {
+        Map<K, Integer> stableIndex = new HashMap<>(stableOrder.size() * 2);
+        Map<K, Integer> indegree = new HashMap<>(stableOrder.size() * 2);
+        for (int index = 0; index < stableOrder.size(); index++) {
+            K node = stableOrder.get(index);
+            stableIndex.put(node, index);
+            indegree.put(node, 0);
+        }
+        adjacency.forEach((ignored, targets) -> {
+            for (K target : targets) {
+                indegree.merge(target, 1, Integer::sum);
+            }
+        });
+
+        PriorityQueue<K> ready = new PriorityQueue<>(
+                java.util.Comparator.comparingInt(stableIndex::get));
+        for (K node : stableOrder) {
+            if (indegree.getOrDefault(node, 0) == 0) {
+                ready.add(node);
+            }
+        }
+        List<K> result = new ArrayList<>(stableOrder.size());
+        while (!ready.isEmpty()) {
+            K node = ready.poll();
+            result.add(node);
+            for (K target : adjacency.getOrDefault(node, List.of())) {
+                int remaining = indegree.merge(target, -1, Integer::sum);
+                if (remaining == 0) {
+                    ready.add(target);
+                }
+            }
+        }
+        return result;
     }
 
     /** Safe route-summing upper bound; shared stock is deliberately counted more than once. */
@@ -2028,6 +2437,17 @@ public final class CraftPlannerV2<K> {
                     coefficients[inputRow][variable] = Math.subtractExact(
                             coefficients[inputRow][variable], input.amount());
                 }
+                for (CraftOutput<K> byproduct : pattern.byproducts()) {
+                    if (!model.reusesByproduct(pattern, byproduct.key())) {
+                        continue;
+                    }
+                    Integer byproductRow = rowByItem.get(byproduct.key());
+                    if (byproductRow == null) {
+                        return LowWidthSolve.unsupported();
+                    }
+                    coefficients[byproductRow][variable] = Math.addExact(
+                            coefficients[byproductRow][variable], byproduct.amount());
+                }
             }
         } catch (ArithmeticException ignored) {
             return LowWidthSolve.unsupported();
@@ -2038,9 +2458,11 @@ public final class CraftPlannerV2<K> {
         for (int row = 0; row < model.items().size(); row++) {
             K item = model.items().get(row);
             long external = model.externalDemand().getOrDefault(item, 0L);
+            long available = Sat.add(
+                    graph.stock(item), model.externalSupply().getOrDefault(item, 0L));
             long minimum;
             try {
-                minimum = Math.subtractExact(external, graph.stock(item));
+                minimum = Math.subtractExact(external, available);
             } catch (ArithmeticException ignored) {
                 return LowWidthSolve.unsupported();
             }
@@ -2163,27 +2585,54 @@ public final class CraftPlannerV2<K> {
             Map<CraftPattern<K>, Long> fired,
             Map<CraftPattern<K>, Long> allocatedUnits,
             Map<CraftPattern<K>, Long> fixedFirings) {
-        long remaining = demand;
+        List<FixedPatternAllocation<K>> selected = new ArrayList<>();
+        long minimumAllocated = 0L;
+        long totalProduced = 0L;
         for (CraftPattern<K> pattern : patterns) {
             long times = fixedFirings.getOrDefault(pattern, 0L);
             if (times <= 0L) {
                 continue;
             }
             long produced = Sat.mul(times, pattern.outputAmount());
-            long consumed = Math.min(remaining, produced);
-            allocatedUnits.merge(pattern, consumed, Sat::add);
+            // Every selected firing must be justified by primary-output demand. Otherwise the integer
+            // vector is deliberately overproducing the primary merely to manufacture a byproduct,
+            // which is outside the planner's opportunistic-reuse contract. Batch rounding may leave
+            // surplus, but removing the final firing must make the allocated primary insufficient.
+            long minimumOwn = Sat.add(
+                    Sat.mul(times - 1L, pattern.outputAmount()), 1L);
+            minimumAllocated = Sat.add(minimumAllocated, minimumOwn);
+            totalProduced = Sat.add(totalProduced, produced);
+            selected.add(new FixedPatternAllocation<>(pattern, times, produced, minimumOwn));
+        }
+        if (selected.isEmpty() || minimumAllocated > demand || totalProduced < demand) {
+            return demand;
+        }
+
+        long remainingExtra = demand - minimumAllocated;
+        for (FixedPatternAllocation<K> allocation : selected) {
+            long extra = Math.min(
+                    remainingExtra, allocation.produced() - allocation.minimumOwn());
+            allocation.allocated = Sat.add(allocation.minimumOwn(), extra);
+            remainingExtra -= extra;
+        }
+        if (remainingExtra > 0) {
+            return demand; // defensive: totalProduced precheck should make this unreachable
+        }
+
+        for (FixedPatternAllocation<K> allocation : selected) {
+            CraftPattern<K> pattern = allocation.pattern();
+            allocatedUnits.merge(pattern, allocation.allocated, Sat::add);
             fireLinear(
                     output,
                     pattern,
-                    times,
-                    consumed,
+                    allocation.times(),
+                    allocation.allocated,
                     need,
                     bp,
                     returnedSeedReserve,
                     fired);
-            remaining -= consumed;
         }
-        return remaining;
+        return 0L;
     }
 
     /** Split {@code d} of {@code x} across recipes by current remaining capacity (dynamic balance). */
@@ -2767,7 +3216,10 @@ public final class CraftPlannerV2<K> {
         need.put(x, d);
         long unmet = 0L;
         boolean reached = false;
-        for (K y : preparedGraph.order) {
+        List<K> aggregateOrder = activeReplayOrder.isEmpty()
+                ? preparedGraph.order
+                : activeReplayOrder;
+        for (K y : aggregateOrder) {
             if (!reached) {
                 if (!y.equals(x)) continue;
                 reached = true;
@@ -3653,16 +4105,53 @@ public final class CraftPlannerV2<K> {
 
     private record LowWidthAnalysis<K>(
             List<LowWidthComponent<K>> components,
-            long optimisticTargetCapacity) {
+            long optimisticTargetCapacity,
+            List<K> replayOrder) {
     }
 
     private record LowWidthComponent<K>(
             List<K> items,
             List<CraftPattern<K>> patterns,
             Map<K, Long> externalDemand,
+            Map<K, Long> externalSupply,
+            Map<CraftPattern<K>, Set<K>> reusableByproducts,
             int separatorWidth,
             boolean exactSolverEligible,
             int workCharge) {
+
+        private boolean reusesByproduct(CraftPattern<K> pattern, K key) {
+            return reusableByproducts.getOrDefault(pattern, Set.of()).contains(key);
+        }
+
+        private boolean reusesByproducts() {
+            return !reusableByproducts.isEmpty();
+        }
+    }
+
+    private record ByproductSchedule<K>(
+            List<K> order,
+            Map<CraftPattern<K>, Set<K>> reusableByproducts,
+            Set<K> unsafeItems) {
+
+        private boolean reuses(CraftPattern<K> pattern, K key) {
+            return reusableByproducts.getOrDefault(pattern, Set.of()).contains(key);
+        }
+
+        private boolean hasRelevantByproducts() {
+            return !reusableByproducts.isEmpty() || !unsafeItems.isEmpty();
+        }
+    }
+
+    private interface ScheduleNode<K> {
+    }
+
+    private record ScheduleItem<K>(K key) implements ScheduleNode<K> {
+    }
+
+    private record ByproductBarrier<K>(K key) implements ScheduleNode<K> {
+    }
+
+    private record ByproductLink<K>(CraftPattern<K> pattern, K output, K key) {
     }
 
     private record LowWidthSolve<K>(
