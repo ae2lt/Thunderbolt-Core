@@ -1,7 +1,6 @@
 package com.moakiee.thunderbolt.ae2.overload.pattern;
 
 import java.util.ArrayList;
-import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Objects;
 
@@ -44,35 +43,13 @@ public final class Ae2OverloadPatternDetails
         for (int slot = 0; slot < sourceInputs.length; slot++) {
             this.inputs[slot] = wrapInput(sourceInputs[slot], overloadDetails.inputMode(slot));
         }
-        this.outputs = wipeIdOnlyOutputs(sourceDetails.getOutputs(), overloadDetails);
-    }
-
-    /**
-     * An ID_ONLY slot is NBT-agnostic by contract, so the AE2-facing view erases the captured
-     * components ("仅id ⇒ 抹除NBT"): the declared key becomes the bare item. For an output slot this
-     * key is what indexes the pattern in the crafting service and what the CPU mirrors into its
-     * waiting list — the product must be requestable/consumable as the plain item, and must
-     * <em>not</em> satisfy strict demand for the originally captured variant (the machine may return
-     * any NBT). STRICT slots keep their exact captured keys. Output list positions are preserved:
-     * CPU-side code correlates {@code getOutputs()} entries with
-     * {@link OverloadPatternDetails.OutputSlot#slotIndex()} by index.
-     */
-    private static List<GenericStack> wipeIdOnlyOutputs(List<GenericStack> sourceOutputs,
-                                                        OverloadPatternDetails overloadDetails) {
-        var result = new ArrayList<GenericStack>(sourceOutputs.size());
+        var sourceOutputs = sourceDetails.getOutputs();
+        var normalizedOutputs = new ArrayList<GenericStack>(sourceOutputs.size());
         for (int slot = 0; slot < sourceOutputs.size(); slot++) {
-            result.add(wipeIfIdOnly(sourceOutputs.get(slot), overloadDetails.outputMode(slot)));
+            normalizedOutputs.add(normalizeTemplate(
+                    sourceOutputs.get(slot), overloadDetails.outputMode(slot)));
         }
-        return List.copyOf(result);
-    }
-
-    private static GenericStack wipeIfIdOnly(GenericStack stack, MatchMode matchMode) {
-        if (!matchMode.ignoresComponents()
-                || !(stack.what() instanceof AEItemKey itemKey)
-                || !itemKey.hasComponents()) {
-            return stack;
-        }
-        return new GenericStack(AEItemKey.of(itemKey.getItem()), stack.amount());
+        this.outputs = List.copyOf(normalizedOutputs);
     }
 
     @Override
@@ -139,33 +116,21 @@ public final class Ae2OverloadPatternDetails
     private static final class OverloadInput implements IInput {
         private final IInput sourceInput;
         private final MatchMode matchMode;
+        private final GenericStack[] sourcePossibleInputs;
         private final GenericStack[] possibleInputs;
         private final List<AEItemKey> itemKeys;
 
         private OverloadInput(IInput sourceInput, MatchMode matchMode) {
             this.sourceInput = sourceInput;
             this.matchMode = matchMode;
-            // Expose the component-wiped templates (see wipeIfIdOnly): the declared demand of an
-            // ID_ONLY slot is the bare item. Runtime acceptance is unchanged — isValid matches by
-            // item id, and CPU extraction resolves concrete variants through findFuzzyTemplates.
-            this.possibleInputs = wipePossibleInputs(sourceInput.getPossibleInputs(), matchMode);
-            // Keep the ORIGINAL captured keys for getRemainingKey: the source input only understands
-            // the templates it declared.
-            this.itemKeys = collectItemKeys(sourceInput.getPossibleInputs());
-        }
-
-        private static GenericStack[] wipePossibleInputs(GenericStack[] source, MatchMode matchMode) {
-            var byKey = new LinkedHashMap<AEKey, GenericStack>(source.length);
-            for (var possible : source) {
-                var wiped = wipeIfIdOnly(possible, matchMode);
-                byKey.putIfAbsent(wiped.what(), wiped);
-            }
-            return byKey.values().toArray(new GenericStack[0]);
+            this.sourcePossibleInputs = sourceInput.getPossibleInputs();
+            this.possibleInputs = normalizeTemplates(sourcePossibleInputs, matchMode);
+            this.itemKeys = collectItemKeys(sourcePossibleInputs);
         }
 
         @Override
         public GenericStack[] getPossibleInputs() {
-            return possibleInputs;
+            return possibleInputs.clone();
         }
 
         @Override
@@ -189,9 +154,10 @@ public final class Ae2OverloadPatternDetails
             }
 
             if (template instanceof AEItemKey itemKey) {
-                for (var possible : itemKeys) {
-                    if (possible.getItem() == itemKey.getItem()) {
-                        var remaining = sourceInput.getRemainingKey(possible);
+                for (var possible : sourcePossibleInputs) {
+                    if (possible.what() instanceof AEItemKey possibleItem
+                            && possibleItem.getItem() == itemKey.getItem()) {
+                        var remaining = sourceInput.getRemainingKey(possible.what());
                         if (remaining != null) {
                             return remaining;
                         }
@@ -271,6 +237,22 @@ public final class Ae2OverloadPatternDetails
             return sourceInput;
         }
         return new OverloadInput(sourceInput, matchMode);
+    }
+
+    private static GenericStack[] normalizeTemplates(GenericStack[] templates, MatchMode matchMode) {
+        var result = new GenericStack[templates.length];
+        for (int slot = 0; slot < templates.length; slot++) {
+            result[slot] = normalizeTemplate(templates[slot], matchMode);
+        }
+        return result;
+    }
+
+    /** ID_ONLY is encoded as the item's primary identity, never one arbitrary component variant. */
+    static GenericStack normalizeTemplate(GenericStack template, MatchMode matchMode) {
+        if (matchMode == MatchMode.ID_ONLY) {
+            return new GenericStack(template.what().dropSecondary(), template.amount());
+        }
+        return template;
     }
 
     private static boolean hasItemVariants(GenericStack[] possibleInputs) {

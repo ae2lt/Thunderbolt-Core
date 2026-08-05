@@ -12,6 +12,8 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.function.Function;
+import java.util.function.Supplier;
 
 import org.jetbrains.annotations.Nullable;
 
@@ -27,8 +29,12 @@ import net.minecraft.world.level.Level;
 import appeng.crafting.CraftingPlan;
 import appeng.crafting.inv.ChildCraftingSimulationState;
 import appeng.crafting.inv.CraftingSimulationState;
+import appeng.crafting.pattern.AECraftingPattern;
 
+import com.moakiee.thunderbolt.ae2.api.crafting.CraftingPatternDelegates;
+import com.moakiee.thunderbolt.ae2.overload.pattern.OverloadPatternMatchPolicy;
 import com.moakiee.thunderbolt.ae2.overload.pattern.OverloadedProviderOnlyPatternDetails;
+import com.moakiee.thunderbolt.ae2.overload.pattern.WrappedPatternDetails;
 import com.moakiee.thunderbolt.core.planner.BoundedCombinations;
 import com.moakiee.thunderbolt.core.planner.CraftGraph;
 import com.moakiee.thunderbolt.core.planner.CraftInput;
@@ -191,18 +197,26 @@ public final class FastCraftingPlanner {
         // whole-item inputs. This keeps every unrelated durability chain on the fast representation
         // and, unlike pattern-private durability pools, never counts one physical tool more than once.
         Set<Item> conservativeDurabilityItems = new HashSet<>();
+        Map<AEKey, RequirementMode> forcedRequirementModes = new HashMap<>();
+        PrimaryIdentityCraftables idOnlyCraftables = new PrimaryIdentityCraftables(
+                () -> craftingService.getCraftables(ignored -> true));
         GraphBuild graphBuild;
         long graphBuildStarted = System.nanoTime();
         while (true) {
             graphBuild = new GraphBuild();
-            Set<Item> conflicts = buildGraph(
+            GraphBuildDiscovery discovery = buildGraph(
                     craftingService, snapshot, reusableSeedSnapshot, level, output,
                     graphBuild.builder, graphBuild.multiplePaths, graphBuild.durability,
                     graphBuild.patternSources, graphBuild.emittable, conservativeDurabilityItems,
-                    reservedStock);
-            if (conflicts.isEmpty() || !conservativeDurabilityItems.addAll(conflicts)) {
-                // A repeated conflict is still safe: buildGraph drops the conflicting pattern before
-                // publishing it. Normally this branch is reached after one discovery + one clean pass.
+                    forcedRequirementModes, idOnlyCraftables, reservedStock);
+            boolean durabilityChanged = conservativeDurabilityItems.addAll(
+                    discovery.durabilityConflicts());
+            boolean requirementChanged = mergeForcedRequirementModes(
+                    forcedRequirementModes, discovery.lateRequirementModes());
+            if (!durabilityChanged && !requirementChanged) {
+                // Repeated durability conflicts are still safe because buildGraph drops their patterns;
+                // late requirement changes are forced into the next pass before producers are filtered.
+                // Normally this settles after one discovery pass and one clean rebuild.
                 break;
             }
         }
@@ -267,9 +281,10 @@ public final class FastCraftingPlanner {
     /**
      * BFS the reachable recipe graph.
      *
-     * @return durability item types that must be rebuilt with conservative whole-item semantics
+     * @return durability conflicts plus demand modes discovered after their node was already expanded;
+     *         either condition requires a clean graph rebuild
      */
-    private static Set<Item> buildGraph(ICraftingService craftingService,
+    private static GraphBuildDiscovery buildGraph(ICraftingService craftingService,
                                       ChildCraftingSimulationState snapshot,
                                       ChildCraftingSimulationState reusableSeedSnapshot,
                                       Level level,
@@ -280,12 +295,15 @@ public final class FastCraftingPlanner {
                                       Map<AEKey, Set<IPatternDetails>> patternSources,
                                       Set<AEKey> emittable,
                                       Set<Item> conservativeDurabilityItems,
+                                      Map<AEKey, RequirementMode> forcedRequirementModes,
+                                      PrimaryIdentityCraftables idOnlyCraftables,
                                       @Nullable ReservedStockCraftingRequester reservedStock) {
         Set<AEKey> seen = new HashSet<>();
         Deque<AEKey> queue = new ArrayDeque<>();
         // Memoized "how much is already in the network" per key (SIMULATE probe), used to rank fuzzy
         // substitutes most-available-first so the bounded keep-best-32 picks the cheapest routes.
         Map<AEKey, Long> availability = new HashMap<>();
+        RequirementModes requirementModes = new RequirementModes(root, forcedRequirementModes);
         Map<AEKey, Long> supplementalSelfSeedStock = new HashMap<>();
         // Unit-system bookkeeping. A durability chain prices its links in USES (carrier pool); every
         // other node is priced in whole ITEMS. The same physical stock must never be counted under
@@ -301,14 +319,12 @@ public final class FastCraftingPlanner {
         Set<AEKey> itemUnitKeys = new HashSet<>();
         Map<AEKey, DurabilityChain<AEKey>> linkOwner = new HashMap<>();
         Set<Item> durabilityConflicts = new HashSet<>();
-        // Memoized ICraftingService#getCraftables scans for ID_ONLY candidate expansion, keyed by the
-        // declared template. Several slots demanding the same item share one network-wide scan.
-        Map<AEKey, List<AEKey>> craftableVariantCache = new HashMap<>();
         seen.add(root);
         queue.add(root);
 
         while (!queue.isEmpty()) {
             AEKey key = queue.poll();
+            requirementModes.markProcessed(key);
 
             // Durability carrier: a finite-use token resource. Its stock (= aggregate uses over the
             // whole chain, 链长×数量) was set once at capture, so we don't re-stock it here — but we DO
@@ -353,6 +369,10 @@ public final class FastCraftingPlanner {
                 // made by deliberately over-producing the primary.
                 GenericStack primaryStack = details.getPrimaryOutput();
                 if (primaryStack == null || !key.equals(primaryStack.what())) {
+                    continue;
+                }
+                if (!producerMatchesRequirement(
+                        details, key, requirementModes.modeFor(key))) {
                     continue;
                 }
                 patternSources.computeIfAbsent(key,
@@ -414,21 +434,29 @@ public final class FastCraftingPlanner {
 
                 // Per-slot acceptable concrete options for the hard-fuzzy (OR) expansion.
                 IPatternDetails.IInput[] inputs = details.getInputs();
-                // Overload patterns expose per-slot match modes; an ID_ONLY (ignore-NBT) slot accepts any
-                // stack sharing the item id, so its candidates span every stocked or craftable same-item
-                // variant. The slot index here lines up with how Ae2OverloadPatternDetails wrapped
-                // getInputs().
+                // Overload patterns expose per-slot match modes; an ID_ONLY (ignore-NBT) slot accepts
+                // every stocked or craftable key with the same primary identity. Resolve the provider
+                // view through wrappers so matching does not depend on the adapter nesting order.
+                var providerDetails = CraftingPatternDelegates.forProviderLookup(details);
                 OverloadedProviderOnlyPatternDetails overloadView =
-                        details instanceof OverloadedProviderOnlyPatternDetails op ? op : null;
+                        providerDetails instanceof OverloadedProviderOnlyPatternDetails op
+                        ? op
+                        : null;
+                boolean craftingPattern = isCraftingPattern(providerDetails);
                 List<List<SlotChoice>> slotOptions = new ArrayList<>(inputs.length);
+                List<RequirementMode> slotRequirementModes = new ArrayList<>(inputs.length);
                 long combos = 1;
                 boolean patternUnsatisfiable = false;
                 for (int slot = 0; slot < inputs.length; slot++) {
                     IPatternDetails.IInput in = inputs[slot];
-                    // Durability tool slot: collapse the degradation chain to one finite-use token.
-                    ChainLookup lookup = durabilityChain(in, craftingService, snapshot, level, builder,
-                            durability, linkOwner, itemUnitKeys, conservativeDurabilityItems,
-                            reservedStock);
+                    // Durability semantics are inferred only for real crafting patterns. Processing
+                    // patterns cannot encode component-dependent tool degradation reliably, so even a
+                    // custom input that reports a same-item remainder stays outside this optimization.
+                    ChainLookup lookup = craftingPattern
+                            ? durabilityChain(in, craftingService, snapshot, level, builder,
+                                    durability, linkOwner, itemUnitKeys, conservativeDurabilityItems,
+                                    reservedStock)
+                            : ChainLookup.NONE;
                     if (lookup.conflict()) {
                         durabilityConflicts.add(lookup.conflictItem());
                         patternUnsatisfiable = true;
@@ -445,11 +473,14 @@ public final class FastCraftingPlanner {
                                 Math.max(1, in.getMultiplier()));
                         slotOptions.add(List.of(new SlotChoice(List.of(
                                 CraftInput.of(chain.carrier(), usesPerFiring)))));
+                        // A durability carrier means one exact full tool. An ID_ONLY producer is
+                        // late-bound and must never be priced as that full carrier.
+                        slotRequirementModes.add(RequirementMode.STRICT);
                         continue; // single deterministic option, never enqueued for crafting
                     }
                     boolean idOnly = overloadView != null && overloadView.isFuzzyInput(slot);
                     List<GenericStack> templates = idOnlyTemplates(
-                            in, idOnly, snapshot, craftingService, craftableVariantCache);
+                            in, idOnly, snapshot, idOnlyCraftables);
                     templates = addConservativeDurabilityTemplates(
                             in, templates, craftingService, snapshot, level,
                             conservativeDurabilityItems);
@@ -490,8 +521,9 @@ public final class FastCraftingPlanner {
                                 // over-promise stock or double-count a tool between pattern semantics.
                                 opts.add(CraftInput.of(inputKey, template.amount()));
                             }
-                            // Otherwise durabilityChain declined it (usually over the cyclic budget).
-                            // Drop the option so this recipe safely surfaces as missing.
+                            // Otherwise durabilityChain declined it (non-crafting pattern, non-chain
+                            // remainder semantics, or cyclic budget). Drop the option so this recipe
+                            // safely surfaces as missing instead of inventing durability behavior.
                         } else {
                             // Different leftover item (e.g. filled bucket -> empty bucket): consume the
                             // full input and hand back the remainder as a byproduct, so refilling it
@@ -520,6 +552,8 @@ public final class FastCraftingPlanner {
                     }
                     List<SlotChoice> choices = expandSlotChoices(opts, in.getMultiplier(), availability);
                     slotOptions.add(choices);
+                    slotRequirementModes.add(
+                            idOnly ? RequirementMode.ID_ONLY : RequirementMode.STRICT);
                     // Saturating product: a raw `combos *= opts.size()` can overflow Long for patterns
                     // with many fuzzy slots over large tags, wrapping to a small value that slips past
                     // the budget check below. Sat.mul clamps so the budget comparison stays correct.
@@ -535,14 +569,17 @@ public final class FastCraftingPlanner {
                 long outAmount = Sat.mul(primary.amount(), outputScale);
                 // Keep the best (lowest rank-sum) up to FUZZY_NONCYCLE_STEPS combinations; when the
                 // product is within budget this emits all of them, otherwise it greedily keeps the front.
-                emitBestCombinations(builder, seen, queue, key, outAmount, byproducts, slotOptions, details);
+                emitBestCombinations(
+                        builder, seen, queue, key, outAmount, byproducts, slotOptions,
+                        slotRequirementModes, requirementModes, details);
                 registeredForKey++;
             }
             if (registeredForKey > 1) {
                 multiplePaths[0] = true; // genuinely distinct recipes whose primary output is `key`
             }
         }
-        return durabilityConflicts;
+        return new GraphBuildDiscovery(
+                Set.copyOf(durabilityConflicts), requirementModes.lateChanges());
     }
 
     /**
@@ -561,10 +598,23 @@ public final class FastCraftingPlanner {
      * {@code IInput#isValid}, which an ID_ONLY slot answers by item id) and the provider push
      * ({@code Ae2OverloadPatternDetails#pushIdOnlyInput}) resolve same-id variants at runtime.
      */
-    private static List<GenericStack> idOnlyTemplates(IPatternDetails.IInput in, boolean idOnly,
-                                                      ChildCraftingSimulationState snapshot,
-                                                      ICraftingService craftingService,
-                                                      Map<AEKey, List<AEKey>> craftableVariantCache) {
+    private static List<GenericStack> idOnlyTemplates(
+            IPatternDetails.IInput in,
+            boolean idOnly,
+            ChildCraftingSimulationState snapshot,
+            PrimaryIdentityCraftables craftableIndex) {
+        return expandIdOnlyTemplates(
+                in,
+                idOnly,
+                snapshot::findFuzzyTemplates,
+                craftableIndex::get);
+    }
+
+    static List<GenericStack> expandIdOnlyTemplates(
+            IPatternDetails.IInput in,
+            boolean idOnly,
+            Function<AEKey, ? extends Iterable<AEKey>> stockedVariants,
+            Function<AEKey, ? extends Iterable<AEKey>> craftableVariants) {
         GenericStack[] possible = in.getPossibleInputs();
         if (!idOnly) {
             return Arrays.asList(possible);
@@ -572,30 +622,159 @@ public final class FastCraftingPlanner {
         LinkedHashMap<AEKey, GenericStack> byKey = new LinkedHashMap<>();
         for (GenericStack template : possible) {
             byKey.putIfAbsent(template.what(), template);
-            for (AEKey fuzzy : snapshot.findFuzzyTemplates(template.what())) {
+            for (AEKey fuzzy : stockedVariants.apply(template.what())) {
                 byKey.putIfAbsent(fuzzy, new GenericStack(fuzzy, template.amount()));
             }
-            for (AEKey craftable : craftableSameIdVariants(
-                    craftingService, template.what(), craftableVariantCache)) {
-                byKey.putIfAbsent(craftable, new GenericStack(craftable, template.amount()));
+            AEKey identity = template.what().dropSecondary();
+            for (AEKey craftable : craftableVariants.apply(identity)) {
+                if (OverloadPatternMatchPolicy.accepts(
+                        possible, true, craftable, false)) {
+                    byKey.putIfAbsent(craftable, new GenericStack(craftable, template.amount()));
+                }
             }
         }
         return new ArrayList<>(byKey.values());
     }
 
+    private static boolean producerMatchesRequirement(
+            IPatternDetails details, AEKey requestedKey, RequirementMode requirementMode) {
+        var providerDetails = CraftingPatternDelegates.forProviderLookup(details);
+        if (!(providerDetails instanceof OverloadedProviderOnlyPatternDetails overload)) {
+            return true;
+        }
+        var outputs = providerDetails.getOutputs();
+        for (int slot = 0; slot < outputs.size(); slot++) {
+            var output = outputs.get(slot);
+            if (output != null && requestedKey.equals(output.what())) {
+                return OverloadPatternMatchPolicy.accepts(
+                        new GenericStack[] {new GenericStack(requestedKey, 1)},
+                        requirementMode.acceptsIdOnlyOutput(),
+                        output.what(),
+                        overload.isFuzzyOutput(slot));
+            }
+        }
+        return true;
+    }
+
+    enum RequirementMode {
+        STRICT,
+        ID_ONLY,
+        MIXED;
+
+        boolean acceptsIdOnlyOutput() {
+            return this == ID_ONLY;
+        }
+
+        static RequirementMode merge(RequirementMode left, RequirementMode right) {
+            return left == right ? left : MIXED;
+        }
+    }
+
+    private record GraphBuildDiscovery(
+            Set<Item> durabilityConflicts,
+            Map<AEKey, RequirementMode> lateRequirementModes) {
+    }
+
     /**
-     * Every key the network can craft that an ID_ONLY slot demanding {@code template} would accept:
-     * same key type and same id ({@link AEKey#getId()} is the item's registry id for item keys, NBT
-     * excluded). This is what lets a strict plain pattern, a strict overload pattern, or another
-     * ID_ONLY overload pattern supply an ID_ONLY slot even when its declared output NBT differs from
-     * the slot's captured template and no unit is currently stocked. One network-wide scan per
-     * distinct template, memoized for the whole graph build.
+     * Tracks the demand capability attached to each concrete graph key. If a key has already been
+     * expanded and a later edge tightens its mode, the current graph is discarded and rebuilt with
+     * that mode forced from the start. This makes producer eligibility independent of BFS order.
      */
-    private static List<AEKey> craftableSameIdVariants(ICraftingService craftingService,
-                                                       AEKey template,
-                                                       Map<AEKey, List<AEKey>> cache) {
-        return cache.computeIfAbsent(template, t -> List.copyOf(craftingService.getCraftables(
-                k -> k.getType() == t.getType() && k.getId().equals(t.getId()))));
+    static final class RequirementModes {
+        private final Map<AEKey, RequirementMode> modes;
+        private final Set<AEKey> processed = new HashSet<>();
+        private final Map<AEKey, RequirementMode> lateChanges = new HashMap<>();
+
+        RequirementModes(AEKey root, Map<AEKey, RequirementMode> forcedModes) {
+            modes = new HashMap<>(forcedModes);
+            require(root, RequirementMode.STRICT);
+        }
+
+        RequirementMode modeFor(AEKey key) {
+            return modes.getOrDefault(key, RequirementMode.STRICT);
+        }
+
+        void markProcessed(AEKey key) {
+            processed.add(key);
+        }
+
+        void require(AEKey key, RequirementMode requested) {
+            var previous = modes.get(key);
+            var merged = previous == null ? requested : RequirementMode.merge(previous, requested);
+            if (merged == previous) {
+                return;
+            }
+            modes.put(key, merged);
+            if (processed.contains(key)) {
+                lateChanges.merge(key, merged, RequirementMode::merge);
+            }
+        }
+
+        Map<AEKey, RequirementMode> lateChanges() {
+            return Map.copyOf(lateChanges);
+        }
+    }
+
+    /** Builds one same-primary-identity index from AE2's full craftable snapshot, lazily. */
+    static final class PrimaryIdentityCraftables {
+        private final Supplier<? extends Iterable<AEKey>> source;
+        private Map<AEKey, List<AEKey>> byIdentity;
+
+        PrimaryIdentityCraftables(Supplier<? extends Iterable<AEKey>> source) {
+            this.source = source;
+        }
+
+        List<AEKey> get(AEKey identity) {
+            if (byIdentity == null) {
+                var mutable = new LinkedHashMap<AEKey, List<AEKey>>();
+                var craftables = source.get();
+                if (craftables != null) {
+                    for (var craftable : craftables) {
+                        if (craftable == null) continue;
+                        mutable.computeIfAbsent(
+                                craftable.dropSecondary(), ignored -> new ArrayList<>()).add(craftable);
+                    }
+                }
+                var frozen = new HashMap<AEKey, List<AEKey>>();
+                for (var entry : mutable.entrySet()) {
+                    frozen.put(entry.getKey(), List.copyOf(entry.getValue()));
+                }
+                byIdentity = Map.copyOf(frozen);
+            }
+            return byIdentity.getOrDefault(identity, List.of());
+        }
+    }
+
+    private static boolean mergeForcedRequirementModes(
+            Map<AEKey, RequirementMode> forced,
+            Map<AEKey, RequirementMode> discovered) {
+        boolean changed = false;
+        for (var entry : discovered.entrySet()) {
+            var previous = forced.get(entry.getKey());
+            var merged = previous == null
+                    ? entry.getValue() : RequirementMode.merge(previous, entry.getValue());
+            if (merged != previous) {
+                forced.put(entry.getKey(), merged);
+                changed = true;
+            }
+        }
+        return changed;
+    }
+
+    static boolean isCraftingPattern(IPatternDetails details) {
+        var current = details;
+        var visited = java.util.Collections.newSetFromMap(
+                new java.util.IdentityHashMap<IPatternDetails, Boolean>());
+        while (current instanceof WrappedPatternDetails wrapped) {
+            if (!visited.add(current)) {
+                return false;
+            }
+            current = wrapped.wrappedPatternDetails();
+            if (current == null) {
+                return false;
+            }
+        }
+        return current instanceof AECraftingPattern;
     }
 
     /**
@@ -655,8 +834,11 @@ public final class FastCraftingPlanner {
     }
 
     /**
-     * Detect a durability-tool input and capture its degradation chain once, delegating the chain
-     * building / reduction to the engine ({@link DurabilityChain}).
+     * Detect a durability-tool input from an AE2 crafting pattern and capture its degradation chain
+     * once, delegating the chain building / reduction to the engine ({@link DurabilityChain}). Callers
+     * must not invoke this for processing or other pattern kinds. A chain is accepted only when this
+     * input's remainder stays on the same item id; null, unchanged, and different-id remainders are not
+     * durability semantics.
      *
      * <p>The only AE2-specific bits are the two lambdas: {@code remaining} follows
      * {@code getRemainingKey} but returns {@code null} when the step leaves the tool's own {@link Item}
@@ -847,13 +1029,26 @@ public final class FastCraftingPlanner {
      * real pattern and resolves the fuzzy slot from whatever the plan charged as used); the v2 planner
      * treats them as competing recipes and picks per availability.
      */
-    private static void emitBestCombinations(CraftGraph.Builder<AEKey> builder, Set<AEKey> seen, Deque<AEKey> queue,
-                                         AEKey key, long outputAmount, List<CraftOutput<AEKey>> byproducts,
-                                         List<List<SlotChoice>> slotOptions, IPatternDetails source) {
+    private static void emitBestCombinations(
+            CraftGraph.Builder<AEKey> builder,
+            Set<AEKey> seen,
+            Deque<AEKey> queue,
+            AEKey key,
+            long outputAmount,
+            List<CraftOutput<AEKey>> byproducts,
+            List<List<SlotChoice>> slotOptions,
+            List<RequirementMode> slotRequirementModes,
+            RequirementModes requirementModes,
+            IPatternDetails source) {
         for (List<SlotChoice> selectedSlots
                 : BoundedCombinations.bestFirst(slotOptions, (int) FUZZY_NONCYCLE_STEPS)) {
             List<CraftInput<AEKey>> coreInputs = new ArrayList<>();
-            for (SlotChoice selected : selectedSlots) {
+            for (int slot = 0; slot < selectedSlots.size(); slot++) {
+                SlotChoice selected = selectedSlots.get(slot);
+                RequirementMode mode = slotRequirementModes.get(slot);
+                for (var input : selected.inputs()) {
+                    requirementModes.require(input.key(), mode);
+                }
                 coreInputs.addAll(selected.inputs());
             }
             // A container option (consume full, return empty) contributes its leftover as a byproduct of
@@ -864,6 +1059,7 @@ public final class FastCraftingPlanner {
                     queue.add(opt.key());
                 }
                 if (opt.remainder() != null) {
+                    requirementModes.require(opt.remainder(), RequirementMode.STRICT);
                     if (combo == byproducts) {
                         combo = new ArrayList<>(byproducts);
                     }
