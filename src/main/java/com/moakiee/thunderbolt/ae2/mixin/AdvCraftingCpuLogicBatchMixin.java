@@ -1,0 +1,143 @@
+package com.moakiee.thunderbolt.ae2.mixin;
+
+import java.util.HashMap;
+import java.util.IdentityHashMap;
+import java.util.Map;
+
+import org.jetbrains.annotations.Nullable;
+import org.spongepowered.asm.mixin.Final;
+import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.Pseudo;
+import org.spongepowered.asm.mixin.Shadow;
+import org.spongepowered.asm.mixin.Unique;
+import org.spongepowered.asm.mixin.injection.At;
+
+import com.llamalad7.mixinextras.injector.wrapoperation.Operation;
+import com.llamalad7.mixinextras.injector.wrapoperation.WrapOperation;
+
+import net.minecraft.world.level.Level;
+
+import appeng.api.crafting.IPatternDetails;
+import appeng.api.networking.crafting.ICraftingProvider;
+import appeng.api.networking.energy.IEnergyService;
+import appeng.crafting.inv.ListCraftingInventory;
+import appeng.hooks.ticking.TickHandler;
+import appeng.me.service.CraftingService;
+
+import com.moakiee.thunderbolt.ae2.batch.AaeBatchJobView;
+import com.moakiee.thunderbolt.ae2.batch.BatchCpuAccounting;
+import com.moakiee.thunderbolt.ae2.batch.BatchExecutor;
+import com.moakiee.thunderbolt.ae2.batch.BatchProviderFilterIterable;
+
+@Pseudo
+@Mixin(targets = "net.pedroksl.advanced_ae.common.logic.AdvCraftingCPULogic", remap = false)
+public abstract class AdvCraftingCpuLogicBatchMixin {
+    @Shadow
+    // AAE is optional; the shadowed field type is only known at runtime.
+    private Object job;
+
+    @Shadow
+    @Final
+    private ListCraftingInventory inventory;
+
+    @Shadow
+    @Final
+    private Object cpu;
+
+    @Unique
+    @Nullable
+    private Map<IPatternDetails, IdentityHashMap<ICraftingProvider, Boolean>> ae2lt$batchedByTask;
+
+    @Unique
+    private long ae2lt$batchTick;
+
+    @Unique
+    private boolean ae2lt$batchExhaustedThisTick;
+
+    @WrapOperation(
+            method = "tickCraftingLogic",
+            at = @At(
+                    value = "INVOKE",
+                    target = "Lnet/pedroksl/advanced_ae/common/logic/AdvCraftingCPULogic;executeCrafting"
+                            + "(ILappeng/me/service/CraftingService;Lappeng/api/networking/energy/IEnergyService;"
+                            + "Lnet/minecraft/world/level/Level;)I"
+            )
+    )
+    private int ae2lt$wrapExecuteCrafting(Object self,
+                                          int remainingOps,
+                                          CraftingService craftingService,
+                                          IEnergyService energyService,
+                                          Level level,
+                                          Operation<Integer> original) {
+        long now = TickHandler.instance().getCurrentTick();
+        var batchedByTask = ae2lt$getBatchedByTask();
+        if (now != ae2lt$batchTick) {
+            ae2lt$batchTick = now;
+            batchedByTask.clear();
+            ae2lt$batchExhaustedThisTick = false;
+        }
+
+        if (job == null || ae2lt$batchExhaustedThisTick) {
+            return original.call(self, remainingOps, craftingService, energyService, level);
+        }
+
+        var batchResult = BatchExecutor.runBatchOnly(
+                remainingOps,
+                BatchCpuAccounting.Mode.LINEAR,
+                craftingService,
+                energyService,
+                level,
+                new AaeBatchJobView(job),
+                inventory,
+                batchedByTask,
+                this::ae2lt$markCpuDirty);
+
+        if (batchResult.dispatchedCopies() > 0) {
+            // AdvancedAE CPUs keep batch extraction/provider dispatch, but pay one operation per copy.
+            // UNBOUNDED providers (such as creative item sources) still pay one operation per dispatch.
+            return batchResult.consumedCpuOps();
+        }
+
+        // No batch-dispatchable task this tick (no batch provider / all full / out of material).
+        // Game time is frozen within a tick, so capacity cannot recover; skip the per-round re-probe.
+        ae2lt$batchExhaustedThisTick = true;
+        return original.call(self, remainingOps, craftingService, energyService, level);
+    }
+
+    @WrapOperation(
+            method = "executeCrafting",
+            at = @At(
+                    value = "INVOKE",
+                    target = "Lappeng/me/service/CraftingService;getProviders"
+                            + "(Lappeng/api/crafting/IPatternDetails;)Ljava/lang/Iterable;"
+            )
+    )
+    private Iterable<ICraftingProvider> ae2lt$filterBatched(CraftingService craftingService,
+                                                            IPatternDetails details,
+                                                            Operation<Iterable<ICraftingProvider>> original) {
+        var raw = original.call(craftingService, details);
+        var batchedByTask = ae2lt$getBatchedByTask();
+        if (batchedByTask.isEmpty()) return raw;
+        var perTask = batchedByTask.get(details);
+        if (perTask == null || perTask.isEmpty()) return raw;
+        return new BatchProviderFilterIterable(raw, perTask);
+    }
+
+    @Unique
+    private void ae2lt$markCpuDirty() {
+        // AdvancedAE is optional; invoke markDirty reflectively on the shadowed CPU.
+        if (cpu == null) return;
+        try {
+            var method = cpu.getClass().getMethod("markDirty");
+            method.invoke(cpu);
+        } catch (ReflectiveOperationException ignored) {}
+    }
+
+    @Unique
+    private Map<IPatternDetails, IdentityHashMap<ICraftingProvider, Boolean>> ae2lt$getBatchedByTask() {
+        if (this.ae2lt$batchedByTask == null) {
+            this.ae2lt$batchedByTask = new HashMap<>();
+        }
+        return this.ae2lt$batchedByTask;
+    }
+}

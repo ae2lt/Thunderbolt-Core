@@ -1,0 +1,159 @@
+plugins {
+    id 'eclipse'
+    id 'idea'
+    id 'maven-publish'
+    id 'net.minecraftforge.gradle' version '[6.0,6.2)'
+    id 'org.spongepowered.mixin' version '0.7.+'
+}
+
+version = mod_version
+group = mod_group_id
+
+base {
+    archivesName = project.findProperty("artifact_name") ?: mod_id
+}
+
+java.toolchain.languageVersion = JavaLanguageVersion.of(17)
+
+minecraft {
+    mappings channel: 'official', version: minecraft_version
+    copyIdeResources = true
+
+    runs {
+        client {
+            workingDirectory project.file('run')
+            property 'forge.logging.markers', 'REGISTRIES'
+            property 'forge.logging.console.level', 'debug'
+            mods { "${mod_id}" { source sourceSets.main } }
+        }
+        server {
+            workingDirectory project.file('run')
+            property 'forge.logging.markers', 'REGISTRIES'
+            property 'forge.logging.console.level', 'debug'
+            mods { "${mod_id}" { source sourceSets.main } }
+        }
+        data {
+            workingDirectory project.file('run')
+            property 'forge.logging.markers', 'REGISTRIES'
+            property 'forge.logging.console.level', 'debug'
+            args '--mod', mod_id, '--all', '--output', file('src/generated/resources/'), '--existing', file('src/main/resources/')
+            mods { "${mod_id}" { source sourceSets.main } }
+        }
+    }
+}
+
+mixin {
+    add sourceSets.main, "${mod_id}.refmap.json"
+    config "${mod_id}.mixins.json"
+}
+
+repositories {
+    mavenLocal()
+    mavenCentral()
+    // Forge/MCP 工具链依赖（accesstransformers 等）通过项目仓库解析。
+    maven {
+        name = 'MinecraftForge'
+        url = 'https://maven.minecraftforge.net/'
+    }
+    // 本地镜像仓库：maven.modrinth.com TLS 握手被网络阻断，AE2 15.4.10 已从
+    // Modrinth CDN 下载并放置到 repo/ 目录（见 repo/maven/modrinth/ae2/15.4.10/）。
+    maven {
+        name = 'LocalMirror'
+        url = uri("${projectDir}/repo")
+    }
+    maven {
+        name = 'Modrinth'
+        url = 'https://maven.modrinth.com'
+    }
+    maven {
+        name = 'CurseMaven'
+        url = 'https://www.cursemaven.com'
+        content {
+            includeGroup "curse.maven"
+        }
+    }
+}
+
+dependencies {
+    minecraft "net.minecraftforge:forge:${minecraft_version}-${forge_version}"
+
+    // MixinExtras (@WrapOperation/@Local) is built into NeoForge but NOT Forge — required explicitly.
+    // mixinextras-forge is a jar-in-jar shell (classes live in META-INF/jars/MixinExtras-0.4.1.jar),
+    // so javac cannot see the classes from the shell artifact. Compile against mixinextras-common
+    // (plain jar with all classes), keep the forge jar-in-jar artifact on the runtime classpath.
+    compileOnly "io.github.llamalad7:mixinextras-common:0.4.1"
+    annotationProcessor "io.github.llamalad7:mixinextras-common:0.4.1"
+    runtimeOnly fg.deobf("io.github.llamalad7:mixinextras-forge:0.4.1")
+
+    // Mixin annotation processor — generates thunderbolt.refmap.json.
+    annotationProcessor 'org.spongepowered:mixin:0.8.5:processor'
+
+    // AE2 — Modrinth Maven (15.4.10 is not on Maven Central). compileOnly: this layer patches AE2 via
+    // mixins; AE2 is provided by the modpack at runtime. The pure planner core under
+    // `crafting.core` has NO AE2 dependency and is unit-tested standalone.
+    compileOnly "maven.modrinth:ae2:15.4.10"
+
+    // Applied Flux — CurseForge 1.20.1 file.
+    compileOnly "curse.maven:applied-flux-965012:7651647"
+
+    // Unit tests for the pure planner core (no Minecraft/AE2 needed).
+    testImplementation platform("org.junit:junit-bom:5.10.2")
+    testImplementation "org.junit.jupiter:junit-jupiter"
+    testRuntimeOnly "org.junit.platform:junit-platform-launcher"
+    // AE2 API types exercised directly by unit tests (e.g. ByteTracker's AEKeyType);
+    // compileOnly deps are absent from the test runtime classpath otherwise.
+    testRuntimeOnly "maven.modrinth:ae2:15.4.10"
+}
+
+// Tests that exercise SavedData/codecs need the same generated Minecraft/Forge classes as main.
+sourceSets.test.compileClasspath += sourceSets.main.compileClasspath
+sourceSets.test.runtimeClasspath += sourceSets.main.runtimeClasspath
+
+test {
+    useJUnitPlatform()
+    testLogging {
+        events "passed", "skipped", "failed"
+    }
+}
+
+processResources {
+    var replaceProperties = [
+        minecraft_version      : minecraft_version,
+        minecraft_version_range: minecraft_version_range,
+        forge_version          : forge_version,
+        forge_version_range    : forge_version_range,
+        loader_version_range   : loader_version_range,
+        mod_id                 : mod_id,
+        mod_name               : mod_name,
+        mod_license            : mod_license,
+        mod_version            : mod_version,
+        mod_authors            : mod_authors,
+        mod_description        : mod_description]
+    inputs.properties replaceProperties
+    filesMatching('META-INF/mods.toml') {
+        expand replaceProperties
+    }
+}
+
+publishing {
+    publications {
+        register('mavenJava', MavenPublication) {
+            from components.java
+            artifactId = mod_id
+        }
+    }
+    repositories {
+        maven {
+            url = project.projectDir.toPath().resolve("repo").toUri()
+        }
+    }
+}
+
+if (plugins.hasPlugin('idea')) {
+    idea {
+        module {
+            downloadSources = true
+            downloadJavadoc = true
+        }
+    }
+}
