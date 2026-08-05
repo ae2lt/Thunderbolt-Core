@@ -1,4 +1,4 @@
-package com.moakiee.thunderbolt.ae2.crafting;
+package com.moakiee.thunderbolt.mixin.ae2.crafting.support;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -29,11 +29,12 @@ import appeng.crafting.CraftingPlan;
 import appeng.crafting.inv.ChildCraftingSimulationState;
 import appeng.crafting.inv.ICraftingInventory;
 
-import com.moakiee.thunderbolt.core.planner.CraftGraph;
-import com.moakiee.thunderbolt.core.planner.CraftInput;
-import com.moakiee.thunderbolt.core.planner.CraftPattern;
-import com.moakiee.thunderbolt.core.planner.CraftPlan;
-import com.moakiee.thunderbolt.core.planner.CraftPlannerV2;
+import com.moakiee.thunderbolt.core.crafting.planner.CraftGraph;
+import com.moakiee.thunderbolt.core.crafting.planner.CraftInput;
+import com.moakiee.thunderbolt.core.crafting.planner.CraftPattern;
+import com.moakiee.thunderbolt.core.crafting.planner.CraftPlan;
+import com.moakiee.thunderbolt.core.crafting.planner.CraftPlannerV2;
+import com.moakiee.thunderbolt.core.crafting.support.CraftingStockPolicy;
 
 import org.junit.jupiter.api.Test;
 
@@ -101,7 +102,7 @@ class FastCraftingPlannerPlanConversionTest {
         Method method = FastCraftingPlanner.class.getDeclaredMethod(
                 "toAe2Plan", AEKey.class, long.class, CraftPlan.class,
                 boolean.class, boolean.class, Map.class, Map.class, Set.class,
-                ChildCraftingSimulationState.class, ReservedStockCraftingRequester.class);
+                ChildCraftingSimulationState.class, CraftingStockPolicy.class);
         method.setAccessible(true);
         var snapshot = new ChildCraftingSimulationState(new EmptyInventory());
         return (CraftingPlan) method.invoke(

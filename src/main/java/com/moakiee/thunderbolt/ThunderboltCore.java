@@ -2,9 +2,10 @@ package com.moakiee.thunderbolt;
 
 import com.mojang.logging.LogUtils;
 import com.moakiee.thunderbolt.api.eject.EjectCapabilityRegistry;
-import com.moakiee.thunderbolt.ae2.cell.IndexedCellStorageRegistry;
-import com.moakiee.thunderbolt.ae2.cell.IndexedStorageCellHandler;
-import com.moakiee.thunderbolt.registry.ThunderboltBlockEntities;
+import com.moakiee.thunderbolt.core.storage.cell.IndexedCellStorageRegistry;
+import com.moakiee.thunderbolt.core.storage.cell.IndexedStorageCellHandler;
+import com.moakiee.thunderbolt.core.eject.ThunderboltBlockEntities;
+import com.moakiee.thunderbolt.core.eject.EjectEndpointIndex;
 import appeng.api.storage.StorageCells;
 import net.neoforged.bus.api.IEventBus;
 import net.neoforged.fml.event.lifecycle.FMLCommonSetupEvent;
@@ -28,6 +29,7 @@ public final class ThunderboltCore {
     public static final Logger LOGGER = LogUtils.getLogger();
 
     public ThunderboltCore(IEventBus modEventBus) {
+        EjectCapabilityRegistry.installRuntime(EjectEndpointIndex.INSTANCE);
         ThunderboltBlockEntities.TYPES.register(modEventBus);
         modEventBus.addListener(this::onCommonSetup);
         NeoForge.EVENT_BUS.addListener(this::onServerStarting);
@@ -36,12 +38,12 @@ public final class ThunderboltCore {
     }
 
     private void onServerStarting(ServerStartingEvent event) {
-        EjectCapabilityRegistry.onServerStart(event.getServer());
+        EjectEndpointIndex.INSTANCE.onServerStart(event.getServer());
         IndexedCellStorageRegistry.get(event.getServer());
     }
 
     private void onServerStopped(ServerStoppedEvent event) {
-        EjectCapabilityRegistry.onServerStop();
+        EjectEndpointIndex.INSTANCE.onServerStop();
     }
 
     private void onCommonSetup(FMLCommonSetupEvent event) {

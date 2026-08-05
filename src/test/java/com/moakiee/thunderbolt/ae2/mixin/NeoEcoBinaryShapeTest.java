@@ -1,4 +1,4 @@
-package com.moakiee.thunderbolt.ae2.mixin;
+package com.moakiee.thunderbolt.mixin.compat.neoeco;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;

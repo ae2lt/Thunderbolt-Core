@@ -1,4 +1,4 @@
-package com.moakiee.thunderbolt.ae2.mixin;
+package com.moakiee.thunderbolt.mixin;
 
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -9,7 +9,7 @@ class OptionalMixinSelectorTest {
     @Test
     void skipsAdvancedAeTargetsWhenAddonIsMissing() {
         assertFalse(OptionalMixinSelector.shouldApply(
-                "com.moakiee.thunderbolt.ae2.mixin.AdvCraftingCpuLogicMixin",
+                "com.moakiee.thunderbolt.mixin.compat.advancedae.AdvCraftingCpuLogicBatchMixin",
                 ignored -> false));
         assertFalse(OptionalMixinSelector.shouldApply("AaeTaskProgressAccessor", ignored -> false));
     }
@@ -17,30 +17,19 @@ class OptionalMixinSelectorTest {
     @Test
     void skipsNeoEcoTargetsWhenAddonIsMissing() {
         assertFalse(OptionalMixinSelector.shouldApply("ECOCraftingCpuLogicBatchMixin", ignored -> false));
-        assertFalse(OptionalMixinSelector.shouldApply("ECOCraftingCpuLogicMixin", ignored -> false));
         assertFalse(OptionalMixinSelector.shouldApply("ECOCraftingCpuAccessor", ignored -> false));
         assertFalse(OptionalMixinSelector.shouldApply("NeoEcoPatternBusBatchMixin", ignored -> false));
-    }
-
-    @Test
-    void gatesAe2CraftingTreeCompatibilityToItsOwningAddon() {
-        assertFalse(OptionalMixinSelector.shouldApply(
-                "Ae2CraftingTreeCompatibilityMixin", ignored -> false));
-        assertTrue(OptionalMixinSelector.shouldApply(
-                "Ae2CraftingTreeCompatibilityMixin", "ae2ct"::equals));
     }
 
     @Test
     void appliesOptionalTargetsWhenTheirModIsLoaded() {
         assertTrue(OptionalMixinSelector.shouldApply("AdvCraftingCpuAccessor", "advanced_ae"::equals));
         assertTrue(OptionalMixinSelector.shouldApply("ECOCraftingCpuLogicBatchMixin", "neoecoae"::equals));
-        assertTrue(OptionalMixinSelector.shouldApply("ECOCraftingCpuLogicMixin", "neoecoae"::equals));
         assertTrue(OptionalMixinSelector.shouldApply("NeoEcoPatternBusBatchMixin", "neoecoae"::equals));
     }
 
     @Test
     void neverGatesRequiredMixins() {
         assertTrue(OptionalMixinSelector.shouldApply("CraftingCalculationMixin", ignored -> false));
-        assertTrue(OptionalMixinSelector.shouldApply("ExtendedCraftingCpuServiceMixin", ignored -> false));
     }
 }

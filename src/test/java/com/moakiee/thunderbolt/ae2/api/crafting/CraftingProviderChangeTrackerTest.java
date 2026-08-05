@@ -1,4 +1,4 @@
-package com.moakiee.thunderbolt.ae2.api.crafting;
+package com.moakiee.thunderbolt.mixin.ae2.crafting.support;
 
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;

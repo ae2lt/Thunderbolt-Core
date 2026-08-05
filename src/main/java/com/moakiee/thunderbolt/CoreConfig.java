@@ -7,7 +7,7 @@ import com.moakiee.thunderbolt.core.util.FastWildcardMatcher;
 /** Lightweight host-configured values shared by Thunderbolt's low-level hooks. */
 public final class CoreConfig {
     /**
-     * Channel capacity granted per overloaded controller by the channel/max-flow grid mixins.
+     * Channel capacity granted per registered high-capacity controller by the channel grid mixins.
      * Defaults to 128; the host mod (AE2 Lightning Tech) overwrites it from its own config during
      * setup via {@link #setChannelsPerController(int)} so the value stays user-configurable.
      */
