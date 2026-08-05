@@ -11,6 +11,7 @@ import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.function.Function;
 import java.util.function.Supplier;
@@ -43,6 +44,7 @@ import com.moakiee.thunderbolt.core.planner.CraftPattern;
 import com.moakiee.thunderbolt.core.planner.CraftPlan;
 import com.moakiee.thunderbolt.core.planner.CraftPlannerV2;
 import com.moakiee.thunderbolt.core.planner.PlanningResult;
+import com.moakiee.thunderbolt.core.planner.PlanningCancellation;
 import com.moakiee.thunderbolt.core.planner.ReusableStockFallback;
 import com.moakiee.thunderbolt.core.planner.ReusableStockUsageKey;
 import com.moakiee.thunderbolt.core.planner.DurabilityChain;
@@ -133,7 +135,62 @@ public final class FastCraftingPlanner {
      */
     static final long FUZZY_CYCLE_STEPS = 8192;
 
+    /** Adapter-side cap before the immutable core graph exists. */
+    private static final long MAX_GRAPH_EXPORT_WORK = Math.max(
+            4_096L,
+            Long.getLong("thunderbolt.maxGraphExportWork", 65_536L));
+
     private FastCraftingPlanner() {
+    }
+
+    /**
+     * Single-threaded state for every amount probe made by one AE2 crafting calculation. The
+     * inventory/pattern graph is immutable for that calculation, so it is compiled once while the
+     * core planner shares its exact and fallback work budgets across {@code CRAFT_LESS} probes.
+     */
+    public static final class CalculationSession {
+        private ICraftingService craftingService;
+        private CraftingSimulationState networkInv;
+        private Level level;
+        private AEKey output;
+        private ReservedStockCraftingRequester reservedStock;
+        private Thread owner;
+        private CompiledGraph compiledGraph;
+        private final CraftPlannerV2.PlanningSession<AEKey> plannerSession =
+                new CraftPlannerV2.PlanningSession<>();
+
+        public CalculationSession() {
+        }
+
+        private void bind(
+                ICraftingService candidateCraftingService,
+                CraftingSimulationState candidateNetworkInv,
+                Level candidateLevel,
+                AEKey candidateOutput,
+                @Nullable ReservedStockCraftingRequester candidateReservedStock) {
+            PlanningCancellation.check();
+            Thread current = Thread.currentThread();
+            if (owner == null) {
+                craftingService = candidateCraftingService;
+                networkInv = candidateNetworkInv;
+                level = candidateLevel;
+                output = candidateOutput;
+                reservedStock = candidateReservedStock;
+                owner = current;
+                return;
+            }
+            if (owner != current) {
+                throw new IllegalStateException("calculation session cannot move between threads");
+            }
+            if (craftingService != candidateCraftingService
+                    || networkInv != candidateNetworkInv
+                    || level != candidateLevel
+                    || reservedStock != candidateReservedStock
+                    || !Objects.equals(output, candidateOutput)) {
+                throw new IllegalArgumentException(
+                        "calculation session is already bound to another crafting calculation");
+            }
+        }
     }
 
     /** Outcome of an attempt: either declined (run AE2) or handled (use {@link #plan}, may be null). */
@@ -171,7 +228,9 @@ public final class FastCraftingPlanner {
                                          AEKey output,
                                          long amount,
                                          boolean simulate) {
-        return tryAttempt(craftingService, networkInv, level, output, amount, simulate, null);
+        return tryAttempt(
+                craftingService, networkInv, level, output, amount, simulate, null,
+                new CalculationSession());
     }
 
     public static FastAttempt tryAttempt(ICraftingService craftingService,
@@ -181,61 +240,60 @@ public final class FastCraftingPlanner {
                                          long amount,
                                          boolean simulate,
                                          @Nullable ReservedStockCraftingRequester reservedStock) {
+        return tryAttempt(
+                craftingService, networkInv, level, output, amount, simulate, reservedStock,
+                new CalculationSession());
+    }
+
+    public static FastAttempt tryAttempt(ICraftingService craftingService,
+                                         CraftingSimulationState networkInv,
+                                         Level level,
+                                         AEKey output,
+                                         long amount,
+                                         boolean simulate,
+                                         @Nullable ReservedStockCraftingRequester reservedStock,
+                                         CalculationSession session) {
         if (amount <= 0) {
             return FastAttempt.decline();
         }
+        Objects.requireNonNull(session, "session");
+        session.bind(craftingService, networkInv, level, output, reservedStock);
 
         // Snapshot inventory the same way AE2 does: a child view that ignores the requested output
         // (existing output stock is never consumed; the full amount is always crafted).
         ChildCraftingSimulationState snapshot = new ChildCraftingSimulationState(networkInv);
-        ChildCraftingSimulationState reusableSeedSnapshot = new ChildCraftingSimulationState(networkInv);
         snapshot.ignore(output);
 
-        // A durability item can occasionally be used under incompatible semantics in the same
-        // reachable graph (different damage-per-firing rules, or both degraded and consumed whole).
-        // Discover those items on the first pass, then rebuild only those items conservatively as
-        // whole-item inputs. This keeps every unrelated durability chain on the fast representation
-        // and, unlike pattern-private durability pools, never counts one physical tool more than once.
-        Set<Item> conservativeDurabilityItems = new HashSet<>();
-        Map<AEKey, RequirementMode> forcedRequirementModes = new HashMap<>();
-        PrimaryIdentityCraftables idOnlyCraftables = new PrimaryIdentityCraftables(
-                () -> craftingService.getCraftables(ignored -> true));
-        GraphBuild graphBuild;
-        long graphBuildStarted = System.nanoTime();
-        while (true) {
-            graphBuild = new GraphBuild();
-            GraphBuildDiscovery discovery = buildGraph(
-                    craftingService, snapshot, reusableSeedSnapshot, level, output,
-                    graphBuild.builder, graphBuild.multiplePaths, graphBuild.durability,
-                    graphBuild.patternSources, graphBuild.emittable, conservativeDurabilityItems,
-                    forcedRequirementModes, idOnlyCraftables, reservedStock);
-            boolean durabilityChanged = conservativeDurabilityItems.addAll(
-                    discovery.durabilityConflicts());
-            boolean requirementChanged = mergeForcedRequirementModes(
-                    forcedRequirementModes, discovery.lateRequirementModes());
-            if (!durabilityChanged && !requirementChanged) {
-                // Repeated durability conflicts are still safe because buildGraph drops their patterns;
-                // late requirement changes are forced into the next pass before producers are filtered.
-                // Normally this settles after one discovery pass and one clean rebuild.
-                break;
-            }
+        CompiledGraph compiled = session.compiledGraph;
+        long graphBuildNanos = 0L;
+        if (compiled == null) {
+            long graphBuildStarted = System.nanoTime();
+            compiled = compileGraph(
+                    craftingService,
+                    snapshot,
+                    new ChildCraftingSimulationState(networkInv),
+                    level,
+                    output,
+                    reservedStock);
+            graphBuildNanos = Math.max(0L, System.nanoTime() - graphBuildStarted);
+            session.compiledGraph = compiled;
         }
 
-        CraftGraph<AEKey> graph = graphBuild.builder.build();
-        FastPlanningWatchdog.recordGraphBuild(System.nanoTime() - graphBuildStarted);
-        PlanningResult<AEKey> planning = CraftPlannerV2.planDetailed(graph, output, amount);
+        FastPlanningWatchdog.recordGraphBuild(graphBuildNanos);
+        PlanningResult<AEKey> planning = CraftPlannerV2.planDetailed(
+                compiled.graph, output, amount, session.plannerSession);
         FastPlanningWatchdog.record(planning.diagnostics());
         CraftPlan<AEKey> plan = planning.plan();
         if (!plan.supported()) {
             return FastAttempt.decline();
         }
-        boolean multi = graphBuild.multiplePaths[0];
+        boolean multi = compiled.multiplePaths;
         // Emittable shortfalls are supplied by emitters, not crafted, so they don't make a plan
         // infeasible — only a non-emittable shortfall does.
-        if (plan.feasible() || noNonEmittableMissing(plan, graphBuild.emittable)) {
+        if (plan.feasible() || noNonEmittableMissing(plan, compiled.emittable)) {
             return FastAttempt.handled(
-                    toAe2Plan(output, amount, plan, multi, false, graphBuild.durability,
-                            graphBuild.patternSources, graphBuild.emittable, snapshot, reservedStock),
+                    toAe2Plan(output, amount, plan, multi, false, compiled.durability,
+                            compiled.patternSources, compiled.emittable, snapshot, reservedStock),
                     plan.usedReusableStock());
         }
         // Infeasible at this amount. A completed search reports proven shortfalls; a budget-limited
@@ -247,14 +305,57 @@ public final class FastCraftingPlanner {
             // page. Build that cheap representation now while the graph/snapshot are still available;
             // CraftingCalculationMixin reuses it instead of rebuilding and replanning the same graph.
             return FastAttempt.infeasible(
-                    toAe2Plan(output, amount, plan, multi, true, graphBuild.durability,
-                            graphBuild.patternSources, graphBuild.emittable, snapshot, reservedStock),
+                    toAe2Plan(output, amount, plan, multi, true, compiled.durability,
+                            compiled.patternSources, compiled.emittable, snapshot, reservedStock),
                     plan.usedReusableStock());
         }
         return FastAttempt.handled(
-                toAe2Plan(output, amount, plan, multi, true, graphBuild.durability,
-                        graphBuild.patternSources, graphBuild.emittable, snapshot, reservedStock),
+                toAe2Plan(output, amount, plan, multi, true, compiled.durability,
+                        compiled.patternSources, compiled.emittable, snapshot, reservedStock),
                 plan.usedReusableStock()); // partial + missing
+    }
+
+    private static CompiledGraph compileGraph(
+            ICraftingService craftingService,
+            ChildCraftingSimulationState snapshot,
+            ChildCraftingSimulationState reusableSeedSnapshot,
+            Level level,
+            AEKey output,
+            @Nullable ReservedStockCraftingRequester reservedStock) {
+        // A durability item can occasionally be used under incompatible semantics in the same
+        // reachable graph. Rediscover only those items using conservative whole-item semantics.
+        Set<Item> conservativeDurabilityItems = new HashSet<>();
+        Map<AEKey, RequirementMode> forcedRequirementModes = new HashMap<>();
+        GraphExportBudget exportBudget = new GraphExportBudget(MAX_GRAPH_EXPORT_WORK);
+        PrimaryIdentityCraftables idOnlyCraftables = new PrimaryIdentityCraftables(
+                () -> craftingService.getCraftables(ignored -> true), exportBudget);
+        GraphBuild graphBuild;
+        try {
+            while (true) {
+                exportBudget.consume();
+                graphBuild = new GraphBuild();
+                GraphBuildDiscovery discovery = buildGraph(
+                        craftingService, snapshot, reusableSeedSnapshot, level, output,
+                        graphBuild.builder, graphBuild.multiplePaths, graphBuild.durability,
+                        graphBuild.patternSources, graphBuild.emittable, conservativeDurabilityItems,
+                        forcedRequirementModes, idOnlyCraftables, exportBudget, reservedStock);
+                boolean durabilityChanged = conservativeDurabilityItems.addAll(
+                        discovery.durabilityConflicts());
+                boolean requirementChanged = mergeForcedRequirementModes(
+                        forcedRequirementModes, discovery.lateRequirementModes());
+                if (!durabilityChanged && !requirementChanged) {
+                    break;
+                }
+            }
+        } catch (GraphExportLimitExceeded ignored) {
+            return CompiledGraph.empty();
+        }
+        return new CompiledGraph(
+                graphBuild.builder.build(),
+                graphBuild.multiplePaths[0],
+                graphBuild.durability,
+                graphBuild.patternSources,
+                graphBuild.emittable);
     }
 
     private static final class GraphBuild {
@@ -263,6 +364,58 @@ public final class FastCraftingPlanner {
         private final Map<AEKey, DurabilityChain<AEKey>> durability = new HashMap<>();
         private final Map<AEKey, Set<IPatternDetails>> patternSources = new HashMap<>();
         private final Set<AEKey> emittable = new HashSet<>();
+    }
+
+    private static final class CompiledGraph {
+        private final CraftGraph<AEKey> graph;
+        private final boolean multiplePaths;
+        private final Map<AEKey, DurabilityChain<AEKey>> durability;
+        private final Map<AEKey, Set<IPatternDetails>> patternSources;
+        private final Set<AEKey> emittable;
+
+        private CompiledGraph(
+                CraftGraph<AEKey> graph,
+                boolean multiplePaths,
+                Map<AEKey, DurabilityChain<AEKey>> durability,
+                Map<AEKey, Set<IPatternDetails>> patternSources,
+                Set<AEKey> emittable) {
+            this.graph = graph;
+            this.multiplePaths = multiplePaths;
+            this.durability = Map.copyOf(durability);
+            Map<AEKey, Set<IPatternDetails>> frozenSources = new HashMap<>();
+            patternSources.forEach((key, value) -> frozenSources.put(
+                    key, java.util.Collections.unmodifiableSet(value)));
+            this.patternSources = Map.copyOf(frozenSources);
+            this.emittable = Set.copyOf(emittable);
+        }
+
+        private static CompiledGraph empty() {
+            return new CompiledGraph(
+                    CraftGraph.<AEKey>builder().build(), false, Map.of(), Map.of(), Set.of());
+        }
+    }
+
+    private static final class GraphExportBudget {
+        private long remaining;
+
+        private GraphExportBudget(long work) {
+            remaining = Math.max(1L, work);
+        }
+
+        private void consume() {
+            PlanningCancellation.check();
+            if (remaining-- <= 0L) {
+                throw GraphExportLimitExceeded.INSTANCE;
+            }
+        }
+    }
+
+    private static final class GraphExportLimitExceeded extends RuntimeException {
+        private static final GraphExportLimitExceeded INSTANCE = new GraphExportLimitExceeded();
+
+        private GraphExportLimitExceeded() {
+            super(null, null, false, false);
+        }
     }
 
     private static boolean noNonEmittableMissing(CraftPlan<AEKey> plan, Set<AEKey> emittable) {
@@ -297,6 +450,7 @@ public final class FastCraftingPlanner {
                                       Set<Item> conservativeDurabilityItems,
                                       Map<AEKey, RequirementMode> forcedRequirementModes,
                                       PrimaryIdentityCraftables idOnlyCraftables,
+                                      GraphExportBudget exportBudget,
                                       @Nullable ReservedStockCraftingRequester reservedStock) {
         Set<AEKey> seen = new HashSet<>();
         Deque<AEKey> queue = new ArrayDeque<>();
@@ -323,6 +477,7 @@ public final class FastCraftingPlanner {
         queue.add(root);
 
         while (!queue.isEmpty()) {
+            exportBudget.consume();
             AEKey key = queue.poll();
             requirementModes.markProcessed(key);
 
@@ -357,6 +512,7 @@ public final class FastCraftingPlanner {
             int registeredForKey = 0;
 
             for (IPatternDetails details : patterns) {
+                exportBudget.consume();
                 // Primary-output restriction: a pattern becomes a craft node ONLY under its declared
                 // primary output. getCraftingFor(key) also returns patterns where `key` is merely a
                 // SECONDARY output; if we registered those as a second node producing `key`, the same
@@ -372,7 +528,7 @@ public final class FastCraftingPlanner {
                     continue;
                 }
                 if (!producerMatchesRequirement(
-                        details, key, requirementModes.modeFor(key))) {
+                        details, key, requirementModes.modeFor(key), exportBudget)) {
                     continue;
                 }
                 patternSources.computeIfAbsent(key,
@@ -382,6 +538,7 @@ public final class FastCraftingPlanner {
                 GenericStack primary = null;
                 List<CraftOutput<AEKey>> byproducts = new ArrayList<>(Math.max(0, outputs.size() - 1));
                 for (GenericStack out : outputs) {
+                    exportBudget.consume();
                     if (primary == null && key.equals(out.what())) {
                         primary = out;
                     } else {
@@ -396,15 +553,18 @@ public final class FastCraftingPlanner {
                     var source = seeded.reusableStockSource();
                     var physicalVariants = seeded.availableReusableSeedSnapshot();
                     for (var entry : physicalVariants.entrySet()) {
+                        exportBudget.consume();
                         if (entry.getKey() == null || entry.getValue() == null || entry.getValue() <= 0) continue;
                         builder.reusableStock(
                                 source.storageScope(), entry.getKey(), entry.getValue());
                     }
                     for (var requirement : seeded.totalReusableSeedRequirements().entrySet()) {
+                        exportBudget.consume();
                         if (requirement.getKey() == null || requirement.getValue() == null
                                 || requirement.getValue() <= 0) continue;
                         var acceptedVariants = new ArrayList<AEKey>();
                         for (var actual : physicalVariants.keySet()) {
+                            exportBudget.consume();
                             if (actual != null
                                     && seeded.acceptsReusableSeedVariant(requirement.getKey(), actual)) {
                                 acceptedVariants.add(actual);
@@ -448,6 +608,7 @@ public final class FastCraftingPlanner {
                 long combos = 1;
                 boolean patternUnsatisfiable = false;
                 for (int slot = 0; slot < inputs.length; slot++) {
+                    exportBudget.consume();
                     IPatternDetails.IInput in = inputs[slot];
                     // Durability semantics are inferred only for real crafting patterns. Processing
                     // patterns cannot encode component-dependent tool degradation reliably, so even a
@@ -455,7 +616,7 @@ public final class FastCraftingPlanner {
                     ChainLookup lookup = craftingPattern
                             ? durabilityChain(in, craftingService, snapshot, level, builder,
                                     durability, linkOwner, itemUnitKeys, conservativeDurabilityItems,
-                                    reservedStock)
+                                    exportBudget, reservedStock)
                             : ChainLookup.NONE;
                     if (lookup.conflict()) {
                         durabilityConflicts.add(lookup.conflictItem());
@@ -480,12 +641,13 @@ public final class FastCraftingPlanner {
                     }
                     boolean idOnly = overloadView != null && overloadView.isFuzzyInput(slot);
                     List<GenericStack> templates = idOnlyTemplates(
-                            in, idOnly, snapshot, idOnlyCraftables);
+                            in, idOnly, snapshot, idOnlyCraftables, exportBudget);
                     templates = addConservativeDurabilityTemplates(
                             in, templates, craftingService, snapshot, level,
-                            conservativeDurabilityItems);
+                            conservativeDurabilityItems, exportBudget);
                     List<CraftInput<AEKey>> opts = new ArrayList<>(templates.size());
                     for (GenericStack template : templates) {
+                        exportBudget.consume();
                         AEKey inputKey = template.what();
                         if (linkOwner.containsKey(inputKey)) {
                             // Whole-item consumption of a key some chain prices in uses (its carrier
@@ -571,7 +733,7 @@ public final class FastCraftingPlanner {
                 // product is within budget this emits all of them, otherwise it greedily keeps the front.
                 emitBestCombinations(
                         builder, seen, queue, key, outAmount, byproducts, slotOptions,
-                        slotRequirementModes, requirementModes, details);
+                        slotRequirementModes, requirementModes, details, exportBudget);
                 registeredForKey++;
             }
             if (registeredForKey > 1) {
@@ -602,12 +764,14 @@ public final class FastCraftingPlanner {
             IPatternDetails.IInput in,
             boolean idOnly,
             ChildCraftingSimulationState snapshot,
-            PrimaryIdentityCraftables craftableIndex) {
+            PrimaryIdentityCraftables craftableIndex,
+            GraphExportBudget exportBudget) {
         return expandIdOnlyTemplates(
                 in,
                 idOnly,
                 snapshot::findFuzzyTemplates,
-                craftableIndex::get);
+                craftableIndex::get,
+                exportBudget);
     }
 
     static List<GenericStack> expandIdOnlyTemplates(
@@ -615,18 +779,31 @@ public final class FastCraftingPlanner {
             boolean idOnly,
             Function<AEKey, ? extends Iterable<AEKey>> stockedVariants,
             Function<AEKey, ? extends Iterable<AEKey>> craftableVariants) {
+        return expandIdOnlyTemplates(
+                in, idOnly, stockedVariants, craftableVariants, null);
+    }
+
+    private static List<GenericStack> expandIdOnlyTemplates(
+            IPatternDetails.IInput in,
+            boolean idOnly,
+            Function<AEKey, ? extends Iterable<AEKey>> stockedVariants,
+            Function<AEKey, ? extends Iterable<AEKey>> craftableVariants,
+            @Nullable GraphExportBudget exportBudget) {
         GenericStack[] possible = in.getPossibleInputs();
         if (!idOnly) {
             return Arrays.asList(possible);
         }
         LinkedHashMap<AEKey, GenericStack> byKey = new LinkedHashMap<>();
         for (GenericStack template : possible) {
+            consumeExportWork(exportBudget);
             byKey.putIfAbsent(template.what(), template);
             for (AEKey fuzzy : stockedVariants.apply(template.what())) {
+                consumeExportWork(exportBudget);
                 byKey.putIfAbsent(fuzzy, new GenericStack(fuzzy, template.amount()));
             }
             AEKey identity = template.what().dropSecondary();
             for (AEKey craftable : craftableVariants.apply(identity)) {
+                consumeExportWork(exportBudget);
                 if (OverloadPatternMatchPolicy.accepts(
                         possible, true, craftable, false)) {
                     byKey.putIfAbsent(craftable, new GenericStack(craftable, template.amount()));
@@ -636,14 +813,23 @@ public final class FastCraftingPlanner {
         return new ArrayList<>(byKey.values());
     }
 
+    private static void consumeExportWork(@Nullable GraphExportBudget exportBudget) {
+        if (exportBudget != null) exportBudget.consume();
+        else PlanningCancellation.check();
+    }
+
     private static boolean producerMatchesRequirement(
-            IPatternDetails details, AEKey requestedKey, RequirementMode requirementMode) {
+            IPatternDetails details,
+            AEKey requestedKey,
+            RequirementMode requirementMode,
+            GraphExportBudget exportBudget) {
         var providerDetails = CraftingPatternDelegates.forProviderLookup(details);
         if (!(providerDetails instanceof OverloadedProviderOnlyPatternDetails overload)) {
             return true;
         }
         var outputs = providerDetails.getOutputs();
         for (int slot = 0; slot < outputs.size(); slot++) {
+            exportBudget.consume();
             var output = outputs.get(slot);
             if (output != null && requestedKey.equals(output.what())) {
                 return OverloadPatternMatchPolicy.accepts(
@@ -718,10 +904,18 @@ public final class FastCraftingPlanner {
     /** Builds one same-primary-identity index from AE2's full craftable snapshot, lazily. */
     static final class PrimaryIdentityCraftables {
         private final Supplier<? extends Iterable<AEKey>> source;
+        private final GraphExportBudget exportBudget;
         private Map<AEKey, List<AEKey>> byIdentity;
 
         PrimaryIdentityCraftables(Supplier<? extends Iterable<AEKey>> source) {
+            this(source, null);
+        }
+
+        private PrimaryIdentityCraftables(
+                Supplier<? extends Iterable<AEKey>> source,
+                @Nullable GraphExportBudget exportBudget) {
             this.source = source;
+            this.exportBudget = exportBudget;
         }
 
         List<AEKey> get(AEKey identity) {
@@ -730,6 +924,8 @@ public final class FastCraftingPlanner {
                 var craftables = source.get();
                 if (craftables != null) {
                     for (var craftable : craftables) {
+                        if (exportBudget != null) exportBudget.consume();
+                        else PlanningCancellation.check();
                         if (craftable == null) continue;
                         mutable.computeIfAbsent(
                                 craftable.dropSecondary(), ignored -> new ArrayList<>()).add(craftable);
@@ -750,6 +946,7 @@ public final class FastCraftingPlanner {
             Map<AEKey, RequirementMode> discovered) {
         boolean changed = false;
         for (var entry : discovered.entrySet()) {
+            PlanningCancellation.check();
             var previous = forced.get(entry.getKey());
             var merged = previous == null
                     ? entry.getValue() : RequirementMode.merge(previous, entry.getValue());
@@ -766,6 +963,7 @@ public final class FastCraftingPlanner {
         var visited = java.util.Collections.newSetFromMap(
                 new java.util.IdentityHashMap<IPatternDetails, Boolean>());
         while (current instanceof WrappedPatternDetails wrapped) {
+            PlanningCancellation.check();
             if (!visited.add(current)) {
                 return false;
             }
@@ -788,15 +986,18 @@ public final class FastCraftingPlanner {
             ICraftingService craftingService,
             ChildCraftingSimulationState snapshot,
             Level level,
-            Set<Item> conservativeDurabilityItems) {
+            Set<Item> conservativeDurabilityItems,
+            GraphExportBudget exportBudget) {
         if (conservativeDurabilityItems.isEmpty()) {
             return base;
         }
         Map<AEKey, GenericStack> byKey = new LinkedHashMap<>();
         for (GenericStack template : base) {
+            exportBudget.consume();
             byKey.putIfAbsent(template.what(), template);
         }
         for (GenericStack possible : in.getPossibleInputs()) {
+            exportBudget.consume();
             if (!(possible.what() instanceof AEItemKey template)
                     || !conservativeDurabilityItems.contains(template.getItem())) {
                 continue;
@@ -808,6 +1009,7 @@ public final class FastCraftingPlanner {
                 byKey.putIfAbsent(craftable, new GenericStack(craftable, possible.amount()));
             }
             for (AEKey variant : snapshot.findFuzzyTemplates(template)) {
+                exportBudget.consume();
                 if (variant instanceof AEItemKey itemVariant
                         && itemVariant.getItem() == item
                         && in.isValid(variant, level)) {
@@ -887,6 +1089,7 @@ public final class FastCraftingPlanner {
                                                Map<AEKey, DurabilityChain<AEKey>> linkOwner,
                                                Set<AEKey> itemUnitKeys,
                                                Set<Item> conservativeDurabilityItems,
+                                               GraphExportBudget exportBudget,
                                                @Nullable ReservedStockCraftingRequester reservedStock) {
         GenericStack[] possible = in.getPossibleInputs();
         if (possible.length == 0 || !(possible[0].what() instanceof AEItemKey template)) {
@@ -896,7 +1099,8 @@ public final class FastCraftingPlanner {
         if (conservativeDurabilityItems.contains(item)) {
             return ChainLookup.NONE;
         }
-        AEItemKey full = fullestAnchor(in, craftingService, snapshot, level, template, item);
+        AEItemKey full = fullestAnchor(
+                in, craftingService, snapshot, level, template, item, exportBudget);
         AEKey remaining = in.getRemainingKey(full);
         // Classify the resolved craftable/stock anchor, not the declared template. AE2 permits a
         // pattern to accidentally encode a damaged output for a damageable input; in that case the
@@ -929,19 +1133,28 @@ public final class FastCraftingPlanner {
 
         DurabilityChain<AEKey> chain = DurabilityChain.build(
                 full,
-                k -> in.getRemainingKey(k) instanceof AEItemKey next && next.getItem() == item ? next : null,
-                k -> usableStock(snapshot, k, reservedStock),
+                k -> {
+                    exportBudget.consume();
+                    return in.getRemainingKey(k) instanceof AEItemKey next
+                            && next.getItem() == item ? next : null;
+                },
+                k -> {
+                    exportBudget.consume();
+                    return usableStock(snapshot, k, reservedStock);
+                },
                 FUZZY_CYCLE_STEPS);
         if (chain == null) {
             return ChainLookup.NONE;
         }
         for (AEKey link : chain.links()) {
+            exportBudget.consume();
             if (itemUnitKeys.contains(link) || linkOwner.containsKey(link)) {
                 return ChainLookup.conflict(item); // already counted under another unit system / chain
             }
         }
         registry.put(chain.carrier(), chain); // carrier == full == links[0]
         for (AEKey link : chain.links()) {
+            exportBudget.consume();
             linkOwner.put(link, chain);
         }
         builder.stock(full, chain.totalUses()); // carrier stock = aggregate uses (set once)
@@ -958,6 +1171,7 @@ public final class FastCraftingPlanner {
             var group = new LinkedHashMap<AEKey, Long>();
             group.put(key, actual);
             for (AEKey variant : snapshot.findFuzzyTemplates(key)) {
+                PlanningCancellation.check();
                 if (!key.dropSecondary().equals(variant.dropSecondary())) continue;
                 long amount = Math.max(0L,
                         snapshot.extract(variant, Long.MAX_VALUE, Actionable.SIMULATE));
@@ -987,18 +1201,20 @@ public final class FastCraftingPlanner {
      */
     private static AEItemKey fullestAnchor(IPatternDetails.IInput in, ICraftingService craftingService,
                                            ChildCraftingSimulationState snapshot, Level level,
-                                           AEItemKey template, Item item) {
+                                           AEItemKey template, Item item,
+                                           GraphExportBudget exportBudget) {
         if (craftingService.getFuzzyCraftable(template, k -> in.isValid(k, level)) instanceof AEItemKey craftable
                 && craftable.getItem() == item) {
             return craftable; // craftable == full durability == absolute fullest; no scan needed
         }
         AEItemKey anchor = template;
-        long best = downwardLength(in, template, item);
+        long best = downwardLength(in, template, item, exportBudget);
         for (AEKey variant : snapshot.findFuzzyTemplates(template)) {
+            exportBudget.consume();
             if (!(variant instanceof AEItemKey ik) || ik.getItem() != item || ik.equals(anchor)) {
                 continue;
             }
-            long len = downwardLength(in, ik, item);
+            long len = downwardLength(in, ik, item, exportBudget);
             if (len > best) {
                 best = len;
                 anchor = ik;
@@ -1008,12 +1224,17 @@ public final class FastCraftingPlanner {
     }
 
     /** Number of links on {@code from}'s downward chain (uses left + 1), capped at the cyclic budget. */
-    private static long downwardLength(IPatternDetails.IInput in, AEItemKey from, Item item) {
+    private static long downwardLength(
+            IPatternDetails.IInput in,
+            AEItemKey from,
+            Item item,
+            GraphExportBudget exportBudget) {
         long len = 1;
         Set<AEKey> guard = new HashSet<>();
         AEKey cur = from;
         guard.add(cur);
         while (in.getRemainingKey(cur) instanceof AEItemKey next && next.getItem() == item && guard.add(next)) {
+            exportBudget.consume();
             cur = next;
             if (++len > FUZZY_CYCLE_STEPS) {
                 break;
@@ -1039,9 +1260,11 @@ public final class FastCraftingPlanner {
             List<List<SlotChoice>> slotOptions,
             List<RequirementMode> slotRequirementModes,
             RequirementModes requirementModes,
-            IPatternDetails source) {
+            IPatternDetails source,
+            GraphExportBudget exportBudget) {
         for (List<SlotChoice> selectedSlots
                 : BoundedCombinations.bestFirst(slotOptions, (int) FUZZY_NONCYCLE_STEPS)) {
+            exportBudget.consume();
             List<CraftInput<AEKey>> coreInputs = new ArrayList<>();
             for (int slot = 0; slot < selectedSlots.size(); slot++) {
                 SlotChoice selected = selectedSlots.get(slot);
@@ -1182,12 +1405,14 @@ public final class FastCraftingPlanner {
         // accumulate firing counts per real pattern.
         Map<IPatternDetails, Long> patternTimes = new HashMap<>();
         for (Map.Entry<CraftPattern<AEKey>, Long> e : plan.firings().entrySet()) {
+            PlanningCancellation.check();
             patternTimes.merge((IPatternDetails) e.getKey().source(), e.getValue(), Sat::add);
         }
 
         KeyCounter usedItems = new KeyCounter();
         KeyCounter emittedItems = new KeyCounter();
         for (Map.Entry<AEKey, Long> e : plan.usedStock().entrySet()) {
+            PlanningCancellation.check();
             if (emittable.contains(e.getKey())) {
                 emittedItems.add(e.getKey(), e.getValue());
                 continue;
@@ -1208,6 +1433,7 @@ public final class FastCraftingPlanner {
 
         KeyCounter missingItems = new KeyCounter();
         for (Map.Entry<AEKey, Long> e : plan.missing().entrySet()) {
+            PlanningCancellation.check();
             if (emittable.contains(e.getKey())) {
                 emittedItems.add(e.getKey(), e.getValue()); // emitter supplies the shortfall on demand
                 continue;
@@ -1248,6 +1474,7 @@ public final class FastCraftingPlanner {
             sourceFirings.merge((IPatternDetails) entry.getKey().source(), entry.getValue(), Sat::add);
         }
         for (var sourceEntry : sourceFirings.entrySet()) {
+            PlanningCancellation.check();
             long times = sourceEntry.getValue();
             for (IPatternDetails.IInput slot : sourceEntry.getKey().getInputs()) {
                 GenericStack[] possible = slot.getPossibleInputs();
@@ -1283,6 +1510,7 @@ public final class FastCraftingPlanner {
                                      Map<AEKey, Set<IPatternDetails>> patternSources) {
         double bytes = 0;
         for (Map.Entry<AEKey, Long> e : plan.grossDemand().entrySet()) {
+            PlanningCancellation.check();
             int amountPerByte = Math.max(1, e.getKey().getType().getAmountPerByte());
             // AE2 charges a node request for every requested input unit. A durability carrier is
             // represented in use-units in the graph, which is exactly the number of requests made by
@@ -1293,6 +1521,7 @@ public final class FastCraftingPlanner {
             bytes += times;
         }
         for (Map.Entry<CraftPattern<AEKey>, Long> entry : plan.firings().entrySet()) {
+            PlanningCancellation.check();
             long times = entry.getValue();
             for (CraftInput<AEKey> input : entry.getKey().inputs()) {
                 if (input.returned() || input.remainder() != null || durability.containsKey(input.key())) {
@@ -1326,6 +1555,7 @@ public final class FastCraftingPlanner {
 
         long extra = 0;
         for (Map.Entry<AEKey, Set<IPatternDetails>> entry : selectedByOutput.entrySet()) {
+            PlanningCancellation.check();
             Set<IPatternDetails> selected = entry.getValue();
             for (IPatternDetails source : patternSources.getOrDefault(entry.getKey(), Set.of())) {
                 if (!selected.contains(source)) {
@@ -1340,6 +1570,7 @@ public final class FastCraftingPlanner {
         long reduction = 0;
         Set<IPatternDetails> visited = java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<>());
         for (CraftPattern<AEKey> pattern : plan.firings().keySet()) {
+            PlanningCancellation.check();
             IPatternDetails source = (IPatternDetails) pattern.source();
             if (!visited.add(source)) continue;
             for (IPatternDetails.IInput slot : source.getInputs()) {

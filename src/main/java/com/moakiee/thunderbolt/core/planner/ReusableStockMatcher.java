@@ -11,6 +11,15 @@ import java.util.function.Function;
 
 /** Long-capacity bipartite matcher for overlapping reusable/fuzzy seed variants. */
 public final class ReusableStockMatcher {
+    /**
+     * Upper bound for the route-by-physical-variant matrix and candidate enumeration. Crossing it
+     * returns a conservative infeasible result: callers may report missing, but can never reserve
+     * the same physical catalyst twice or claim a plan that the bounded matcher did not prove.
+     */
+    static final long MAX_MATCH_PAIRS = Math.max(
+            4_096L,
+            Long.getLong("thunderbolt.maxReusableMatchPairs", 262_144L));
+
     public record Result<K>(boolean feasible, Map<ReusableStockAllocationKey<K>, Long> allocation) {
         public Result {
             allocation = Map.copyOf(allocation);
@@ -21,10 +30,16 @@ public final class ReusableStockMatcher {
             Map<ReusableStockKey<K>, Long> available,
             Map<ReusableStockRouteKey<K>, Long> demand,
             Function<ReusableStockRouteKey<K>, ? extends Iterable<K>> candidates) {
+        PlanningCancellation.check();
         var actual = positiveEntries(available);
         var routes = positiveEntries(demand);
         if (routes.isEmpty()) return new Result<>(true, Map.of());
         if (actual.isEmpty()) return new Result<>(false, Map.of());
+        long potentialPairs = saturatedMultiply(routes.size(), actual.size());
+        long sinkNode = 1L + routes.size() + actual.size();
+        if (potentialPairs > MAX_MATCH_PAIRS || sinkNode >= Integer.MAX_VALUE) {
+            return new Result<>(false, Map.of());
+        }
 
         int source = 0;
         int routeOffset = 1;
@@ -32,12 +47,18 @@ public final class ReusableStockMatcher {
         int sink = actualOffset + actual.size();
         var flow = new LongCapacityFlow(sink + 1);
         var acceptedByRoute = new LinkedHashMap<ReusableStockRouteKey<K>, Set<K>>();
+        long candidateVisits = 0L;
         for (int i = 0; i < routes.size(); i++) {
+            PlanningCancellation.check();
             var route = routes.get(i).getKey();
             var accepted = new LinkedHashSet<K>();
             var routeCandidates = candidates.apply(route);
             if (routeCandidates != null) {
                 for (var candidate : routeCandidates) {
+                    PlanningCancellation.check();
+                    if (++candidateVisits > MAX_MATCH_PAIRS) {
+                        return new Result<>(false, Map.of());
+                    }
                     if (candidate != null) {
                         accepted.add(candidate);
                     }
@@ -48,11 +69,13 @@ public final class ReusableStockMatcher {
 
         var assignmentEdges = new ArrayList<AssignmentEdge<K>>();
         for (int i = 0; i < actual.size(); i++) {
+            PlanningCancellation.check();
             flow.addEdge(actualOffset + i, sink, actual.get(i).getValue());
         }
 
         var demandEdges = new ArrayList<LongCapacityFlow.Edge>(routes.size());
         for (int i = 0; i < routes.size(); i++) {
+            PlanningCancellation.check();
             var route = routes.get(i).getKey();
             demandEdges.add(flow.addEdge(source, routeOffset + i, routes.get(i).getValue()));
 
@@ -79,6 +102,7 @@ public final class ReusableStockMatcher {
         boolean feasible = demandEdges.stream().allMatch(edge -> edge.remaining == 0L);
         var allocation = new LinkedHashMap<ReusableStockAllocationKey<K>, Long>();
         for (var assignment : assignmentEdges) {
+            PlanningCancellation.check();
             long used = Long.MAX_VALUE - assignment.edge.remaining;
             if (used > 0) {
                 allocation.put(
@@ -91,11 +115,17 @@ public final class ReusableStockMatcher {
     private static <K> List<Map.Entry<K, Long>> positiveEntries(Map<K, Long> input) {
         var result = new ArrayList<Map.Entry<K, Long>>();
         for (var entry : input.entrySet()) {
+            PlanningCancellation.check();
             if (entry.getKey() != null && entry.getValue() != null && entry.getValue() > 0) {
                 result.add(Map.entry(entry.getKey(), entry.getValue()));
             }
         }
         return result;
+    }
+
+    private static long saturatedMultiply(long left, long right) {
+        if (left <= 0L || right <= 0L) return 0L;
+        return left > Long.MAX_VALUE / right ? Long.MAX_VALUE : left * right;
     }
 
     private record AssignmentEdge<K>(
@@ -109,7 +139,10 @@ public final class ReusableStockMatcher {
 
         private LongCapacityFlow(int nodes) {
             graph = new ArrayList<>(nodes);
-            for (int i = 0; i < nodes; i++) graph.add(new ArrayList<>());
+            for (int i = 0; i < nodes; i++) {
+                PlanningCancellation.check();
+                graph.add(new ArrayList<>());
+            }
         }
 
         private Edge addEdge(int from, int to, long capacity) {
@@ -122,6 +155,7 @@ public final class ReusableStockMatcher {
 
         private void maximize(int source, int sink) {
             while (buildLevels(source, sink)) {
+                PlanningCancellation.check();
                 next = new int[graph.size()];
                 while (send(source, sink, Long.MAX_VALUE) > 0) {
                     // One augmentation moves a long-capacity bottleneck, never one item.
@@ -136,6 +170,7 @@ public final class ReusableStockMatcher {
             var queue = new ArrayDeque<Integer>();
             queue.add(source);
             while (!queue.isEmpty()) {
+                PlanningCancellation.check();
                 int node = queue.removeFirst();
                 for (var edge : graph.get(node)) {
                     if (edge.remaining > 0 && level[edge.to] < 0) {
@@ -148,6 +183,7 @@ public final class ReusableStockMatcher {
         }
 
         private long send(int node, int sink, long limit) {
+            PlanningCancellation.check();
             if (node == sink) return limit;
             var edges = graph.get(node);
             while (next[node] < edges.size()) {

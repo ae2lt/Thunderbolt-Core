@@ -1,5 +1,7 @@
 package com.moakiee.thunderbolt.core.planner;
 
+import java.lang.management.ManagementFactory;
+import java.lang.management.ThreadMXBean;
 import java.math.BigInteger;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
@@ -7,6 +9,7 @@ import java.util.Arrays;
 import java.util.Deque;
 import java.util.List;
 import java.util.Objects;
+import java.util.concurrent.CancellationException;
 
 /**
  * Exact, node- and pivot-budgeted feasibility for
@@ -16,8 +19,10 @@ import java.util.Objects;
  * public positive-integer helper, but does not scale fractional coordinates: scaling would change a
  * fixed crafting request. Fractional coordinates are resolved with ordinary branch-and-bound. The
  * node and simplex-pivot budgets are independent of coefficient magnitude, so a {@code long}
- * request never becomes a loop over individual crafts. Exhausting either budget returns a cutoff;
- * it is never reported as an infeasibility proof.
+ * request never becomes a loop over individual crafts. Production callers additionally supply a
+ * tableau-shape, rational-cell-work, and elapsed-time budget because one BigInteger pivot can hide
+ * far more work than one graph visit. Exhausting any budget returns a cutoff; it is never reported
+ * as an infeasibility proof.
  */
 final class BoundedIntegerLinearSolver {
 
@@ -72,18 +77,49 @@ final class BoundedIntegerLinearSolver {
             List<Constraint> constraints,
             long maxValue,
             int nodeBudget) {
+        return solve(
+                variableCount,
+                constraints,
+                maxValue,
+                nodeBudget,
+                WorkBudget.unlimited());
+    }
+
+    static Result solve(
+            int variableCount,
+            List<Constraint> constraints,
+            long maxValue,
+            int nodeBudget,
+            WorkBudget workBudget) {
         if (variableCount <= 0 || constraints == null || maxValue < 0 || nodeBudget <= 0) {
             return result(Status.INVALID_INPUT, 0);
+        }
+        if (workBudget == null) {
+            return result(Status.INVALID_INPUT, 0);
+        }
+
+        int positiveMinimums = 0;
+        for (Constraint constraint : constraints) {
+            PlanningCancellation.check();
+            if (constraint == null || constraint.coefficients().length != variableCount) {
+                return result(Status.INVALID_INPUT, 0);
+            }
+            if (constraint.minimum() > 0) {
+                positiveMinimums++;
+            }
+        }
+        long rootRows = constraints.size() + (long) variableCount;
+        long rootColumns = variableCount + rootRows + positiveMinimums + 1L;
+        if (!workBudget.admitsTableau(rootRows, rootColumns)) {
+            return result(Status.BUDGET_EXHAUSTED, 0);
         }
 
         List<ExactConstraint> base = new ArrayList<>(constraints.size() + variableCount);
         for (Constraint constraint : constraints) {
-            if (constraint == null) {
-                return result(Status.INVALID_INPUT, 0);
-            }
+            PlanningCancellation.check();
             long[] coefficients = constraint.coefficients();
-            if (coefficients.length != variableCount) {
-                return result(Status.INVALID_INPUT, 0);
+            if (!workBudget.tryConsume(coefficients.length)) {
+                return result(Status.BUDGET_EXHAUSTED, 0);
             }
             BigInteger[] exact = new BigInteger[variableCount];
             for (int i = 0; i < variableCount; i++) {
@@ -114,7 +150,8 @@ final class BoundedIntegerLinearSolver {
                 List<ExactConstraint> rows = new ArrayList<>(base.size() + branches.size());
                 rows.addAll(base);
                 rows.addAll(branches);
-                Relaxation relaxation = relax(variableCount, rows, pivotBudget);
+                Relaxation relaxation = relax(
+                        variableCount, rows, pivotBudget, workBudget);
                 if (relaxation.status == RelaxationStatus.INFEASIBLE) {
                     continue;
                 }
@@ -131,7 +168,9 @@ final class BoundedIntegerLinearSolver {
                     for (int i = 0; i < variableCount; i++) {
                         integer[i] = relaxation.values[i].toBigIntegerExact();
                     }
-                    minimizeCoordinates(integer, rows);
+                    if (!minimizeCoordinates(integer, rows, workBudget)) {
+                        return result(Status.BUDGET_EXHAUSTED, visited);
+                    }
                     if (!isFeasible(integer, rows)) {
                         return result(Status.INTERNAL_ERROR, visited);
                     }
@@ -168,6 +207,8 @@ final class BoundedIntegerLinearSolver {
                     : result(Status.BUDGET_EXHAUSTED, visited);
         } catch (ArithmeticException ignored) {
             return result(Status.COEFFICIENT_OVERFLOW, visited);
+        } catch (CancellationException cancelled) {
+            throw cancelled;
         } catch (RuntimeException ignored) {
             // Planner helpers fail closed: unsupported arithmetic must not take down the server.
             return result(Status.INTERNAL_ERROR, visited);
@@ -207,7 +248,8 @@ final class BoundedIntegerLinearSolver {
     private static Relaxation relax(
             int variableCount,
             List<ExactConstraint> constraints,
-            PivotBudget pivotBudget) {
+            PivotBudget pivotBudget,
+            WorkBudget workBudget) {
         int rowCount = constraints.size();
         int artificialCount = 0;
         for (ExactConstraint constraint : constraints) {
@@ -219,6 +261,9 @@ final class BoundedIntegerLinearSolver {
         int auxiliaryOffset = variableCount;
         int artificialOffset = variableCount + rowCount;
         int totalVariables = artificialOffset + artificialCount;
+        if (!workBudget.tryStartTableau(rowCount, (long) totalVariables + 1L)) {
+            return new Relaxation(RelaxationStatus.BUDGET_EXHAUSTED, new Rational[0]);
+        }
         Rational[][] tableau = new Rational[rowCount][totalVariables + 1];
         for (Rational[] row : tableau) {
             Arrays.fill(row, Rational.ZERO);
@@ -250,7 +295,7 @@ final class BoundedIntegerLinearSolver {
         }
 
         SimplexStatus simplex = maximize(
-                tableau, basis, costs, totalVariables, pivotBudget);
+                tableau, basis, costs, totalVariables, pivotBudget, workBudget);
         if (simplex == SimplexStatus.BUDGET_EXHAUSTED) {
             return new Relaxation(RelaxationStatus.BUDGET_EXHAUSTED, new Rational[0]);
         }
@@ -284,12 +329,16 @@ final class BoundedIntegerLinearSolver {
             int[] basis,
             Rational[] costs,
             int variableCount,
-            PivotBudget pivotBudget) {
+            PivotBudget pivotBudget,
+            WorkBudget workBudget) {
         while (true) {
             int entering = -1;
             for (int column = 0; column < variableCount; column++) {
                 Rational reduced = costs[column];
                 for (int row = 0; row < tableau.length; row++) {
+                    if (!workBudget.tryConsume(1L)) {
+                        return SimplexStatus.BUDGET_EXHAUSTED;
+                    }
                     reduced = reduced.subtract(costs[basis[row]].multiply(tableau[row][column]));
                 }
                 if (reduced.signum() > 0) {
@@ -304,6 +353,9 @@ final class BoundedIntegerLinearSolver {
             int leaving = -1;
             Rational bestRatio = null;
             for (int row = 0; row < tableau.length; row++) {
+                if (!workBudget.tryConsume(1L)) {
+                    return SimplexStatus.BUDGET_EXHAUSTED;
+                }
                 Rational direction = tableau[row][entering];
                 if (direction.signum() <= 0) {
                     continue;
@@ -321,14 +373,25 @@ final class BoundedIntegerLinearSolver {
             if (!pivotBudget.tryConsume()) {
                 return SimplexStatus.BUDGET_EXHAUSTED;
             }
-            pivot(tableau, basis, leaving, entering, variableCount);
+            if (!pivot(
+                    tableau, basis, leaving, entering, variableCount, workBudget)) {
+                return SimplexStatus.BUDGET_EXHAUSTED;
+            }
         }
     }
 
-    private static void pivot(
-            Rational[][] tableau, int[] basis, int pivotRow, int pivotColumn, int variableCount) {
+    private static boolean pivot(
+            Rational[][] tableau,
+            int[] basis,
+            int pivotRow,
+            int pivotColumn,
+            int variableCount,
+            WorkBudget workBudget) {
         Rational pivot = tableau[pivotRow][pivotColumn];
         for (int column = 0; column <= variableCount; column++) {
+            if (!workBudget.tryConsume(1L)) {
+                return false;
+            }
             tableau[pivotRow][column] = tableau[pivotRow][column].divide(pivot);
         }
         for (int row = 0; row < tableau.length; row++) {
@@ -340,19 +403,28 @@ final class BoundedIntegerLinearSolver {
                 continue;
             }
             for (int column = 0; column <= variableCount; column++) {
+                if (!workBudget.tryConsume(1L)) {
+                    return false;
+                }
                 tableau[row][column] = tableau[row][column]
                         .subtract(factor.multiply(tableau[pivotRow][column]));
             }
         }
         basis[pivotRow] = pivotColumn;
+        return true;
     }
 
     /** One deterministic reduction pass removes unnecessary firings without another search. */
-    private static void minimizeCoordinates(
-            BigInteger[] values, List<ExactConstraint> constraints) {
+    private static boolean minimizeCoordinates(
+            BigInteger[] values,
+            List<ExactConstraint> constraints,
+            WorkBudget workBudget) {
         for (int variable = 0; variable < values.length; variable++) {
             BigInteger lower = BigInteger.ZERO;
             for (ExactConstraint constraint : constraints) {
+                if (!workBudget.tryConsume(values.length)) {
+                    return false;
+                }
                 BigInteger coefficient = constraint.coefficients[variable];
                 if (coefficient.signum() <= 0) {
                     continue;
@@ -369,6 +441,7 @@ final class BoundedIntegerLinearSolver {
                 values[variable] = lower.max(BigInteger.ZERO);
             }
         }
+        return true;
     }
 
     private static boolean isFeasible(
@@ -438,6 +511,130 @@ final class BoundedIntegerLinearSolver {
             }
             remaining--;
             return true;
+        }
+    }
+
+    /**
+     * Plan-shareable guard for the actual cost hidden behind a simplex-pivot count.
+     *
+     * <p>A pivot touches a rational tableau whose dimensions and BigInteger operands may be much
+     * larger than the original conflict graph. The single-tableau cap rejects a locally dense
+     * relaxation before allocation, the cell-work budget limits all admitted relaxations together,
+     * and the monotonic deadline catches coefficient growth that a cell count cannot predict. A
+     * rejected or exhausted solve is only a cutoff; the planner retains its ordinary fallback.
+     */
+    static final class WorkBudget {
+        private static final long TIME_CHECK_INTERVAL = 256L;
+        private static final ThreadMXBean THREADS = ManagementFactory.getThreadMXBean();
+
+        private final boolean unlimited;
+        private final long maxTableauCells;
+        private long remainingCellWork;
+        private long startedNanos = Long.MIN_VALUE;
+        private final long maxNanos;
+        private long workUntilTimeCheck = TIME_CHECK_INTERVAL;
+        private boolean exhausted;
+
+        private WorkBudget(
+                boolean unlimited,
+                long maxTableauCells,
+                long cellWork,
+                long maxNanos) {
+            this.unlimited = unlimited;
+            this.maxTableauCells = maxTableauCells;
+            this.remainingCellWork = cellWork;
+            this.maxNanos = maxNanos;
+        }
+
+        static WorkBudget unlimited() {
+            return new WorkBudget(true, Long.MAX_VALUE, Long.MAX_VALUE, Long.MAX_VALUE);
+        }
+
+        static WorkBudget bounded(
+                long maxTableauCells,
+                long cellWork,
+                long maxNanos) {
+            return new WorkBudget(
+                    false,
+                    Math.max(1L, maxTableauCells),
+                    Math.max(1L, cellWork),
+                    Math.max(1L, maxNanos));
+        }
+
+        private boolean admitsTableau(long rows, long columns) {
+            if (!canContinue()) {
+                return false;
+            }
+            return saturatedMultiply(rows, columns) <= maxTableauCells;
+        }
+
+        private boolean tryStartTableau(long rows, long columns) {
+            long cells = saturatedMultiply(rows, columns);
+            return cells <= maxTableauCells && tryConsume(cells);
+        }
+
+        private boolean tryConsume(long cellWork) {
+            PlanningCancellation.check();
+            if (unlimited) {
+                return true;
+            }
+            if (exhausted) {
+                return false;
+            }
+            long requested = Math.max(1L, cellWork);
+            if (requested > remainingCellWork) {
+                exhausted = true;
+                return false;
+            }
+            remainingCellWork -= requested;
+            workUntilTimeCheck -= Math.min(workUntilTimeCheck, requested);
+            if (workUntilTimeCheck == 0L) {
+                workUntilTimeCheck = TIME_CHECK_INTERVAL;
+                if (deadlineReached()) {
+                    exhausted = true;
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        private boolean canContinue() {
+            PlanningCancellation.check();
+            if (unlimited) {
+                return true;
+            }
+            if (exhausted || remainingCellWork <= 0L || deadlineReached()) {
+                exhausted = true;
+                return false;
+            }
+            return true;
+        }
+
+        private boolean deadlineReached() {
+            long now = workClockNanos();
+            if (startedNanos == Long.MIN_VALUE) {
+                startedNanos = now;
+                return false;
+            }
+            return now - startedNanos >= maxNanos;
+        }
+
+        /** CPU time avoids treating scheduler/GC pauses as solver work; cell count remains primary. */
+        private static long workClockNanos() {
+            if (THREADS.isCurrentThreadCpuTimeSupported()) {
+                long cpu = THREADS.getCurrentThreadCpuTime();
+                if (cpu >= 0L) {
+                    return cpu;
+                }
+            }
+            return System.nanoTime();
+        }
+
+        private static long saturatedMultiply(long left, long right) {
+            if (left <= 0L || right <= 0L) {
+                return 0L;
+            }
+            return left > Long.MAX_VALUE / right ? Long.MAX_VALUE : left * right;
         }
     }
 

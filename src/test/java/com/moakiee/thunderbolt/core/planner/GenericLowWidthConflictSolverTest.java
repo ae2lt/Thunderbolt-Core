@@ -2,12 +2,16 @@ package com.moakiee.thunderbolt.core.planner;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CancellationException;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 
 import org.junit.jupiter.api.Test;
 
@@ -365,6 +369,313 @@ class GenericLowWidthConflictSolverTest {
         assertEquals(1L, result.plan().missing().getOrDefault("token", 0L));
     }
 
+    @Test
+    void returnedCatalystUsesOneActivationReserveInsideGenericFlow() {
+        long amount = 1_000_000_000L;
+        CraftGraph.Builder<String> builder = CraftGraph.builder();
+        for (int level = 3; level < 7; level++) {
+            builder.pattern(new CraftPattern<>(
+                    "catalyst-" + level,
+                    1,
+                    List.of(
+                            CraftInput.of("catalyst-" + (level - 1), 1),
+                            CraftInput.of("catalyst-" + (level - 2), 1),
+                            CraftInput.returned("tool", 1)),
+                    "left-" + level));
+            builder.pattern(new CraftPattern<>(
+                    "catalyst-" + level,
+                    1,
+                    List.of(
+                            CraftInput.of("catalyst-" + (level - 2), 1),
+                            CraftInput.of("catalyst-" + (level - 3), 1),
+                            CraftInput.returned("tool", 1)),
+                    "right-" + level));
+        }
+        builder.stock("catalyst-1", 2 * amount)
+                .stock("catalyst-2", 2 * amount)
+                .stock("tool", 1);
+
+        PlanningResult<String> result = CraftPlannerV2.planDetailed(
+                builder.build(), "catalyst-6", amount);
+
+        assertTrue(result.plan().feasible(), () -> "missing=" + result.plan().missing());
+        assertEquals(1L, result.plan().usedStock().getOrDefault("tool", 0L));
+        assertEquals(1, result.diagnostics().lowWidthSolved());
+        assertTrue(result.diagnostics().lowWidthIntegerNodes() <= 64);
+    }
+
+    @Test
+    void nearIntegralStatefulChainFallsBackBeforeExactRationalWorkCanStall() {
+        PlanningResult<String> result =
+                org.junit.jupiter.api.Assertions.assertTimeoutPreemptively(
+                        Duration.ofSeconds(2),
+                        () -> CraftPlannerV2.planDetailed(
+                                nearIntegralStatefulChain(24), "budget-root", 1));
+
+        assertTrue(result.plan().feasible(), () -> "missing=" + result.plan().missing());
+        assertFalse(result.plan().budgetExhausted(),
+                "optional exact cutoff must not poison the ordinary planner");
+        assertTrue(result.diagnostics().lowWidthCutoffs() >= 1,
+                "the dense stateful component must be declined generically");
+        assertTrue(result.diagnostics().lowWidthIntegerNodes() <= 4,
+                "the cutoff must happen before repeated rational relaxations");
+    }
+
+    @Test
+    void craftLessProbesShareCompilationAndExactWorkBudget() {
+        org.junit.jupiter.api.Assertions.assertTimeoutPreemptively(
+                Duration.ofSeconds(2), () -> {
+                    CraftGraph<String> graph = nearIntegralStatefulChain(12, 1_023L);
+                    var session = new CraftPlannerV2.PlanningSession<String>();
+                    PlanningResult<String> requested = CraftPlannerV2.planDetailed(
+                            graph, "budget-root", 1_024L, session);
+                    assertFalse(requested.plan().feasible());
+
+                    long best = 0L;
+                    boolean sawPreparedReuse = false;
+                    boolean sawSpentExactBudget = false;
+                    for (long bit = Long.highestOneBit(1_024L); bit > 0L; bit >>>= 1) {
+                        long candidate = best + bit;
+                        if (candidate >= 1_024L) continue;
+                        PlanningResult<String> probe = CraftPlannerV2.planDetailed(
+                                graph, "budget-root", candidate, session);
+                        sawPreparedReuse |= probe.diagnostics().reusedCompilations() > 0;
+                        sawSpentExactBudget |= probe.diagnostics().lowWidthCutoffs() > 0
+                                && probe.diagnostics().lowWidthIntegerNodes() == 0;
+                        if (probe.plan().feasible()) {
+                            best = candidate;
+                        }
+                    }
+
+                    assertEquals(1_023L, best);
+                    assertTrue(sawPreparedReuse,
+                            "quantity probes must reuse the normalized graph orientation");
+                    assertTrue(sawSpentExactBudget,
+                            "later probes must not restart a fresh rational-solver budget");
+                });
+    }
+
+    @Test
+    void deliberatelyHugeReachableGraphReturnsConservativeMissingBeforeCompilation() {
+        int fanout = 14_000;
+        CraftGraph.Builder<String> builder = CraftGraph.builder();
+        List<CraftOutput<String>> byproducts = new ArrayList<>(fanout);
+        List<CraftInput<String>> rootInputs = new ArrayList<>(fanout + 1);
+        rootInputs.add(CraftInput.of("huge-producer", 1));
+        for (int i = 0; i < fanout; i++) {
+            String token = "huge-token-" + i;
+            String consumer = "huge-consumer-" + i;
+            byproducts.add(CraftOutput.of(token, 1));
+            builder.pattern(consumer, 1, List.of(CraftInput.of(token, 1)));
+            rootInputs.add(CraftInput.of(consumer, 1));
+        }
+        builder.pattern(new CraftPattern<>(
+                "huge-producer", 1, List.of(CraftInput.of("huge-raw", 1)),
+                byproducts, "huge-fanout"));
+        builder.pattern("huge-root", 1, rootInputs).stock("huge-raw", 1);
+        CraftGraph<String> graph = builder.build();
+
+        PlanningResult<String> result = org.junit.jupiter.api.Assertions.assertTimeoutPreemptively(
+                Duration.ofSeconds(2),
+                () -> CraftPlannerV2.planDetailed(graph, "huge-root", 1));
+
+        assertFalse(result.plan().feasible());
+        assertTrue(result.plan().budgetExhausted());
+        assertEquals(Map.of("huge-root", 1L), result.plan().missing());
+        assertEquals(0, result.diagnostics().planRuns());
+        assertEquals(0, result.diagnostics().compiledOrientations());
+    }
+
+    @Test
+    void interruptedPlanningThreadPropagatesCancellationWithoutClearingInterrupt() throws Exception {
+        CraftGraph<String> graph = CraftGraph.<String>builder()
+                .pattern("cancel-target", 1, List.of(CraftInput.of("cancel-raw", 1)))
+                .stock("cancel-raw", 1)
+                .build();
+        var executor = Executors.newSingleThreadExecutor();
+        try {
+            var future = executor.submit(() -> {
+                Thread.currentThread().interrupt();
+                assertThrows(CancellationException.class,
+                        () -> CraftPlannerV2.plan(graph, "cancel-target", 1));
+                return Thread.currentThread().isInterrupted();
+            });
+            assertTrue(future.get(2, TimeUnit.SECONDS));
+        } finally {
+            executor.shutdownNow();
+        }
+    }
+
+    @Test
+    void independentCalculationSessionsRunConcurrentlyWithoutBudgetCrossTalk() throws Exception {
+        CraftGraph<String> graph = nearIntegralStatefulChain(12, 1L);
+        int jobs = 4;
+        var executor = Executors.newFixedThreadPool(jobs);
+        try {
+            var futures = new ArrayList<java.util.concurrent.Future<PlanningResult<String>>>(jobs);
+            for (int i = 0; i < jobs; i++) {
+                futures.add(executor.submit(
+                        () -> CraftPlannerV2.planDetailed(graph, "budget-root", 1)));
+            }
+            for (var future : futures) {
+                PlanningResult<String> result = future.get(5, TimeUnit.SECONDS);
+                assertTrue(result.plan().feasible(), () -> "missing=" + result.plan().missing());
+                assertEquals(1, result.diagnostics().compiledOrientations());
+            }
+        } finally {
+            executor.shutdownNow();
+        }
+    }
+
+    @Test
+    void selfGainMacroStartsFromOneAcyclicSeedProducer() {
+        CraftPattern<String> gain = new CraftPattern<>(
+                "X", 1, List.of(CraftInput.returned("X", 1)), "contracted-gain");
+        CraftPattern<String> seed = new CraftPattern<>(
+                "X", 1, List.of(CraftInput.of("seed-raw", 1)), "seed-producer");
+        CraftPattern<String> yGood = new CraftPattern<>(
+                "Y", 1, List.of(CraftInput.of("y-raw", 1)), "y-good");
+        CraftPattern<String> yDead = new CraftPattern<>(
+                "Y", 1, List.of(CraftInput.of("y-dead", 1)), "y-dead");
+        CraftGraph<String> graph = CraftGraph.<String>builder()
+                .pattern("root", 1, List.of(CraftInput.of("X", 100), CraftInput.of("Y", 1)))
+                .pattern(gain)
+                .pattern(seed)
+                .pattern(yGood)
+                .pattern(yDead)
+                .stock("seed-raw", 1)
+                .stock("y-raw", 1)
+                .build();
+
+        PlanningResult<String> result = CraftPlannerV2.planDetailed(graph, "root", 1);
+
+        assertTrue(result.plan().feasible(), () -> "missing=" + result.plan().missing());
+        assertEquals(100L, result.plan().firings().getOrDefault(gain, 0L));
+        assertEquals(1L, result.plan().firings().getOrDefault(seed, 0L));
+        assertEquals(1L, result.plan().usedStock().getOrDefault("seed-raw", 0L));
+        assertTrue(result.diagnostics().seedOrdered());
+        assertTrue(result.diagnostics().lowWidthSolved() >= 1);
+    }
+
+    @Test
+    void unseededSelfGainCannotWinAnAlgebraicRouteChoice() {
+        CraftPattern<String> rootViaLoop = new CraftPattern<>(
+                "root", 1, List.of(CraftInput.of("X", 1)), "root-via-loop");
+        CraftPattern<String> rootViaSafe = new CraftPattern<>(
+                "root", 1,
+                List.of(CraftInput.of("safe", 1), CraftInput.of("Q", 1)),
+                "root-via-safe");
+        CraftPattern<String> gain = new CraftPattern<>(
+                "X", 1, List.of(CraftInput.returned("X", 1)), "unseeded-gain");
+        CraftPattern<String> qGood = new CraftPattern<>(
+                "Q", 1, List.of(CraftInput.of("q-raw", 1)), "q-good");
+        CraftPattern<String> qDead = new CraftPattern<>(
+                "Q", 1, List.of(CraftInput.of("q-dead", 1)), "q-dead");
+        CraftGraph<String> graph = CraftGraph.<String>builder()
+                .pattern(rootViaLoop)
+                .pattern(rootViaSafe)
+                .pattern(gain)
+                .pattern(qGood)
+                .pattern(qDead)
+                .stock("safe", 1)
+                .stock("q-raw", 1)
+                .build();
+
+        PlanningResult<String> result = CraftPlannerV2.planDetailed(graph, "root", 1);
+
+        assertTrue(result.plan().feasible(), () -> "missing=" + result.plan().missing());
+        assertEquals(0L, result.plan().firings().getOrDefault(rootViaLoop, 0L));
+        assertEquals(0L, result.plan().firings().getOrDefault(gain, 0L));
+        assertEquals(1L, result.plan().firings().getOrDefault(rootViaSafe, 0L));
+        assertTrue(result.diagnostics().lowWidthSolved() >= 1);
+    }
+
+    @Test
+    void dedicatedLoopPoolsShareThePhysicalHostCapacityConstraint() {
+        var leftSource = new ReusableStockSource("host", "left-loop");
+        var rightSource = new ReusableStockSource("host", "right-loop");
+        CraftPattern<String> leftLoop = new CraftPattern<>(
+                "left", 1, List.of(CraftInput.returnedFrom("seed", 1, leftSource)), "left-loop");
+        CraftPattern<String> leftRaw = new CraftPattern<>(
+                "left", 1, List.of(CraftInput.of("left-raw", 1)), "left-raw");
+        CraftPattern<String> rightLoop = new CraftPattern<>(
+                "right", 1, List.of(CraftInput.returnedFrom("seed", 1, rightSource)), "right-loop");
+        CraftPattern<String> rightRaw = new CraftPattern<>(
+                "right", 1, List.of(CraftInput.of("right-raw", 1)), "right-raw");
+        CraftGraph<String> graph = CraftGraph.<String>builder()
+                .pattern("root", 1, List.of(CraftInput.of("left", 1), CraftInput.of("right", 1)))
+                .pattern(leftLoop)
+                .pattern(leftRaw)
+                .pattern(rightLoop)
+                .pattern(rightRaw)
+                .reusableStock("host", "seed", 1)
+                .stock("right-raw", 1)
+                .build();
+
+        PlanningResult<String> result = CraftPlannerV2.planDetailed(graph, "root", 1);
+
+        assertTrue(result.plan().feasible(), () -> "missing=" + result.plan().missing());
+        assertEquals(1L, result.plan().firings().getOrDefault(leftLoop, 0L));
+        assertEquals(0L, result.plan().firings().getOrDefault(rightLoop, 0L));
+        assertEquals(1L, result.plan().firings().getOrDefault(rightRaw, 0L));
+        assertEquals(1L, result.plan().usedReusableStock().values().stream()
+                .mapToLong(Long::longValue).sum());
+        assertEquals(1, result.diagnostics().lowWidthSolved());
+    }
+
+    @Test
+    void contractedMacroByproductFeedsSiblingAfterSeedStartup() {
+        var source = new ReusableStockSource("host", "loop");
+        CraftPattern<String> macro = new CraftPattern<>(
+                "P",
+                1,
+                List.of(CraftInput.returnedFrom("seed", 1, source)),
+                List.of(CraftOutput.of("token", 10)),
+                "contracted-loop");
+        CraftPattern<String> deadP = new CraftPattern<>(
+                "P", 1, List.of(CraftInput.of("dead-p", 1)), "dead-p");
+        CraftPattern<String> tokenConsumer = new CraftPattern<>(
+                "Q", 1, List.of(CraftInput.of("token", 1)), "token-consumer");
+        CraftPattern<String> deadQ = new CraftPattern<>(
+                "Q", 1, List.of(CraftInput.of("dead-q", 1)), "dead-q");
+        CraftGraph<String> graph = CraftGraph.<String>builder()
+                .pattern("root", 1, List.of(CraftInput.of("P", 1), CraftInput.of("Q", 1)))
+                .pattern(macro)
+                .pattern(deadP)
+                .pattern(tokenConsumer)
+                .pattern(deadQ)
+                .reusableStock("host", "seed", 1)
+                .build();
+
+        PlanningResult<String> result = CraftPlannerV2.planDetailed(graph, "root", 1);
+
+        assertTrue(result.plan().feasible(), () -> "missing=" + result.plan().missing());
+        assertEquals(1L, result.plan().firings().getOrDefault(macro, 0L));
+        assertEquals(1L, result.plan().firings().getOrDefault(tokenConsumer, 0L));
+        assertEquals(0L, result.plan().usedStock().getOrDefault("token", 0L));
+        assertEquals(1, result.diagnostics().lowWidthSolved());
+    }
+
+    @Test
+    void unrelatedCycleCutDoesNotDisableNarrowDagComponents() {
+        CraftGraph.Builder<String> builder = twoRouteRecurrence("cut-rec-", 7)
+                .stock("cut-rec-1", 2)
+                .stock("cut-rec-2", 2)
+                .pattern("ring-target", 1, List.of(CraftInput.of("ring-B", 1)))
+                .pattern("ring-B", 1, List.of(CraftInput.of("ring-D", 9)))
+                .pattern("ring-D", 9, List.of(CraftInput.of("ring-B", 1)))
+                .stock("ring-D", 9)
+                .pattern("root", 1, List.of(
+                        CraftInput.of("cut-rec-6", 1), CraftInput.of("ring-target", 1)));
+
+        PlanningResult<String> result = CraftPlannerV2.planDetailed(builder.build(), "root", 1);
+
+        assertTrue(result.plan().feasible(), () -> "missing=" + result.plan().missing());
+        assertTrue(result.diagnostics().cycleCuts() > 0);
+        assertTrue(result.diagnostics().lowWidthSolved() >= 1,
+                "a cut in the ring component must not globally veto the recurrence solver");
+    }
+
     private static PlanningResult<String> assertStarvedRecurrence(
             String prefix, int depth, long amount) {
         return org.junit.jupiter.api.Assertions.assertTimeoutPreemptively(
@@ -390,6 +701,67 @@ class GenericLowWidthConflictSolverTest {
 
     private static CraftGraph.Builder<String> twoRouteRecurrence(String prefix, int depth) {
         return twoRouteRecurrence(prefix, depth, new int[] {1, 1, 1, 1});
+    }
+
+    /**
+     * A feasible narrow chain whose LP relaxation has near-one fractional coordinates at every
+     * level. This is deliberately a solver-shape test, not a production recipe special case.
+     */
+    private static CraftGraph<String> nearIntegralStatefulChain(int patternCount) {
+        return nearIntegralStatefulChain(patternCount, 1L);
+    }
+
+    private static CraftGraph<String> nearIntegralStatefulChain(
+            int patternCount, long availableRaw) {
+        int itemCount = patternCount - 1;
+        long[] batches = new long[itemCount];
+        for (int i = 0; i < itemCount; i++) {
+            batches[i] = 1_000_000_007L + 2L * i;
+        }
+
+        ReusableStockSource seedSource =
+                new ReusableStockSource("budget-host", "budget-loop");
+        CraftGraph.Builder<String> builder = CraftGraph.builder();
+        builder.pattern(new CraftPattern<>(
+                "budget-x0",
+                batches[0],
+                List.of(
+                        CraftInput.of("budget-x1", batches[1] - 1L),
+                        CraftInput.returnedFrom("budget-tool", 1, seedSource)),
+                "budget-good-head"));
+        builder.pattern(new CraftPattern<>(
+                "budget-x0",
+                batches[0],
+                List.of(
+                        CraftInput.of("budget-dead", 1),
+                        CraftInput.returnedFrom("budget-tool", 1, seedSource)),
+                "budget-dead-head"));
+        for (int i = 1; i < itemCount - 1; i++) {
+            builder.pattern(new CraftPattern<>(
+                    "budget-x" + i,
+                    batches[i],
+                    List.of(
+                            CraftInput.of("budget-x" + (i + 1), batches[i + 1] - 1L),
+                            CraftInput.returnedFrom("budget-tool", 1, seedSource)),
+                    "budget-chain-" + i));
+        }
+        builder.pattern(new CraftPattern<>(
+                "budget-x" + (itemCount - 1),
+                batches[itemCount - 1],
+                List.of(
+                        CraftInput.of("budget-raw", 1),
+                        CraftInput.returnedFrom("budget-tool", 1, seedSource)),
+                "budget-chain-tail"));
+        builder.pattern("budget-side", 1, List.of(CraftInput.of("budget-side-raw", 1)));
+        builder.pattern("budget-side", 1, List.of(CraftInput.of("budget-side-dead", 1)));
+        builder.pattern("budget-root", 1, List.of(
+                CraftInput.of("budget-x0", batches[0]),
+                CraftInput.of("budget-side", 1)));
+        return builder
+                .reusableStock("budget-host", "budget-tool", 1)
+                .stock("budget-side-raw", availableRaw)
+                .stock("budget-raw", availableRaw)
+                .build();
     }
 
     private static CraftGraph.Builder<String> twoRouteRecurrence(

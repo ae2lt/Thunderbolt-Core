@@ -2,6 +2,7 @@ package com.moakiee.thunderbolt.ae2.mixin;
 
 import java.util.IdentityHashMap;
 import java.util.Map;
+import java.util.concurrent.CancellationException;
 import java.util.concurrent.TimeUnit;
 
 import org.jetbrains.annotations.Nullable;
@@ -100,6 +101,10 @@ public abstract class CraftingCalculationMixin implements FastCraftingControl {
     @Unique
     private int thunderbolt$fastFailures;
 
+    @Unique
+    @Nullable
+    private FastCraftingPlanner.CalculationSession thunderbolt$planningSession;
+
     @Override
     public void ae2lt$setFastPlanningEnabled(boolean enabled) {
         this.ae2lt$fastPlanningInitialized = true;
@@ -119,6 +124,9 @@ public abstract class CraftingCalculationMixin implements FastCraftingControl {
         thunderbolt$fastFallbackAttempts = 0;
         thunderbolt$cachedSimulationAttempts = 0;
         thunderbolt$fastFailures = 0;
+        thunderbolt$planningSession = ae2lt$isFastPlanningEnabled()
+                ? new FastCraftingPlanner.CalculationSession()
+                : null;
         ThunderboltCore.LOGGER.info(
                 "[Thunderbolt Core][crafting-timing] started: output={} requested={} fastEnabled={}",
                 output, requestedAmount, ae2lt$isFastPlanningEnabled());
@@ -148,6 +156,7 @@ public abstract class CraftingCalculationMixin implements FastCraftingControl {
                 thunderbolt$cachedSimulationAttempts, thunderbolt$fastFailures,
                 result == null ? "null" : result.getClass().getSimpleName());
         thunderbolt$calculationStartedNanos = 0L;
+        thunderbolt$planningSession = null;
     }
 
     @Inject(method = "runCraftAttempt", at = @At("HEAD"), cancellable = true, remap = false)
@@ -176,6 +185,9 @@ public abstract class CraftingCalculationMixin implements FastCraftingControl {
             return;
         }
         var craftingService = gridNode.getGrid().getCraftingService();
+        if (thunderbolt$planningSession == null) {
+            thunderbolt$planningSession = new FastCraftingPlanner.CalculationSession();
+        }
 
         FastPlanningWatchdog.start(
                 "output=" + this.output + " requested=" + amount + " simulate=" + simulate + " engine=thunderbolt");
@@ -183,7 +195,8 @@ public abstract class CraftingCalculationMixin implements FastCraftingControl {
             var attempt = FastCraftingPlanner.tryAttempt(
                     craftingService, networkInv, getLevel(), output, amount, simulate,
                     simRequester instanceof com.moakiee.thunderbolt.ae2.crafting.ReservedStockCraftingRequester reserved
-                            ? reserved : null);
+                            ? reserved : null,
+                    thunderbolt$planningSession);
             if (attempt.handled()) {
                 thunderbolt$fastHandledAttempts++;
                 // Reproduce the side effect of the real method body we are skipping, so that
@@ -203,11 +216,17 @@ public abstract class CraftingCalculationMixin implements FastCraftingControl {
             } else {
                 thunderbolt$fastFallbackAttempts++;
             }
-        } catch (Throwable t) {
+        } catch (CancellationException cancelled) {
+            // The future was cancelled or the calculating thread was interrupted. Propagate that
+            // signal; falling through to AE2's slower simulator would defeat cooperative cancellation.
+            throw cancelled;
+        } catch (RuntimeException t) {
             thunderbolt$fastFailures++;
             thunderbolt$fastFallbackAttempts++;
+            thunderbolt$planningSession = null;
             // Never let the optimization break a craft: fall back to AE2. Log at WARN with full context
             // so an unexpected fast-path failure is easy to pinpoint instead of silently degrading.
+            // Fatal VM errors are deliberately not swallowed and followed by another expensive plan.
             ThunderboltCore.LOGGER.warn(
                 "[Thunderbolt Core] fast path threw, falling back to AE2: output={} amount={} simulate={}",
                 output, amount, simulate, t);

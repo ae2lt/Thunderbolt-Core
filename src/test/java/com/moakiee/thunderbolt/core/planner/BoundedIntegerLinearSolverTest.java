@@ -45,6 +45,28 @@ class BoundedIntegerLinearSolverTest {
     }
 
     @Test
+    void rejectsDenseRelaxationBeforeAllocatingOrSearchingIt() {
+        var budget = BoundedIntegerLinearSolver.WorkBudget.bounded(
+                32,
+                1_024,
+                1_000_000_000L);
+        var result = BoundedIntegerLinearSolver.solve(
+                4,
+                List.of(
+                        row(1, 1, 0, 0, 0),
+                        row(1, 0, 1, 0, 0),
+                        row(1, 0, 0, 1, 0),
+                        row(1, 0, 0, 0, 1)),
+                Sat.SAT,
+                64,
+                budget);
+
+        assertEquals(BoundedIntegerLinearSolver.Status.BUDGET_EXHAUSTED, result.status());
+        assertEquals(0, result.visitedNodes(),
+                "tableau-shape admission must run before branch-and-bound");
+    }
+
+    @Test
     void randomSmallSignedSystemsMatchBruteForce() {
         Random random = new Random(0x5EEDB0A7L);
         for (int sample = 0; sample < 64; sample++) {

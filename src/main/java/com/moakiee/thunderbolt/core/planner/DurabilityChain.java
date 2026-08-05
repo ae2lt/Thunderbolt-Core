@@ -83,6 +83,7 @@ public final class DurabilityChain<K> {
         Set<K> guard = new HashSet<>();
         K cur = full;
         while (cur != null && guard.add(cur)) {
+            PlanningCancellation.check();
             links.add(cur);
             cur = remaining.apply(cur);
             if (links.size() > maxSteps) {
@@ -97,6 +98,7 @@ public final class DurabilityChain<K> {
         long[] stockPerLink = new long[(int) n];
         long totalUses = 0;
         for (int i = 0; i < n; i++) {
+            PlanningCancellation.check();
             long cnt = Math.max(0L, stock.apply(links.get(i)));
             stockPerLink[i] = cnt;
             totalUses = Sat.add(totalUses, Sat.mul(cnt, n - i)); // a tool at index i has n-i uses left
@@ -115,6 +117,7 @@ public final class DurabilityChain<K> {
     public void chargeFromStock(long uses, ObjLongConsumer<K> sink) {
         long remaining = uses;
         for (int i = links.size() - 1; i >= 0 && remaining > 0; i--) {
+            PlanningCancellation.check();
             long perTool = n - i; // uses left in a tool at this degradation level
             long have = stockPerLink[i];
             if (have <= 0 || perTool <= 0) {

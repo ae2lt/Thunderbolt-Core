@@ -5,6 +5,7 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
@@ -176,12 +177,68 @@ class FastCraftingPlannerIdOnlyCraftableVariantTest {
         assertEquals(1L, attempt.plan().usedItems().get(MAT_STOCKED));
     }
 
+    @Test
+    void oneCalculationSessionBuildsTheAe2GraphOnlyOnceAcrossAmountProbes() {
+        IPatternDetails consumer = new FakePattern(TARGET, new IPatternDetails.IInput[] {
+                new FakeInput(BASE, 1)
+        });
+        var service = new FakeCraftingService().pattern(TARGET, consumer).craftable(TARGET);
+        var networkInv = new ChildCraftingSimulationState(new StockInventory(Map.of(BASE, 2L)));
+        var session = new FastCraftingPlanner.CalculationSession();
+
+        var first = FastCraftingPlanner.tryAttempt(
+                service, networkInv, null, TARGET, 1, false, null, session);
+        int callsAfterFirstProbe = service.craftingForCalls();
+        var second = FastCraftingPlanner.tryAttempt(
+                service, networkInv, null, TARGET, 2, false, null, session);
+
+        assertTrue(first.handled());
+        assertNotNull(first.plan());
+        assertTrue(second.handled());
+        assertNotNull(second.plan());
+        assertTrue(callsAfterFirstProbe > 0);
+        assertEquals(callsAfterFirstProbe, service.craftingForCalls(),
+                "CRAFT_LESS amount probes must reuse one inventory/pattern graph snapshot");
+    }
+
+    @Test
+    void oversizedAdapterExportReturnsConservativeSimulationPlan() {
+        int extraOutputs = 66_000;
+        var outputs = new ArrayList<appeng.api.stacks.GenericStack>(extraOutputs + 1);
+        outputs.add(new appeng.api.stacks.GenericStack(TARGET, 1));
+        for (int i = 0; i < extraOutputs; i++) {
+            outputs.add(new appeng.api.stacks.GenericStack(
+                    new VariantKey("export-side-" + i, null), 1));
+        }
+        IPatternDetails fanout = new FakeMultiOutputPattern(TARGET, outputs);
+        var service = new FakeCraftingService().pattern(TARGET, fanout).craftable(TARGET);
+        var networkInv = new ChildCraftingSimulationState(new StockInventory(Map.of()));
+
+        var attempt = org.junit.jupiter.api.Assertions.assertTimeoutPreemptively(
+                Duration.ofSeconds(2),
+                () -> FastCraftingPlanner.tryAttempt(
+                        service, networkInv, null, TARGET, 1, false));
+
+        assertTrue(attempt.handled());
+        assertNull(attempt.plan());
+        assertNotNull(attempt.simulationFallback());
+        assertEquals(1L, attempt.simulationFallback().missingItems().get(TARGET));
+    }
+
     private record FakePattern(AEKey output, IInput[] inputs) implements IPatternDetails {
         @Override public AEItemKey getDefinition() { return null; }
         @Override public IInput[] getInputs() { return inputs; }
         @Override public List<appeng.api.stacks.GenericStack> getOutputs() {
             return List.of(new appeng.api.stacks.GenericStack(output, 1));
         }
+    }
+
+    private record FakeMultiOutputPattern(
+            AEKey output,
+            List<appeng.api.stacks.GenericStack> outputs) implements IPatternDetails {
+        @Override public AEItemKey getDefinition() { return null; }
+        @Override public IInput[] getInputs() { return new IInput[0]; }
+        @Override public List<appeng.api.stacks.GenericStack> getOutputs() { return outputs; }
     }
 
     /**
@@ -219,6 +276,7 @@ class FastCraftingPlannerIdOnlyCraftableVariantTest {
     private static final class FakeCraftingService implements ICraftingService {
         private final Map<AEKey, List<IPatternDetails>> patterns = new LinkedHashMap<>();
         private final Set<AEKey> craftables = new java.util.LinkedHashSet<>();
+        private int craftingForCalls;
 
         FakeCraftingService pattern(AEKey output, IPatternDetails details) {
             patterns.computeIfAbsent(output, ignored -> new ArrayList<>()).add(details);
@@ -230,7 +288,12 @@ class FastCraftingPlannerIdOnlyCraftableVariantTest {
             return this;
         }
 
+        int craftingForCalls() {
+            return craftingForCalls;
+        }
+
         @Override public java.util.Collection<IPatternDetails> getCraftingFor(AEKey whatToCraft) {
+            craftingForCalls++;
             return patterns.getOrDefault(whatToCraft, List.of());
         }
         @Override public void refreshNodeCraftingProvider(IGridNode node) { }
