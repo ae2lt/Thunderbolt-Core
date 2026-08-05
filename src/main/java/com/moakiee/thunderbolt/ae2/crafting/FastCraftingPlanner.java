@@ -28,8 +28,6 @@ import appeng.crafting.CraftingPlan;
 import appeng.crafting.inv.ChildCraftingSimulationState;
 import appeng.crafting.inv.CraftingSimulationState;
 
-import com.moakiee.thunderbolt.ae2.overload.model.MatchMode;
-import com.moakiee.thunderbolt.ae2.overload.pattern.OverloadPatternDetails;
 import com.moakiee.thunderbolt.ae2.overload.pattern.OverloadedProviderOnlyPatternDetails;
 import com.moakiee.thunderbolt.core.planner.BoundedCombinations;
 import com.moakiee.thunderbolt.core.planner.CraftGraph;
@@ -94,9 +92,14 @@ import com.moakiee.thunderbolt.ae2.timewheel.ReusableSeedPattern;
  * <p><b>Planning-side ID_ONLY (ignore-NBT) aggregation.</b> Overload patterns may mark an input slot
  * {@code ID_ONLY}: at execution any stack sharing the item id is accepted regardless of NBT. For such a
  * slot the planner expands the candidate set with every same-item stack already in the network (via
- * {@code findFuzzyTemplates}/{@code IGNORE_ALL}) so the slot's available stock is counted as the
- * cross-NBT sum. Without this the planner would only see the exact declared template and report a false
- * shortfall whenever the item is held under a different NBT variant.
+ * {@code findFuzzyTemplates}/{@code IGNORE_ALL}) <em>and</em> every same-item key some pattern can
+ * craft ({@code ICraftingService#getCraftables}), so the slot can be supplied by stock under any NBT
+ * and by any producer pattern — strict plain, strict overload, or ID_ONLY overload (whose declared
+ * outputs are component-wiped, see {@code Ae2OverloadPatternDetails}) — regardless of which NBT
+ * variant that producer declares. Without this the planner would only see the exact declared template
+ * and report a false shortfall whenever the item is held or crafted under a different NBT variant.
+ * STRICT slots are intentionally not expanded: a producer whose output NBT differs must not satisfy
+ * them.
  *
  * <p>Byte accounting reproduces AE2's formulas (see {@code CraftingTreeNode#request},
  * {@code CraftingTreeProcess#request} and {@code ICraftingSimulationState#addStackBytes}) over the
@@ -298,6 +301,9 @@ public final class FastCraftingPlanner {
         Set<AEKey> itemUnitKeys = new HashSet<>();
         Map<AEKey, DurabilityChain<AEKey>> linkOwner = new HashMap<>();
         Set<Item> durabilityConflicts = new HashSet<>();
+        // Memoized ICraftingService#getCraftables scans for ID_ONLY candidate expansion, keyed by the
+        // declared template. Several slots demanding the same item share one network-wide scan.
+        Map<AEKey, List<AEKey>> craftableVariantCache = new HashMap<>();
         seen.add(root);
         queue.add(root);
 
@@ -409,11 +415,11 @@ public final class FastCraftingPlanner {
                 // Per-slot acceptable concrete options for the hard-fuzzy (OR) expansion.
                 IPatternDetails.IInput[] inputs = details.getInputs();
                 // Overload patterns expose per-slot match modes; an ID_ONLY (ignore-NBT) slot accepts any
-                // stack sharing the item id, so its available stock is the SUM across NBT variants. The
-                // slot index here lines up with how Ae2OverloadPatternDetails wrapped getInputs().
-                OverloadPatternDetails overloadView = details instanceof OverloadedProviderOnlyPatternDetails op
-                        ? op.overloadPatternDetailsView()
-                        : null;
+                // stack sharing the item id, so its candidates span every stocked or craftable same-item
+                // variant. The slot index here lines up with how Ae2OverloadPatternDetails wrapped
+                // getInputs().
+                OverloadedProviderOnlyPatternDetails overloadView =
+                        details instanceof OverloadedProviderOnlyPatternDetails op ? op : null;
                 List<List<SlotChoice>> slotOptions = new ArrayList<>(inputs.length);
                 long combos = 1;
                 boolean patternUnsatisfiable = false;
@@ -441,8 +447,9 @@ public final class FastCraftingPlanner {
                                 CraftInput.of(chain.carrier(), usesPerFiring)))));
                         continue; // single deterministic option, never enqueued for crafting
                     }
-                    boolean idOnly = overloadView != null && overloadView.inputMode(slot) == MatchMode.ID_ONLY;
-                    List<GenericStack> templates = idOnlyTemplates(in, idOnly, snapshot);
+                    boolean idOnly = overloadView != null && overloadView.isFuzzyInput(slot);
+                    List<GenericStack> templates = idOnlyTemplates(
+                            in, idOnly, snapshot, craftingService, craftableVariantCache);
                     templates = addConservativeDurabilityTemplates(
                             in, templates, craftingService, snapshot, level,
                             conservativeDurabilityItems);
@@ -542,14 +549,22 @@ public final class FastCraftingPlanner {
      * Concrete templates to consider for one input slot. A normal slot uses the pattern's declared
      * possible inputs verbatim. An ID_ONLY (ignore-NBT) overload slot additionally pulls every same-item
      * stack already in the network ({@code findFuzzyTemplates} uses {@code FuzzyMode.IGNORE_ALL} = same
-     * item id regardless of NBT/damage), each carrying the slot's per-craft amount. The v2 planner then
-     * treats them as competing inputs and splits firings across them, so the slot's effective stock is the
-     * cross-NBT sum — eliminating false "missing" when the item is only held under an NBT variant the
-     * pattern never enumerated. Crafting still works because the original declared template is kept first
-     * (so its pattern is discovered) and AE2's executing CPU reconciles the actually-extracted variant.
+     * item id regardless of NBT/damage) <em>and</em> every same-item key any pattern can craft
+     * ({@code ICraftingService#getCraftables} filtered to the template's key type + id), each carrying
+     * the slot's per-craft amount. The v2 planner then treats them as competing inputs and splits
+     * firings across them, so the slot can draw from cross-NBT stock <em>and</em> from producer
+     * patterns declaring a different NBT variant (strict plain, strict overload, or wiped ID_ONLY
+     * overload outputs alike) — eliminating false "missing" when the item is only held or crafted
+     * under an NBT variant the pattern never enumerated. Crafting still works because the declared
+     * template stays first (so its own pattern is discovered) and both the executing CPU's extraction
+     * ({@code CraftingCpuHelper.getValidItemTemplates} filters fuzzy inventory keys through
+     * {@code IInput#isValid}, which an ID_ONLY slot answers by item id) and the provider push
+     * ({@code Ae2OverloadPatternDetails#pushIdOnlyInput}) resolve same-id variants at runtime.
      */
     private static List<GenericStack> idOnlyTemplates(IPatternDetails.IInput in, boolean idOnly,
-                                                      ChildCraftingSimulationState snapshot) {
+                                                      ChildCraftingSimulationState snapshot,
+                                                      ICraftingService craftingService,
+                                                      Map<AEKey, List<AEKey>> craftableVariantCache) {
         GenericStack[] possible = in.getPossibleInputs();
         if (!idOnly) {
             return Arrays.asList(possible);
@@ -560,8 +575,27 @@ public final class FastCraftingPlanner {
             for (AEKey fuzzy : snapshot.findFuzzyTemplates(template.what())) {
                 byKey.putIfAbsent(fuzzy, new GenericStack(fuzzy, template.amount()));
             }
+            for (AEKey craftable : craftableSameIdVariants(
+                    craftingService, template.what(), craftableVariantCache)) {
+                byKey.putIfAbsent(craftable, new GenericStack(craftable, template.amount()));
+            }
         }
         return new ArrayList<>(byKey.values());
+    }
+
+    /**
+     * Every key the network can craft that an ID_ONLY slot demanding {@code template} would accept:
+     * same key type and same id ({@link AEKey#getId()} is the item's registry id for item keys, NBT
+     * excluded). This is what lets a strict plain pattern, a strict overload pattern, or another
+     * ID_ONLY overload pattern supply an ID_ONLY slot even when its declared output NBT differs from
+     * the slot's captured template and no unit is currently stocked. One network-wide scan per
+     * distinct template, memoized for the whole graph build.
+     */
+    private static List<AEKey> craftableSameIdVariants(ICraftingService craftingService,
+                                                       AEKey template,
+                                                       Map<AEKey, List<AEKey>> cache) {
+        return cache.computeIfAbsent(template, t -> List.copyOf(craftingService.getCraftables(
+                k -> k.getType() == t.getType() && k.getId().equals(t.getId()))));
     }
 
     /**

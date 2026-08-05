@@ -17,6 +17,8 @@ public record PlanningDiagnostics(
         boolean seedOrdered,
         int configuredSearchBudget,
         int consumedSearchBudget,
+        int configuredResolutionBudget,
+        int consumedResolutionBudget,
         int configuredFallbackBudget,
         int consumedFallbackBudget,
         int planRuns,
@@ -28,6 +30,7 @@ public record PlanningDiagnostics(
         int failureMemoHits,
         int frontierPeak,
         boolean searchCutoff,
+        boolean resolutionCutoff,
         boolean fallbackCutoff,
         long graphCompileNanos,
         long linearPassNanos,
@@ -37,7 +40,8 @@ public record PlanningDiagnostics(
     public static PlanningDiagnostics empty() {
         return new PlanningDiagnostics(
                 0, 0, 0, 0, 0, 0, false,
-                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, false, false,
+                0, 0, 0, 0, 0, 0,
+                0, 0, 0, 0, 0, 0, 0, 0, false, false, false,
                 0L, 0L, 0L, 0L);
     }
 }

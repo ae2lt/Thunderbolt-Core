@@ -55,7 +55,7 @@ class CycleAnalysisTest {
     }
 
     @Test
-    void rejectsGainCycleAndMultiInputCycleAsComplex() {
+    void classifiesGainCycleAsLossyAndMultiInputCycleAsComplex() {
         CraftGraph<String> gain = CraftGraph.<String>builder()
                 .pattern("A", 2, List.of(CraftInput.of("B", 1)))
                 .pattern("B", 2, List.of(CraftInput.of("A", 1)))
@@ -66,7 +66,10 @@ class CycleAnalysisTest {
                 .pattern("C", 1, List.of(CraftInput.of("A", 1)))
                 .build();
 
-        assertEquals(CycleAnalysis.Kind.COMPLEX, CycleAnalysis.analyze(gain, "A").kindOf("A"));
+        // A gain/lossy ring is still one mass-balanced direction per orientation, so it is now
+        // classified LOSSY_CONVERSION and may be reoriented; structurally weird cycles stay COMPLEX.
+        assertEquals(CycleAnalysis.Kind.LOSSY_CONVERSION,
+                CycleAnalysis.analyze(gain, "A").kindOf("A"));
         assertEquals(CycleAnalysis.Kind.COMPLEX,
                 CycleAnalysis.analyze(multiInput, "A").kindOf("A"));
     }

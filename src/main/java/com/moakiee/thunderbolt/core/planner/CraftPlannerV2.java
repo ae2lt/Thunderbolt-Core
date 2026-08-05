@@ -128,10 +128,21 @@ public final class CraftPlannerV2<K> {
     /** Ordinary unchanged catalysts may share one seed in the linear pass when no byproduct can feed it. */
     private final Set<K> ordinaryReturnedSeedKeys = new HashSet<>();
     private final Set<K> reachableByproductKeys = new HashSet<>();
+    /**
+     * Outputs whose resolution can reach a seed-order-sensitive pattern. Aggregating one of these
+     * outputs could reorder sibling seed acquisitions, while ordinary dependency cones below the
+     * sensitive pattern remain safe to fold into one topological sweep.
+     */
+    private final Set<K> seedOrderedDependencyCone = new HashSet<>();
 
     // Current recursion depth of the bounded fallback search (obtain/fire). Guards against stack overflow
     // on degenerate deep chains; see MAX_OBTAIN_DEPTH. Not part of the rolled-back planning state.
     private int depth;
+
+    /** Memo for {@link #isAggregable}: which nodes resolve deterministically without route search. */
+    private final Map<K, Boolean> aggregableMemo = new HashMap<>();
+    /** Lazily built key set for {@link #byproductFeedableKeys()}. */
+    private Set<K> byproductFeedableKeys;
 
     private final Map<K, List<CraftPattern<K>>> patternsByOutput = new HashMap<>();
     /**
@@ -310,16 +321,33 @@ public final class CraftPlannerV2<K> {
         // policy while sharing one global anytime-search budget with ordinary route deviations.
         if (!firstPlanner.cutOutputs.isEmpty()) {
             CycleAnalysis<K> cycleAnalysis = CycleAnalysis.analyze(graph, target);
-            int retries = 0;
+            // The DFS cut position inside a cycle depends on sibling arrival order, so a bad cut can
+            // surface its shortfall on ANOTHER member of the same cycle instead of on the recorded
+            // cut output. Attribute missing at member granularity and try the most-starved
+            // orientation first, so the bounded retries go to the cuts that actually hurt.
+            List<Map.Entry<K, Long>> reorientCandidates = new ArrayList<>();
             for (K cutOutput : firstPlanner.cutOutputs) {
-                if (retries >= MAX_CONVERSION_ORIENTATION_RETRIES) break;
-                if (!first.missing().containsKey(cutOutput)
-                        || !cycleAnalysis.mayReorient(cutOutput)) {
+                if (!cycleAnalysis.mayReorient(cutOutput)) {
                     continue;
                 }
+                long attributedMissing = first.missing().getOrDefault(cutOutput, 0L);
+                for (K member : cycleAnalysis.membersOf(cutOutput)) {
+                    if (!member.equals(cutOutput)) {
+                        attributedMissing = Sat.add(
+                                attributedMissing, first.missing().getOrDefault(member, 0L));
+                    }
+                }
+                if (attributedMissing > 0) {
+                    reorientCandidates.add(Map.entry(cutOutput, attributedMissing));
+                }
+            }
+            reorientCandidates.sort((left, right) -> Long.compare(right.getValue(), left.getValue()));
+            int retries = 0;
+            for (Map.Entry<K, Long> candidate : reorientCandidates) {
+                if (retries >= MAX_CONVERSION_ORIENTATION_RETRIES) break;
                 retries++;
                 PlanVariant<K> variant =
-                        new PlanVariant<>(List.of(cutOutput), Map.of(), 1, sequence++);
+                        new PlanVariant<>(List.of(candidate.getKey()), Map.of(), 1, sequence++);
                 if (queued.add(variant.key())) {
                     frontier.add(variant);
                 }
@@ -522,6 +550,7 @@ public final class CraftPlannerV2<K> {
                 order.add(postOrder.get(i));
             }
             indexLinearContainerBootstrapReserves();
+            indexSeedOrderedDependencyCone(order);
             this.capacity = capacityFromOrder(order, items.size());
             indexCapacityOrder();
             indexDirectRawConsumables();
@@ -537,6 +566,7 @@ public final class CraftPlannerV2<K> {
         // Returned catalysts must be acquired before the firing's outputs enter the shared pool.
         // The recursive path already has that execution order; the aggregate linear pass does not,
         // so using it here could let a positive macro output bootstrap its own seed algebraically.
+        CraftPlan<K> linearDiagnosis = null;
         if (!requiresSeedOrderedPlanning) {
             // 1) Linear backbone (v2-memo-deps / v2-lazy-deduct): one topological aggregation pass,
             //    each item resolved exactly once = O(n + E). Reservation-based capacity gives O(1)
@@ -546,6 +576,22 @@ public final class CraftPlannerV2<K> {
             diagnostics.addLinearPassNanos(System.nanoTime() - linearStarted);
             if (linear.feasible()) {
                 return enforceCycleBootstrap(linear);
+            }
+            linearDiagnosis = linear;
+            // 1b) Allocation repair: search over the contended outputs' route allocations only,
+            //     each candidate evaluated by one O(E) sweep. The sweep is the same aggregation
+            //     the linear backbone uses, so this applies exactly where the backbone's feasible
+            //     answers are already trusted: catalysts resolve through the shared seed reserve,
+            //     fixed conversion rings arrive here already cut to a DAG, and contracted
+            //     gain/feedback loops keep their compile-time bookkeeping. Unlike the recursive
+            //     search this can SPLIT one product's demand across routes; the cycle-bootstrap
+            //     check afterwards may still veto a plan, in which case the recursion runs.
+            CraftPlan<K> repaired = allocationRepair(order, target, amount);
+            if (repaired != null && repaired.feasible()) {
+                CraftPlan<K> bootstrapped = enforceCycleBootstrap(repaired);
+                if (bootstrapped.feasible()) {
+                    return bootstrapped;
+                }
             }
         }
 
@@ -557,6 +603,8 @@ public final class CraftPlannerV2<K> {
         obtain(target, amount, true);
         diagnostics.addSearchNanos(System.nanoTime() - searchStarted);
         boolean feasible = missing.isEmpty();
+        boolean budgetTruncated =
+                (searchBudget.exhausted() || diagnostics.resolutionExhausted()) && !feasible;
         CraftPlan<K> fallback = new CraftPlan<>(true, feasible,
                 new IdentityHashMap<>(firings),
                 new HashMap<>(usedStock),
@@ -564,8 +612,34 @@ public final class CraftPlannerV2<K> {
                 new HashMap<>(missing),
                 new HashMap<>(grossDemand),
                 processed,
-                searchBudget.exhausted() && !feasible);
+                budgetTruncated);
+        // A budget-truncated descent stops mid-graph and reports still-craftable intermediates as
+        // missing (e.g. "2 x complex component" instead of the millions of raw units their subtree
+        // needs). The aggregate pass has already expanded the same request all the way to raw leaves,
+        // so its diagnosis is the actionable one; the plan stays flagged budget-exhausted because
+        // alternate routes were still never fully explored.
+        if (budgetTruncated && linearDiagnosis != null && hasCraftableMissing(fallback)) {
+            CraftPlan<K> diagnosis = new CraftPlan<>(true, false,
+                    linearDiagnosis.firings(),
+                    linearDiagnosis.usedStock(),
+                    linearDiagnosis.usedReusableStock(),
+                    linearDiagnosis.missing(),
+                    linearDiagnosis.grossDemand(),
+                    linearDiagnosis.itemsProcessed(),
+                    true);
+            return enforceCycleBootstrap(diagnosis);
+        }
         return enforceCycleBootstrap(fallback);
+    }
+
+    /** True when a missing entry still has a producing pattern, i.e. the diagnosis was cut short. */
+    private boolean hasCraftableMissing(CraftPlan<K> plan) {
+        for (K key : plan.missing().keySet()) {
+            if (!patternsByOutput.getOrDefault(key, List.of()).isEmpty()) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private PreparedGraph<K> snapshotPreparedGraph(List<K> order, Set<K> items) {
@@ -617,6 +691,7 @@ public final class CraftPlannerV2<K> {
                 frozenBootstraps,
                 frozenConverters,
                 requiresSeedOrderedPlanning,
+                Set.copyOf(seedOrderedDependencyCone),
                 new HashMap<>(capacity),
                 frozenScores,
                 new HashMap<>(capacityOrderByOutput),
@@ -635,6 +710,7 @@ public final class CraftPlannerV2<K> {
         feedbackSeedBootstraps.putAll(prepared.feedbackSeedBootstraps);
         feedbackSeedConverters.putAll(prepared.feedbackSeedConverters);
         requiresSeedOrderedPlanning = prepared.seedOrdered;
+        seedOrderedDependencyCone.addAll(prepared.seedOrderedDependencyCone);
         capacity = prepared.capacity;
         capacityScoreByPattern.putAll(prepared.capacityScoreByPattern);
         capacityOrderByOutput.putAll(prepared.capacityOrderByOutput);
@@ -1140,6 +1216,55 @@ public final class CraftPlannerV2<K> {
     }
 
     /**
+     * Marks only the consumer-side cone above seed-order-sensitive patterns. The topological order is
+     * target first, so scanning it backwards lets the marker flow from an input to every output that
+     * may resolve it. Dependency cones below a sensitive pattern are deliberately left unmarked and
+     * can still use {@link #obtainAggregate}.
+     */
+    private void indexSeedOrderedDependencyCone(List<K> order) {
+        if (!requiresSeedOrderedPlanning) {
+            return;
+        }
+        for (int i = order.size() - 1; i >= 0; i--) {
+            K output = order.get(i);
+            boolean affected = directlyRequiresSeedOrder(output);
+            if (!affected) {
+                outer:
+                for (CraftPattern<K> pattern
+                        : patternsByOutput.getOrDefault(output, List.of())) {
+                    for (CraftInput<K> input : pattern.inputs()) {
+                        if (seedOrderedDependencyCone.contains(input.key())) {
+                            affected = true;
+                            break outer;
+                        }
+                    }
+                }
+            }
+            if (affected) {
+                seedOrderedDependencyCone.add(output);
+            }
+        }
+    }
+
+    /** The exact local conditions that raise the graph-wide seed-order safety gate. */
+    private boolean directlyRequiresSeedOrder(K output) {
+        for (CraftPattern<K> pattern
+                : patternsByOutput.getOrDefault(output, List.of())) {
+            for (CraftInput<K> input : pattern.inputs()) {
+                if (!input.returned() || input.uses() != CraftInput.INFINITE_USES) {
+                    continue;
+                }
+                if (isSelfReturnedSeed(pattern, input)
+                        || input.reusableStockSource() != null
+                        || reachableByproductKeys.contains(input.key())) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    /**
      * A complete private-host seed is already an acyclic startup source. It must not be treated as a
      * graph edge back to an ancestor merely because the same state is also craftable downstream.
      */
@@ -1531,6 +1656,162 @@ public final class CraftPlannerV2<K> {
      * to the bounded search on the contended cone.
      */
     private CraftPlan<K> linearPass(List<K> order, K target, long amount) {
+        LinearPassState<K> pass = linearPassState(order, target, amount, Map.of());
+        boolean feasible = pass.miss().isEmpty();
+        return new CraftPlan<>(true, feasible, pass.fired(), pass.used(), Map.of(), pass.miss(),
+                pass.gross(), pass.done(), false);
+    }
+
+    /** Everything one aggregation sweep learned; the allocation-repair loop reads it back. */
+    private record LinearPassState<K>(
+            Map<K, Long> need,
+            Map<CraftPattern<K>, Long> fired,
+            Map<K, Long> used,
+            Map<K, Long> miss,
+            Map<K, Long> gross,
+            Map<CraftPattern<K>, Long> allocatedUnits,
+            int done) {
+    }
+
+    /**
+     * Anytime allocation search whose decision variables are ONLY the contended outputs' route
+     * allocations. Each iteration is one O(E) aggregation sweep under per-route unit caps; when the
+     * sweep is infeasible, the largest raw shortfall is attributed backward through the realized
+     * demand flow to the contended route that pulled most of it, that route's cap is tightened by
+     * the attributed amount, and the freed demand re-splits across sibling routes on the next sweep.
+     * This finds mixed allocations (partially route A, remainder route B) that the all-or-nothing
+     * recursive search cannot express, and its cost scales with the number of contended outputs
+     * rather than with root-to-leaf path counts. Returns {@code null} when repair gave up — the
+     * recursive search then runs unchanged.
+     */
+    private CraftPlan<K> allocationRepair(List<K> order, K target, long amount) {
+        int contended = preparedGraph.contendedOutputCount;
+        if (contended == 0) {
+            return null; // nothing to reallocate; the plain pass already had the only answer
+        }
+        int maxIterations = (int) Math.min(64L, 4L + 2L * contended);
+        Map<CraftPattern<K>, Long> caps = new IdentityHashMap<>();
+        Set<CraftPattern<K>> ineffective =
+                java.util.Collections.newSetFromMap(new IdentityHashMap<>());
+        for (int i = 0; i < maxIterations; i++) {
+            if (!searchBudget.tryConsume()) {
+                return null;
+            }
+            diagnostics.recordDynamicCapacityEvaluation();
+            LinearPassState<K> pass = linearPassState(order, target, amount, caps);
+            if (pass.miss().isEmpty()) {
+                return new CraftPlan<>(true, true, pass.fired(), pass.used(), Map.of(), Map.of(),
+                        pass.gross(), pass.done(), false);
+            }
+            if (!tightenBlamedRoute(pass, caps, ineffective)) {
+                return null;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Attributes the largest leaf shortfall backward through this sweep's realized demand flow and
+     * tightens the cap of the contended route that pulled the biggest share of it. Blame fractions
+     * are heuristic step sizes only — every resulting allocation is re-validated by the next full
+     * sweep, so precision here affects convergence speed, never correctness.
+     *
+     * @return false when no cap can make further progress
+     */
+    private boolean tightenBlamedRoute(
+            LinearPassState<K> pass,
+            Map<CraftPattern<K>, Long> caps,
+            Set<CraftPattern<K>> ineffective) {
+        K shortLeaf = null;
+        long shortfall = 0L;
+        for (Map.Entry<K, Long> entry : pass.miss().entrySet()) {
+            if (entry.getValue() > shortfall) {
+                shortLeaf = entry.getKey();
+                shortfall = entry.getValue();
+            }
+        }
+        if (shortLeaf == null) {
+            return false;
+        }
+
+        // consumers[i] = the fired patterns that demanded item i this sweep, with their unit draw.
+        Map<K, List<Map.Entry<CraftPattern<K>, Long>>> consumers = new HashMap<>();
+        for (Map.Entry<CraftPattern<K>, Long> firing : pass.fired().entrySet()) {
+            CraftPattern<K> r = firing.getKey();
+            for (CraftInput<K> in : r.inputs()) {
+                long units = in.unitsFor(firing.getValue());
+                if (units > 0) {
+                    consumers.computeIfAbsent(in.key(), ignored -> new ArrayList<>())
+                            .add(Map.entry(r, units));
+                }
+            }
+        }
+
+        // Backward blame propagation, leaves toward the target (reverse topological order).
+        Map<K, Double> blameByItem = new HashMap<>();
+        blameByItem.put(shortLeaf, (double) shortfall);
+        CraftPattern<K> blamed = null;
+        double blamedShare = 0.0;
+        List<K> order = preparedGraph.order;
+        for (int i = order.size() - 1; i >= 0; i--) {
+            K item = order.get(i);
+            Double blame = blameByItem.get(item);
+            if (blame == null || blame <= 0.0) {
+                continue;
+            }
+            long demand = pass.need().getOrDefault(item, 0L);
+            if (demand <= 0) {
+                continue;
+            }
+            for (Map.Entry<CraftPattern<K>, Long> consumer
+                    : consumers.getOrDefault(item, List.of())) {
+                CraftPattern<K> r = consumer.getKey();
+                double share = blame * consumer.getValue() / (double) demand;
+                if (share <= 0.0) {
+                    continue;
+                }
+                if (isContendedOutput(r.output()) && !ineffective.contains(r) && share > blamedShare) {
+                    blamed = r;
+                    blamedShare = share;
+                }
+                blameByItem.merge(r.output(), share, Double::sum);
+            }
+        }
+        if (blamed == null) {
+            return false;
+        }
+
+        long allocated = pass.allocatedUnits().getOrDefault(blamed, 0L);
+        long leafDemand = pass.need().getOrDefault(shortLeaf, 0L);
+        // contribution of the blamed route to the leaf ≈ (blamedShare/shortfall)·leafDemand;
+        // removing Δ allocation units removes Δ·contribution/allocated leaf units.
+        double contribution = blamedShare / (double) shortfall * (double) leafDemand;
+        long delta = contribution <= 0.0
+                ? allocated
+                : (long) Math.ceil((double) shortfall * (double) allocated / contribution);
+        long newCap = Math.max(0L, allocated - Math.max(1L, delta));
+        Long existing = caps.get(blamed);
+        if (existing != null && existing <= newCap) {
+            ineffective.add(blamed);
+            return tightenBlamedRoute(pass, caps, ineffective);
+        }
+        caps.put(blamed, newCap);
+        return true;
+    }
+
+    private boolean isContendedOutput(K output) {
+        List<CraftPattern<K>> ps = patternsByOutput.getOrDefault(output, List.of());
+        return ps.size() > 1 && distinctMaterialBranches(capacityOrder(output)).size() > 1;
+    }
+
+    /**
+     * One topological aggregation sweep. {@code capUnits} (possibly empty) bounds how many units of
+     * its own output each pattern may be allocated; the bound is soft — demand nobody has capacity
+     * or cap room for is still pushed down the primary recipe so shortfalls always surface at raw
+     * leaves, never as silently dropped demand.
+     */
+    private LinearPassState<K> linearPassState(
+            List<K> order, K target, long amount, Map<CraftPattern<K>, Long> capUnits) {
         Map<K, Long> need = new HashMap<>();
         Map<K, Long> bp = new HashMap<>();       // byproduct / surplus pool
         Map<K, Long> stockL = new HashMap<>();   // remaining inventory
@@ -1541,6 +1822,7 @@ public final class CraftPlannerV2<K> {
         // seed reserve separately so ordinary consumption of the same key is still added on top.
         Map<K, Long> returnedSeedReserve = new HashMap<>();
         Map<CraftPattern<K>, Long> fired = new IdentityHashMap<>();
+        Map<CraftPattern<K>, Long> allocatedUnits = new IdentityHashMap<>();
         need.put(target, amount);
         int done = 0;
 
@@ -1572,18 +1854,19 @@ public final class CraftPlannerV2<K> {
                 miss.merge(x, d, Sat::add);
                 continue;
             }
-            allocateLinear(x, d, ps, need, bp, returnedSeedReserve, fired);
+            allocateLinear(x, d, ps, need, bp, returnedSeedReserve, fired, capUnits, allocatedUnits);
         }
 
-        boolean feasible = miss.isEmpty();
-        return new CraftPlan<>(true, feasible, fired, used, Map.of(), miss, gross, done, false);
+        return new LinearPassState<>(need, fired, used, miss, gross, allocatedUnits, done);
     }
 
     /** Split {@code d} of {@code x} across recipes by current remaining capacity (dynamic balance). */
     private void allocateLinear(K x, long d, List<CraftPattern<K>> ps,
                                 Map<K, Long> need, Map<K, Long> bp,
                                 Map<K, Long> returnedSeedReserve,
-                                Map<CraftPattern<K>, Long> fired) {
+                                Map<CraftPattern<K>, Long> fired,
+                                Map<CraftPattern<K>, Long> capUnits,
+                                Map<CraftPattern<K>, Long> allocatedUnits) {
         List<CraftPattern<K>> ordered = groupedCapacityOrder(
                 ps,
                 pattern -> capRemainingVia(pattern, need),
@@ -1594,12 +1877,17 @@ public final class CraftPlannerV2<K> {
                 break;
             }
             long p = capRemainingVia(r, need);
+            Long cap = capUnits.get(r);
+            if (cap != null) {
+                p = Math.min(p, Math.max(0L, cap - allocatedUnits.getOrDefault(r, 0L)));
+            }
             if (p <= 0) {
                 continue;
             }
             long make = Math.min(d, p);
             long t = Sat.ceilDiv(make, r.outputAmount());
             long consumed = Math.min(d, Sat.mul(t, r.outputAmount()));
+            allocatedUnits.merge(r, consumed, Sat::add);
             fireLinear(x, r, t, consumed, need, bp, returnedSeedReserve, fired);
             d -= consumed;
         }
@@ -1608,6 +1896,7 @@ public final class CraftPlannerV2<K> {
         if (d > 0) {
             CraftPattern<K> r0 = ps.get(0);
             long t = Sat.ceilDiv(d, r0.outputAmount());
+            allocatedUnits.merge(r0, d, Sat::add);
             fireLinear(x, r0, t, d, need, bp, returnedSeedReserve, fired);
         }
     }
@@ -1787,11 +2076,12 @@ public final class CraftPlannerV2<K> {
             return d;
         }
 
-        // Once alternative-search work is exhausted, finish the already-running plan through one
-        // deterministic capacity-first route. This reuses the current pools, reservations and parent
-        // results; it does not rebuild the graph or launch a separate diagnostic planner.
-        if (searchBudget.exhausted()) {
-            return commitFailure ? commitBudgetFallback(x, d) : d;
+        // An uncontended cone needs no route search: resolve it with one topological demand
+        // aggregation instead of per-edge recursion. Recursion multiplies obtain() calls by the
+        // number of root-to-node paths (exponential when a deep chain's tiers share nodes), so the
+        // recursive search below is reserved for genuinely contended nodes.
+        if (isAggregable(x)) {
+            return obtainAggregate(x, d, commitFailure);
         }
 
         // Depth is part of the proof identity: a route rejected only because it reached the stack
@@ -1802,25 +2092,23 @@ public final class CraftPlannerV2<K> {
             return d;
         }
 
-        if (!searchBudget.tryConsume()) {
+        // Stateful/cyclic boundaries cannot use the aggregate sweep and therefore need their own
+        // bounded resolution guard. This is deliberately separate from alternative-search work: a
+        // single returned seed or container is deterministic and must not consume search budget.
+        if (!diagnostics.tryConsumeResolutionWork()) {
             return commitFailure ? commitBudgetFallback(x, d) : d;
         }
+
         if (processed < Integer.MAX_VALUE) {
             processed++;
         }
 
-        int v = visit.getOrDefault(x, 0);
-        if (v >= visitCap) {
-            diagnostics.recordHotNodeVisit();
-            return obtainHot(x, d, commitFailure, failureKey);
-        }
-        visit.put(x, v + 1);
-
         // A single recipe needs no alternate search, but its descendants still resolve their own
-        // contention normally and may switch to current-state ordering once hot.
+        // contention normally. It consumes resolution work above, never alternative-search work.
         if (ps.size() == 1) {
             long unmet = fire(x, ps.get(0), d, !commitFailure);
-            if (!commitFailure && unmet > 0 && !searchBudget.exhausted()) {
+            if (!commitFailure && unmet > 0
+                    && !searchBudget.exhausted() && !diagnostics.resolutionExhausted()) {
                 failedSpeculativeSearches.add(failureKey);
             }
             return unmet;
@@ -1832,11 +2120,26 @@ public final class CraftPlannerV2<K> {
             // There is no materially different alternative to discover. Commit the representative
             // once instead of speculatively expanding it, rolling it back, and expanding it again.
             long unmet = fire(x, distinctBranches.get(0), d, !commitFailure);
-            if (!commitFailure && unmet > 0 && !searchBudget.exhausted()) {
+            if (!commitFailure && unmet > 0
+                    && !searchBudget.exhausted() && !diagnostics.resolutionExhausted()) {
                 failedSpeculativeSearches.add(failureKey);
             }
             return unmet;
         }
+
+        // Only a materially contended node reaches this point. Once alternative-search work is
+        // exhausted, finish its selected capacity-first route through the separately bounded tail.
+        if (searchBudget.exhausted()) {
+            return commitFailure ? commitBudgetFallback(x, d) : d;
+        }
+
+        int v = visit.getOrDefault(x, 0);
+        if (v >= visitCap) {
+            diagnostics.recordHotNodeVisit();
+            return obtainHot(x, d, commitFailure, failureKey);
+        }
+        visit.put(x, v + 1);
+
         for (CraftPattern<K> r : distinctBranches) {
             if (hasProvenDirectConsumableShortfall(r, d)) {
                 continue;
@@ -1848,7 +2151,7 @@ public final class CraftPlannerV2<K> {
             long beforeMissing = missingTotal;
             recordRouteDecision(x, r, distinctBranches);
             long unmet = fire(x, r, d, true);
-            if (searchBudget.exhausted()) {
+            if (searchBudget.exhausted() || diagnostics.resolutionExhausted()) {
                 rollback(mark);
                 return commitFailure ? commitBestEffort(distinctBranches, x, d) : d;
             }
@@ -1887,7 +2190,7 @@ public final class CraftPlannerV2<K> {
             long beforeMissing = missingTotal;
             recordRouteDecision(x, route, distinctBranches);
             long unmet = fire(x, route, d, true);
-            if (searchBudget.exhausted()) {
+            if (searchBudget.exhausted() || diagnostics.resolutionExhausted()) {
                 rollback(mark);
                 return commitFailure ? commitBestEffort(distinctBranches, x, d) : d;
             }
@@ -2032,6 +2335,151 @@ public final class CraftPlannerV2<K> {
         return distinct;
     }
 
+    /**
+     * True when {@code y}'s own resolution is fully deterministic: at most one materially distinct
+     * route, ordinary consumed inputs only (no catalysts, containers, tools or reusable-stock
+     * seeds), no byproducts, and no cycle/feedback bookkeeping. Such a node never benefits from the
+     * branching search, so its demand can be folded into an aggregate sweep. Descendants are NOT
+     * required to be aggregable — a sweep hands their aggregated demand back to {@link #obtain}.
+     */
+    private boolean isAggregable(K y) {
+        if (seedOrderedDependencyCone.contains(y)) {
+            return false;
+        }
+        Boolean cached = aggregableMemo.get(y);
+        if (cached != null) {
+            return cached;
+        }
+        boolean result = computeAggregable(y);
+        aggregableMemo.put(y, result);
+        return result;
+    }
+
+    private boolean computeAggregable(K y) {
+        if (cutOutputs.contains(y)) {
+            return false;
+        }
+        List<CraftPattern<K>> ps = patternsByOutput.getOrDefault(y, List.of());
+        if (ps.isEmpty()) {
+            return false; // raw leaf: obtain()'s ordinary path already handles it in O(1)
+        }
+        if (ps.size() > 1 && distinctMaterialBranches(capacityOrder(y)).size() > 1) {
+            return false;
+        }
+        for (CraftPattern<K> r : ps) {
+            if (!r.byproducts().isEmpty()
+                    || suppressedPositiveFeedbackOutputs.containsKey(r)
+                    || feedbackSeedBootstraps.containsKey(r)
+                    || feedbackSeedConverters.containsKey(r)) {
+                return false;
+            }
+            for (CraftInput<K> in : r.inputs()) {
+                if (in.returned() || in.remainder() != null || in.reusableStockSource() != null) {
+                    return false;
+                }
+                // A byproduct-feedable input depends on sibling firing order, which the
+                // topologically ordered sweep would change; leave such nodes to the recursion.
+                if (byproductFeedableKeys().contains(in.key())) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    /** Keys some reachable pattern emits as a byproduct; consumers of these stay on the recursion. */
+    private Set<K> byproductFeedableKeys() {
+        if (byproductFeedableKeys == null) {
+            Set<K> keys = new HashSet<>();
+            for (List<CraftPattern<K>> patterns : patternsByOutput.values()) {
+                for (CraftPattern<K> pattern : patterns) {
+                    for (CraftOutput<K> out : pattern.byproducts()) {
+                        keys.add(out.key());
+                    }
+                }
+            }
+            byproductFeedableKeys = keys;
+        }
+        return byproductFeedableKeys;
+    }
+
+    /**
+     * Resolves the cone under an uncontended node by one topological demand-aggregation sweep.
+     * Demand for every item is summed across all of its consumers before the item is expanded, so a
+     * node shared by many parents is fired exactly once per sweep instead of once per root-to-node
+     * path (which is exponential in chain depth). Contended or otherwise non-aggregable descendants
+     * are handed their <em>total</em> aggregated demand through an ordinary {@link #obtain} boundary
+     * call, confining the branching search to the contended subgraph. All mutations go through the
+     * trail-logged helpers, so a speculative caller can roll the whole sweep back like any branch.
+     *
+     * <p>{@code x}'s own gross demand, seed reservations and pool draw were already performed by the
+     * calling {@link #obtain}.
+     */
+    private long obtainAggregate(K x, long d, boolean commitFailure) {
+        Map<K, Long> need = new HashMap<>();
+        need.put(x, d);
+        long unmet = 0L;
+        boolean reached = false;
+        for (K y : preparedGraph.order) {
+            if (!reached) {
+                if (!y.equals(x)) continue;
+                reached = true;
+            }
+            long dy = need.getOrDefault(y, 0L);
+            if (dy <= 0) {
+                continue;
+            }
+            if (!y.equals(x)) {
+                bump(grossDemand, y, dy);
+                reserveSelfSeed(y);
+                reserveFeedbackSeedOutput(y, dy);
+                dy -= drawPools(y, dy);
+                if (dy <= 0) {
+                    continue;
+                }
+                List<CraftPattern<K>> psy = patternsByOutput.getOrDefault(y, List.of());
+                if (psy.isEmpty()) {
+                    unmet = Sat.add(unmet, dy);
+                    if (!commitFailure) {
+                        return unmet; // shortfall: the speculative caller rolls the sweep back
+                    }
+                    addMissing(y, dy);
+                    continue;
+                }
+                if (!isAggregable(y)) {
+                    depth++;
+                    long u;
+                    try {
+                        u = obtain(y, dy, commitFailure);
+                    } finally {
+                        depth--;
+                    }
+                    unmet = Sat.add(unmet, u);
+                    if (!commitFailure && (u > 0 || searchBudget.exhausted()
+                            || diagnostics.resolutionExhausted())) {
+                        return unmet;
+                    }
+                    continue;
+                }
+            }
+            List<CraftPattern<K>> psy = patternsByOutput.getOrDefault(y, List.of());
+            CraftPattern<K> r = psy.size() == 1 ? psy.get(0) : capacityOrder(y).get(0);
+            if (processed < Integer.MAX_VALUE) {
+                processed++;
+            }
+            long times = Sat.ceilDiv(dy, r.outputAmount());
+            bumpFiring(r, times);
+            for (CraftInput<K> in : r.inputs()) {
+                need.merge(in.key(), in.unitsFor(times), Sat::add);
+            }
+            long surplus = Sat.mul(times, r.outputAmount()) - dy;
+            if (surplus > 0) {
+                bump(bpPool, y, surplus);
+            }
+        }
+        return unmet;
+    }
+
     private long commitBudgetFallback(K x, long d) {
         if (!fallbackBudget.tryConsume()) {
             addMissing(x, d);
@@ -2099,7 +2547,7 @@ public final class CraftPlannerV2<K> {
                 }
             }
             inputUnmet = Sat.add(inputUnmet, unmet);
-            if (search && searchBudget.exhausted()) {
+            if (search && (searchBudget.exhausted() || diagnostics.resolutionExhausted())) {
                 return inputUnmet;
             }
             if (detectSiblingConflict
@@ -2486,8 +2934,12 @@ public final class CraftPlannerV2<K> {
         }
         alternatives.sort((a, b) -> Long.compare(capacityScore(b), capacityScore(a)));
         alternatives = new ArrayList<>(promotePreferredRoute(key, alternatives));
+        boolean competing = alternatives.size() > 1;
         for (CraftPattern<K> alternative : alternatives) {
-            if (!searchBudget.tryConsume()) {
+            boolean admitted = competing
+                    ? searchBudget.tryConsume()
+                    : diagnostics.tryConsumeResolutionWork();
+            if (!admitted) {
                 // The outer committed route will retain this deterministic dependency tree; a
                 // speculative parent will roll the same writes back at its own mark.
                 if (!fallbackBudget.tryConsume()) {
@@ -2500,7 +2952,7 @@ public final class CraftPlannerV2<K> {
             long beforeMissing = missingTotal;
             recordRouteDecision(key, alternative, alternatives);
             long unmet = fire(key, alternative, amount, true);
-            if (searchBudget.exhausted()) {
+            if (searchBudget.exhausted() || diagnostics.resolutionExhausted()) {
                 rollback(mark);
                 return amount;
             }
@@ -2882,6 +3334,7 @@ public final class CraftPlannerV2<K> {
         private final Map<CraftPattern<K>, List<FeedbackSeedBootstrap<K>>> feedbackSeedBootstraps;
         private final Map<CraftPattern<K>, List<FeedbackSeedBootstrap<K>>> feedbackSeedConverters;
         private final boolean seedOrdered;
+        private final Set<K> seedOrderedDependencyCone;
         private final Map<K, Long> capacity;
         private final Map<CraftPattern<K>, Long> capacityScoreByPattern;
         private final Map<K, List<CraftPattern<K>>> capacityOrderByOutput;
@@ -2902,6 +3355,7 @@ public final class CraftPlannerV2<K> {
                 Map<CraftPattern<K>, List<FeedbackSeedBootstrap<K>>> feedbackSeedBootstraps,
                 Map<CraftPattern<K>, List<FeedbackSeedBootstrap<K>>> feedbackSeedConverters,
                 boolean seedOrdered,
+                Set<K> seedOrderedDependencyCone,
                 Map<K, Long> capacity,
                 Map<CraftPattern<K>, Long> capacityScoreByPattern,
                 Map<K, List<CraftPattern<K>>> capacityOrderByOutput,
@@ -2920,6 +3374,7 @@ public final class CraftPlannerV2<K> {
             this.feedbackSeedBootstraps = feedbackSeedBootstraps;
             this.feedbackSeedConverters = feedbackSeedConverters;
             this.seedOrdered = seedOrdered;
+            this.seedOrderedDependencyCone = seedOrderedDependencyCone;
             this.capacity = capacity;
             this.capacityScoreByPattern = capacityScoreByPattern;
             this.capacityOrderByOutput = capacityOrderByOutput;
@@ -2935,6 +3390,7 @@ public final class CraftPlannerV2<K> {
     private static final class DiagnosticsCollector {
         private final int reachableWorkEstimate;
         private final int configuredSearchBudget;
+        private final int configuredResolutionBudget;
         private final int configuredFallbackBudget;
         private int reachableItems;
         private int reachablePatterns;
@@ -2951,6 +3407,8 @@ public final class CraftPlannerV2<K> {
         private int failureMemoHits;
         private int frontierPeak;
         private boolean searchCutoff;
+        private int consumedResolutionBudget;
+        private boolean resolutionCutoff;
         private int consumedFallbackBudget;
         private boolean fallbackCutoff;
         private long graphCompileNanos;
@@ -2960,6 +3418,7 @@ public final class CraftPlannerV2<K> {
         private DiagnosticsCollector(int reachableWorkEstimate, int configuredSearchBudget) {
             this.reachableWorkEstimate = reachableWorkEstimate;
             this.configuredSearchBudget = Math.max(1, configuredSearchBudget);
+            this.configuredResolutionBudget = fallbackWorkBudget(reachableWorkEstimate);
             this.configuredFallbackBudget = fallbackWorkBudget(reachableWorkEstimate);
         }
 
@@ -3010,6 +3469,19 @@ public final class CraftPlannerV2<K> {
             searchCutoff = true;
         }
 
+        private boolean tryConsumeResolutionWork() {
+            if (consumedResolutionBudget >= configuredResolutionBudget) {
+                resolutionCutoff = true;
+                return false;
+            }
+            consumedResolutionBudget = increment(consumedResolutionBudget);
+            return true;
+        }
+
+        private boolean resolutionExhausted() {
+            return resolutionCutoff;
+        }
+
         private void recordFallbackWork() {
             consumedFallbackBudget = increment(consumedFallbackBudget);
         }
@@ -3038,6 +3510,8 @@ public final class CraftPlannerV2<K> {
                     seedOrdered,
                     configuredSearchBudget,
                     consumed,
+                    configuredResolutionBudget,
+                    consumedResolutionBudget,
                     configuredFallbackBudget,
                     consumedFallbackBudget,
                     planRuns,
@@ -3049,6 +3523,7 @@ public final class CraftPlannerV2<K> {
                     failureMemoHits,
                     frontierPeak,
                     searchCutoff,
+                    resolutionCutoff,
                     fallbackCutoff,
                     graphCompileNanos,
                     linearPassNanos,

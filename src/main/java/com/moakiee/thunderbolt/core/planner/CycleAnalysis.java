@@ -23,11 +23,21 @@ final class CycleAnalysis<K> {
         ACYCLIC,
         PURE_CONVERSION,
         CATALYZED_CONVERSION,
+        /**
+         * Structurally a conversion ring (each internal pattern consumes exactly one ordinary
+         * internal input, no internal byproducts), but the round-trip exchange rate is not 1 —
+         * lossy or gainful. Any single orientation is still an ordinary mass-balanced DAG, so
+         * reorienting it is safe: only one direction ever exists within a plan, which makes
+         * round-trip amplification impossible to schedule.
+         */
+        LOSSY_CONVERSION,
         CATALYST_STATE,
         COMPLEX;
 
         boolean mayReorient() {
-            return this == PURE_CONVERSION || this == CATALYZED_CONVERSION;
+            return this == PURE_CONVERSION
+                    || this == CATALYZED_CONVERSION
+                    || this == LOSSY_CONVERSION;
         }
     }
 
@@ -35,10 +45,15 @@ final class CycleAnalysis<K> {
 
     private final Map<K, Kind> kindByMember;
     private final Set<K> directlyReorientable;
+    private final Map<K, Set<K>> membersByMember;
 
-    private CycleAnalysis(Map<K, Kind> kindByMember, Set<K> directlyReorientable) {
+    private CycleAnalysis(
+            Map<K, Kind> kindByMember,
+            Set<K> directlyReorientable,
+            Map<K, Set<K>> membersByMember) {
         this.kindByMember = Map.copyOf(kindByMember);
         this.directlyReorientable = Set.copyOf(directlyReorientable);
+        this.membersByMember = Map.copyOf(membersByMember);
     }
 
     static <K> CycleAnalysis<K> analyze(CraftGraph<K> graph, K target) {
@@ -47,6 +62,7 @@ final class CycleAnalysis<K> {
         List<K> finishOrder = finishOrder(adjacency);
 
         Map<K, Kind> kinds = new HashMap<>();
+        Map<K, Set<K>> membersBySccMember = new HashMap<>();
         Set<K> assigned = new HashSet<>();
         for (int i = finishOrder.size() - 1; i >= 0; i--) {
             K root = finishOrder.get(i);
@@ -68,13 +84,23 @@ final class CycleAnalysis<K> {
             Kind kind = members.size() > 1 || selfLoop
                     ? classify(graph, members)
                     : Kind.ACYCLIC;
+            if (members.size() > 1 || selfLoop) {
+                Set<K> frozen = Set.copyOf(members);
+                for (K member : members) membersBySccMember.put(member, frozen);
+            }
             for (K member : members) kinds.put(member, kind);
         }
-        return new CycleAnalysis<>(kinds, directlyReorientable(graph, adjacency.keySet()));
+        return new CycleAnalysis<>(
+                kinds, directlyReorientable(graph, adjacency.keySet()), membersBySccMember);
     }
 
     Kind kindOf(K key) {
         return kindByMember.getOrDefault(key, Kind.ACYCLIC);
+    }
+
+    /** The key's cycle members (itself included), or an empty set for acyclic nodes. */
+    Set<K> membersOf(K key) {
+        return membersByMember.getOrDefault(key, Set.of());
     }
 
     boolean mayReorient(K key) {
@@ -264,7 +290,7 @@ final class CycleAnalysis<K> {
 
         if (internalPatternCount == 0 || mode == null) return Kind.COMPLEX;
         if (mode == InternalMode.CATALYST) return Kind.CATALYST_STATE;
-        if (!weightsAreConsistent(members, weights)) return Kind.COMPLEX;
+        if (!weightsAreConsistent(members, weights)) return Kind.LOSSY_CONVERSION;
         return hasExternalInputs ? Kind.CATALYZED_CONVERSION : Kind.PURE_CONVERSION;
     }
 

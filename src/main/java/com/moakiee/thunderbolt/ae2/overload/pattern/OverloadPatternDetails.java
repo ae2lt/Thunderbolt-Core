@@ -104,7 +104,7 @@ public final class OverloadPatternDetails implements OverloadedProviderOnlyPatte
     private static InputSlot toInputSlot(ParsedPatternInput input, MatchMode matchMode) {
         return new InputSlot(
                 input.slotIndex(),
-                normalizedCopy(input.stack()),
+                wipeIfIdOnly(normalizedCopy(input.stack()), matchMode),
                 input.amountPerCraft(),
                 matchMode);
     }
@@ -112,7 +112,7 @@ public final class OverloadPatternDetails implements OverloadedProviderOnlyPatte
     private static OutputSlot toOutputSlot(ParsedPatternOutput output, MatchMode matchMode) {
         return new OutputSlot(
                 output.slotIndex(),
-                normalizedCopy(output.stack()),
+                wipeIfIdOnly(normalizedCopy(output.stack()), matchMode),
                 output.amountPerCraft(),
                 matchMode,
                 output.primaryOutput());
@@ -122,6 +122,19 @@ public final class OverloadPatternDetails implements OverloadedProviderOnlyPatte
         var copy = stack.copy();
         copy.setCount(1);
         return copy;
+    }
+
+    /**
+     * An ID_ONLY slot compares by item id only, so its template erases the captured components
+     * ("仅id ⇒ 抹除NBT"). This keeps every metadata consumer — tooltips, CPU pending-output
+     * registration, mirror accounting — consistent with the wiped AE2-facing keys exposed by
+     * {@code Ae2OverloadPatternDetails}.
+     */
+    private static ItemStack wipeIfIdOnly(ItemStack stack, MatchMode matchMode) {
+        if (!matchMode.ignoresComponents() || stack.getComponentsPatch().isEmpty()) {
+            return stack;
+        }
+        return new ItemStack(stack.getItem(), stack.getCount());
     }
 
     /**
