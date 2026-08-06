@@ -3,22 +3,23 @@ package com.moakiee.thunderbolt.api.crafting.engine;
 import java.util.ArrayList;
 import java.util.List;
 
-/**
- * 当前选择的合成计算引擎（互斥，至多一个）。
- *
- * <p>默认 {@link CraftingEngineRegistry#NONE}（原版路径）。玩家通过游戏内命令
- * {@code /thunderbolt engine <id|list>} 切换；选择持久化在服务端配置中并自动同步到客户端。
- * 第三方引擎被选中时，闪电自身的深层规划器让位（不与其抢计算）。
- */
+
 public final class CraftingEngineSelection {
 
     private static volatile String current = CraftingEngineRegistry.NONE;
+    private static volatile String playerCurrent = CraftingEngineRegistry.NONE;
 
     private CraftingEngineSelection() {
     }
 
+    /** 机器默认引擎（配置文件值）；机器/自动化请求使用它。 */
     public static String current() {
         return current;
+    }
+
+    /** 本地玩家个人选择的引擎（客户端镜像，用于界面显示）。 */
+    public static String playerCurrent() {
+        return playerCurrent;
     }
 
     /**
@@ -32,9 +33,16 @@ public final class CraftingEngineSelection {
         }
     }
 
+    /** Loads the local player's personal engine choice mirror (client side, from the sync packet). */
+    public static void seedPlayer(String id) {
+        if (id != null && !id.isBlank()) {
+            playerCurrent = id;
+        }
+    }
+
     /**
-     * Sets the selection to a registered and available engine id. Invalid ids are rejected and the
-     * previous selection is kept. Pass {@link CraftingEngineRegistry#NONE} to return to vanilla.
+     * Sets the machine default to a registered and available engine id. Invalid ids are rejected
+     * and the previous selection is kept. Pass {@link CraftingEngineRegistry#NONE} to return to vanilla.
      */
     public static boolean select(String id) {
         if (CraftingEngineRegistry.NONE.equals(id)) {

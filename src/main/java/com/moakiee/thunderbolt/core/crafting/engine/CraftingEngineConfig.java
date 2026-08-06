@@ -1,7 +1,5 @@
 package com.moakiee.thunderbolt.core.crafting.engine;
 
-// [Thunderbolt-Core] engine-selection + mixin-package-fixes changeset (PR -> refactor/thunderbolt-three-layer-clean, 2026-08-07)
-
 import com.moakiee.thunderbolt.api.crafting.engine.CraftingEngineRegistry;
 import com.moakiee.thunderbolt.api.crafting.engine.CraftingEngineSelection;
 
@@ -15,11 +13,12 @@ public final class CraftingEngineConfig {
 
     private static final ModConfigSpec.ConfigValue<String> ENGINE = BUILDER
             .comment(
-                    "Which AE2 crafting-calculation engine is active. Mutually exclusive: at most one wins.",
+                    "Machine-default AE2 crafting-calculation engine. Used by machines/automation;",
+                    "each player can pick their own engine in the terminal GUI (persisted per-player).",
                     "  none        = original AE2 calculation (default)",
                     "  thunderbolt = Thunderbolt's own linear-time fast planner",
                     "  <other id>  = a registered third-party engine (e.g. vm, eco)",
-                    "Switch in-game with: /thunderbolt engine <id|list>")
+                    "Admin switch with: /thunderbolt engine <id|list> (machine default)")
             .define("craftingEngine", CraftingEngineRegistry.NONE);
 
     public static final ModConfigSpec SPEC = BUILDER.build();

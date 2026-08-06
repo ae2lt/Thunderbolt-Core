@@ -35,6 +35,7 @@ import com.moakiee.thunderbolt.core.crafting.planner.CraftPattern;
 import com.moakiee.thunderbolt.core.crafting.planner.CraftPlan;
 import com.moakiee.thunderbolt.core.crafting.planner.CraftPlannerV2;
 import com.moakiee.thunderbolt.core.crafting.support.CraftingStockPolicy;
+import com.moakiee.thunderbolt.core.crafting.support.FastCraftingPlanner;
 
 import org.junit.jupiter.api.Test;
 

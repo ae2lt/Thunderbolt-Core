@@ -1,11 +1,10 @@
 package com.moakiee.thunderbolt.core.crafting.engine.client;
 
-// [Thunderbolt-Core] engine-selection + mixin-package-fixes changeset (PR -> refactor/thunderbolt-three-layer-clean, 2026-08-07)
-
 import java.util.ArrayList;
 import java.util.List;
 
 import net.minecraft.client.Minecraft;
+import net.minecraft.client.gui.components.StringWidget;
 import net.minecraft.client.gui.screens.Screen;
 import net.minecraft.network.chat.Component;
 import net.minecraft.world.entity.player.Inventory;
@@ -29,6 +28,7 @@ public class EngineSelectionScreen extends AEBaseScreen<EngineSelectionMenu> {
     private final Screen previous;
     private final List<Option> options = new ArrayList<>();
     private String selectedId;
+    private StringWidget footerWidget;
 
     private record Option(AECheckbox checkbox, String id) {
     }
@@ -37,7 +37,7 @@ public class EngineSelectionScreen extends AEBaseScreen<EngineSelectionMenu> {
         super(menu, playerInventory, title,
                 StyleManager.loadStyleDoc("/screens/thunderbolt_engine_selection.json"));
         this.previous = Minecraft.getInstance().screen;
-        this.selectedId = CraftingEngineSelection.current();
+        this.selectedId = CraftingEngineSelection.playerCurrent();
     }
 
     /** 从侧边按钮打开：构造纯客户端幽灵菜单 + AE2 屏幕。 */
@@ -48,7 +48,7 @@ public class EngineSelectionScreen extends AEBaseScreen<EngineSelectionMenu> {
         }
         var menu = new EngineSelectionMenu(0, mc.player.getInventory());
         mc.setScreen(new EngineSelectionScreen(
-                menu, mc.player.getInventory(), Component.literal("AE2 合成计算引擎")));
+                menu, mc.player.getInventory(), Component.literal("我的合成计算引擎")));
     }
 
     @Override
@@ -65,6 +65,24 @@ public class EngineSelectionScreen extends AEBaseScreen<EngineSelectionMenu> {
         }
         refreshRadios();
         addBottomButtons(y + 6);
+        refreshFooter();
+    }
+
+    /** 底部说明行：机器默认路由（配置文件）与当前个人选择。 */
+    private void refreshFooter() {
+        if (this.footerWidget != null) {
+            this.removeWidget(this.footerWidget);
+        }
+        String footer = "机器默认: " + CraftingEngineSelection.current()
+                + "　我的引擎: " + CraftingEngineSelection.playerCurrent();
+        Component footerText = Component.literal(footer);
+        int textWidth = this.font.width(footerText);
+        this.footerWidget = new StringWidget(
+                this.leftPos + (this.imageWidth - textWidth) / 2,
+                this.topPos + this.imageHeight - 12,
+                textWidth, 9, footerText, this.font);
+        this.footerWidget.setColor(0xFF8A8F9B);
+        this.addRenderableWidget(this.footerWidget);
     }
 
     /** AE2 原版最基础组件：底部「返回」「退出」按钮。 */

@@ -22,6 +22,7 @@ import com.moakiee.thunderbolt.ThunderboltCore;
 import com.moakiee.thunderbolt.api.crafting.engine.CraftingEngineRegistry;
 import com.moakiee.thunderbolt.api.crafting.engine.CraftingEngineRequest;
 import com.moakiee.thunderbolt.api.crafting.engine.CraftingEngineSelection;
+import com.moakiee.thunderbolt.core.crafting.engine.PlayerEngineSelection;
 
 /**
  * 第一层递归 mixin：与 vm（{@code order=100}）、eco（{@code order=500}）同一接缝
@@ -60,20 +61,25 @@ public abstract class CraftingServiceEngineSelectionMixin {
             return;
         }
 
-        String selected = CraftingEngineSelection.current();
+        // 按请求者解析有效引擎：玩家请求 → 玩家个人选择（未设置回落机器默认）；机器 → 机器默认。
+        String machineDefault = CraftingEngineSelection.current();
+        boolean playerRequest = PlayerEngineSelection.isPlayerRequest(simRequester);
+        String selected = PlayerEngineSelection.resolve(simRequester, machineDefault);
         if (selected == null || CraftingEngineRegistry.NONE.equals(selected)) {
             // 都没开 → 原路返回 AE2 原版计算
             ThunderboltCore.LOGGER.info(
-                    "[Thunderbolt Core][engine] vanilla (none selected): what={} amount={}",
-                    what, amount);
+                    "[Thunderbolt Core][engine] vanilla ({}: none selected): requester={} what={} amount={}",
+                    playerRequest ? "player" : "machine",
+                    requesterName(simRequester), what, amount);
             return;
         }
 
         var engine = CraftingEngineRegistry.byId(selected).orElse(null);
         if (engine == null || !engine.isEnabled()) {
             ThunderboltCore.LOGGER.warn(
-                    "[Thunderbolt Core][engine] vanilla (selected '{}' unavailable): what={} amount={}",
-                    selected, what, amount);
+                    "[Thunderbolt Core][engine] vanilla ({}: '{}' unavailable): requester={} what={} amount={}",
+                    playerRequest ? "player" : "machine",
+                    selected, requesterName(simRequester), what, amount);
             return;
         }
 
@@ -101,12 +107,18 @@ public abstract class CraftingServiceEngineSelectionMixin {
             cir.setReturnValue(future);
             cir.cancel(); // 取消其它（未协作的）mixin：vm order=100、eco order=500
             ThunderboltCore.LOGGER.info(
-                    "[Thunderbolt Core][engine] '{}' took over: what={} amount={} strategy={}",
-                    selected, what, amount, strategy);
+                    "[Thunderbolt Core][engine] '{}' ({}) took over: requester={} what={} amount={} strategy={}",
+                    selected, playerRequest ? "player" : "machine",
+                    requesterName(simRequester), what, amount, strategy);
         } catch (Throwable t) {
             ThunderboltCore.LOGGER.warn(
-                    "[Thunderbolt Core][engine] vanilla (engine '{}' failed): what={} amount={}",
-                    selected, what, amount, t);
+                    "[Thunderbolt Core][engine] vanilla ({}: engine '{}' failed): requester={} what={} amount={}",
+                    playerRequest ? "player" : "machine",
+                    selected, requesterName(simRequester), what, amount, t);
         }
+    }
+
+    private static String requesterName(ICraftingSimulationRequester requester) {
+        return requester == null ? "null" : requester.getClass().getSimpleName();
     }
 }
