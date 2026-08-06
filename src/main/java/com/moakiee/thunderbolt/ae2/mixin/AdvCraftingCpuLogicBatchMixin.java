@@ -1,5 +1,6 @@
 package com.moakiee.thunderbolt.ae2.mixin;
 
+import java.lang.reflect.Field;
 import java.util.HashMap;
 import java.util.IdentityHashMap;
 import java.util.Map;
@@ -28,21 +29,28 @@ import com.moakiee.thunderbolt.ae2.batch.AaeBatchJobView;
 import com.moakiee.thunderbolt.ae2.batch.BatchCpuAccounting;
 import com.moakiee.thunderbolt.ae2.batch.BatchExecutor;
 import com.moakiee.thunderbolt.ae2.batch.BatchProviderFilterIterable;
+import com.moakiee.thunderbolt.ae2.util.MixinReflectionSupport;
 
 @Pseudo
 @Mixin(targets = "net.pedroksl.advanced_ae.common.logic.AdvCraftingCPULogic", remap = false)
 public abstract class AdvCraftingCpuLogicBatchMixin {
-    @Shadow
-    // AAE is optional; the shadowed field type is only known at runtime.
-    private Object job;
+    // AdvancedAE 为可选依赖：Mixin 的 @Shadow 按 name+desc 精确匹配，Object 类型的 shadow
+    // 必失配，因此照抄 AdvCraftingCpuLogicMixin 的静态缓存反射范式，查找失败时返回 null 降级。
+    @Unique
+    private static final @Nullable Class<?> AE2LT_ADV_BATCH_LOGIC_CLASS =
+            MixinReflectionSupport.findClassSafe("net.pedroksl.advanced_ae.common.logic.AdvCraftingCPULogic");
+
+    @Unique
+    private static final @Nullable Field AE2LT_ADV_BATCH_JOB_FIELD =
+            MixinReflectionSupport.findDeclaredFieldSafe(AE2LT_ADV_BATCH_LOGIC_CLASS, "job");
+
+    @Unique
+    private static final @Nullable Field AE2LT_ADV_BATCH_CPU_FIELD =
+            MixinReflectionSupport.findDeclaredFieldSafe(AE2LT_ADV_BATCH_LOGIC_CLASS, "cpu");
 
     @Shadow
     @Final
     private ListCraftingInventory inventory;
-
-    @Shadow
-    @Final
-    private Object cpu;
 
     @Unique
     @Nullable
@@ -77,6 +85,8 @@ public abstract class AdvCraftingCpuLogicBatchMixin {
             ae2lt$batchExhaustedThisTick = false;
         }
 
+        // 反射读取 job（null 安全）；反射失败或字段不存在时得到 null，走原版调用降级。
+        Object job = MixinReflectionSupport.getFieldValueSafe(AE2LT_ADV_BATCH_JOB_FIELD, this);
         if (job == null || ae2lt$batchExhaustedThisTick) {
             return original.call(self, remainingOps, craftingService, energyService, level);
         }
@@ -125,7 +135,8 @@ public abstract class AdvCraftingCpuLogicBatchMixin {
 
     @Unique
     private void ae2lt$markCpuDirty() {
-        // AdvancedAE is optional; invoke markDirty reflectively on the shadowed CPU.
+        // AdvancedAE 为可选依赖；先反射读取 cpu 字段，再反射调用其 markDirty。
+        Object cpu = MixinReflectionSupport.getFieldValueSafe(AE2LT_ADV_BATCH_CPU_FIELD, this);
         if (cpu == null) return;
         try {
             var method = cpu.getClass().getMethod("markDirty");

@@ -32,9 +32,9 @@ public final class ThunderboltMixinConfigPlugin implements IMixinConfigPlugin {
             var modList = ModList.get();
             return modList != null && modList.getModFileById(modId) != null;
         } catch (RuntimeException ignored) {
-            // Do not hide a real target/injection failure if a non-standard loader invokes this plugin
-            // before it has made the loading mod list available.
-            return true;
+            // ModList 不可用时（例如非标准加载器在模组列表就绪前调用了本插件），
+            // 宁可跳过可选 mixin，也不要强制应用：否则在目标模组未安装时会直接崩溃。
+            return false;
         }
     }
 
