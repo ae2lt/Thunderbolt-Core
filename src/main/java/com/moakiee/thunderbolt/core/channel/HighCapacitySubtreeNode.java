@@ -1,4 +1,4 @@
-package com.moakiee.thunderbolt.mixin.ae2.channel;
+package com.moakiee.thunderbolt.core.channel;
 
 /**
  * Duck interface mixed into {@code GridNode} at runtime.

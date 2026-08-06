@@ -1,4 +1,4 @@
-package com.moakiee.thunderbolt.mixin.compat.neoeco;
+package com.moakiee.thunderbolt.core.crafting.batch;
 
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
@@ -16,7 +16,7 @@ import appeng.crafting.inv.ListCraftingInventory;
 
 import com.moakiee.thunderbolt.core.crafting.batch.BatchJobView;
 import com.moakiee.thunderbolt.core.crafting.batch.BatchTaskHandle;
-import com.moakiee.thunderbolt.mixin.support.MixinReflectionSupport;
+import com.moakiee.thunderbolt.core.util.MixinReflectionSupport;
 
 /**
  * Reflection-backed batch view for NeoECO's optional crafting job classes.

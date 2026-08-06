@@ -1,4 +1,4 @@
-package com.moakiee.thunderbolt.mixin.ae2.crafting.support;
+package com.moakiee.thunderbolt.core.crafting.support;
 
 import java.util.ArrayDeque;
 import java.util.ArrayList;

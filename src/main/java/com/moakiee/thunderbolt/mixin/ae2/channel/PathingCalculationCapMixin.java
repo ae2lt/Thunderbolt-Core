@@ -9,7 +9,7 @@ import java.util.Set;
 import com.moakiee.thunderbolt.core.channel.BorrowedCapacityCalculator;
 import com.moakiee.thunderbolt.api.channel.ChannelSourceRegistry;
 import com.moakiee.thunderbolt.core.channel.HighCapacityChannelSupport;
-import com.moakiee.thunderbolt.mixin.ae2.channel.HighCapacitySubtreeNode;
+import com.moakiee.thunderbolt.core.channel.HighCapacitySubtreeNode;
 import it.unimi.dsi.fastutil.objects.ReferenceOpenHashSet;
 import org.spongepowered.asm.mixin.Final;
 import org.spongepowered.asm.mixin.Mixin;

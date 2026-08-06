@@ -29,7 +29,7 @@ import appeng.me.service.CraftingService;
 import com.moakiee.thunderbolt.core.crafting.batch.BatchExecutor;
 import com.moakiee.thunderbolt.core.crafting.batch.BatchCpuAccounting;
 import com.moakiee.thunderbolt.core.crafting.batch.BatchProviderFilterIterable;
-import com.moakiee.thunderbolt.mixin.ae2.crafting.VanillaBatchJobView;
+import com.moakiee.thunderbolt.core.crafting.batch.VanillaBatchJobView;
 
 /**
  * Batches identical pattern firings on the vanilla crafting CPU within a tick.

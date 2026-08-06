@@ -1,4 +1,4 @@
-package com.moakiee.thunderbolt.mixin.support;
+package com.moakiee.thunderbolt.core.util;
 
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;

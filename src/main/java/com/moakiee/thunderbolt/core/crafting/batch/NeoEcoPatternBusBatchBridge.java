@@ -1,4 +1,4 @@
-package com.moakiee.thunderbolt.mixin.compat.neoeco;
+package com.moakiee.thunderbolt.core.crafting.batch;
 
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Method;
@@ -15,7 +15,7 @@ import appeng.api.stacks.KeyCounter;
 import appeng.blockentity.crafting.IMolecularAssemblerSupportedPattern;
 
 import com.moakiee.thunderbolt.api.crafting.batch.BatchDispatchContext;
-import com.moakiee.thunderbolt.mixin.support.MixinReflectionSupport;
+import com.moakiee.thunderbolt.core.util.MixinReflectionSupport;
 
 /** Reflection bridge to NeoECO's optional verified batch fast path. */
 public final class NeoEcoPatternBusBatchBridge {

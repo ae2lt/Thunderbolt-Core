@@ -21,12 +21,13 @@ import appeng.crafting.CraftingPlan;
 import appeng.crafting.inv.NetworkCraftingSimulationState;
 
 import com.moakiee.thunderbolt.ThunderboltCore;
+import com.moakiee.thunderbolt.api.crafting.engine.CraftingEngineSelection;
 import com.moakiee.thunderbolt.api.crafting.planner.CraftingInventoryView;
 import com.moakiee.thunderbolt.api.crafting.planner.CraftingPlannerRequest;
 import com.moakiee.thunderbolt.api.crafting.planner.CraftingPlannerStatus;
-import com.moakiee.thunderbolt.mixin.ae2.crafting.support.FastCraftingControl;
-import com.moakiee.thunderbolt.mixin.ae2.crafting.support.FastCraftingPlanner;
-import com.moakiee.thunderbolt.mixin.ae2.crafting.support.FastPlanningWatchdog;
+import com.moakiee.thunderbolt.core.crafting.support.FastCraftingControl;
+import com.moakiee.thunderbolt.core.crafting.support.FastCraftingPlanner;
+import com.moakiee.thunderbolt.core.crafting.support.FastPlanningWatchdog;
 import com.moakiee.thunderbolt.core.crafting.planner.PlannerDispatch;
 import com.moakiee.thunderbolt.core.crafting.planner.PlanningMetadataStore;
 import com.moakiee.thunderbolt.core.crafting.support.CraftingStockPolicy;
@@ -108,6 +109,13 @@ public abstract class CraftingCalculationMixin implements FastCraftingControl {
 
     @Inject(method = "run", at = @At("HEAD"), remap = false)
     private void thunderbolt$startCalculationTiming(CallbackInfoReturnable<ICraftingPlan> cir) {
+        // If the host mod has not explicitly configured this calculation, follow the shared engine
+        // selection: Thunderbolt's deep planner drives native calculations unless a third-party
+        // engine (vm/eco) currently owns the calculation.
+        if (!thunderbolt$fastPlanningInitialized) {
+            thunderbolt$fastPlanningInitialized = true;
+            thunderbolt$fastPlanningEnabled = CraftingEngineSelection.usesThunderboltPlanner();
+        }
         thunderbolt$calculationStartedNanos = System.nanoTime();
         thunderbolt$attempts = 0;
         thunderbolt$fastHandledAttempts = 0;
@@ -139,8 +147,7 @@ public abstract class CraftingCalculationMixin implements FastCraftingControl {
     }
 
     @Inject(method = "runCraftAttempt", at = @At("HEAD"), cancellable = true, remap = false)
-    private void ae2ltCore$fastAttempt(boolean simulate, long amount,
-                                       CallbackInfoReturnable<CraftingPlan> cir) {
+    private void ae2ltCore$fastAttempt(boolean simulate, long amount, CallbackInfoReturnable<CraftingPlan> cir) {
         thunderbolt$attempts++;
         if (!thunderbolt$isFastPlanningEnabled()) {
             return;
