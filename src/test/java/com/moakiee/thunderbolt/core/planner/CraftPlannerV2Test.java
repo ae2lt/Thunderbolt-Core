@@ -923,6 +923,31 @@ class CraftPlannerV2Test {
     }
 
     @Test
+    void lossyRawFeedbackChargesNetLossAndBootstrapReserve() {
+        CraftPattern<String> makeB = new CraftPattern<>(
+                "B", 2, List.of(CraftInput.of("A", 3)), "3A_to_2B");
+        CraftPattern<String> makeD = new CraftPattern<>(
+                "D", 1, List.of(CraftInput.of("B", 2)),
+                List.of(CraftOutput.of("A", 2)), "2B_to_D_2A");
+        CraftGraph<String> shortReserve = CraftGraph.<String>builder()
+                .pattern(makeB).pattern(makeD).stock("A", 8).build();
+        CraftGraph<String> complete = CraftGraph.<String>builder()
+                .pattern(makeB).pattern(makeD).stock("A", 10).build();
+
+        CraftPlan<String> shortPlan = CraftPlannerV2.plan(shortReserve, "D", 8);
+        CraftPlan<String> completePlan = CraftPlannerV2.plan(complete, "D", 8);
+
+        assertFalse(shortPlan.feasible(), "8 net A cannot provide the retained 2-A state");
+        assertEquals(8L, shortPlan.usedStock().get("A"));
+        assertEquals(Map.of("A", 2L), shortPlan.missing());
+        assertTrue(completePlan.feasible());
+        assertEquals(10L, completePlan.usedStock().get("A"));
+        assertEquals(8L, firingsOf(completePlan, makeB));
+        assertEquals(8L, firingsOf(completePlan, makeD));
+        assertTrue(completePlan.missing().isEmpty());
+    }
+
+    @Test
     void partialFeedbackMayBootstrapFromTheReturnedState() {
         CraftPattern<String> makeB = new CraftPattern<>(
                 "B", 2, List.of(CraftInput.of("A", 2)),
@@ -973,6 +998,78 @@ class CraftPlannerV2Test {
         assertEquals(1L, plan.usedStock().get("A"));
         assertEquals(100L, firingsOf(plan, makeB));
         assertEquals(99L, firingsOf(plan, recoverA));
+    }
+
+    @Test
+    void multiHopBalancedRawFeedbackCannotBootstrapItself() {
+        CraftPattern<String> makeB = new CraftPattern<>(
+                "B", 2, List.of(CraftInput.of("A", 1)), "A_to_2B");
+        CraftPattern<String> makeE = new CraftPattern<>(
+                "E", 1, List.of(CraftInput.of("B", 2), CraftInput.of("C", 1)),
+                List.of(CraftOutput.of("D", 1)), "2B_C_to_E_D");
+        CraftPattern<String> recoverA = new CraftPattern<>(
+                "A", 1, List.of(CraftInput.of("D", 1)), "D_to_A");
+        CraftGraph<String> graph = CraftGraph.<String>builder()
+                .pattern(makeB).pattern(makeE).pattern(recoverA)
+                .stock("C", 8)
+                .build();
+
+        CraftPlan<String> plan = CraftPlannerV2.plan(graph, "E", 8);
+
+        assertFalse(plan.feasible(), "a balanced algebraic flow still needs one initial state");
+        assertEquals(Map.of("A", 1L), plan.missing());
+        assertEquals(8L, plan.usedStock().get("C"));
+        assertEquals(8L, firingsOf(plan, makeB));
+        assertEquals(8L, firingsOf(plan, makeE));
+        assertEquals(8L, firingsOf(plan, recoverA));
+    }
+
+    @Test
+    void multiHopBalancedRawFeedbackUsesOneNetworkSeed() {
+        CraftPattern<String> makeB = new CraftPattern<>(
+                "B", 2, List.of(CraftInput.of("A", 1)), "A_to_2B");
+        CraftPattern<String> makeE = new CraftPattern<>(
+                "E", 1, List.of(CraftInput.of("B", 2), CraftInput.of("C", 1)),
+                List.of(CraftOutput.of("D", 1)), "2B_C_to_E_D");
+        CraftPattern<String> recoverA = new CraftPattern<>(
+                "A", 1, List.of(CraftInput.of("D", 1)), "D_to_A");
+        CraftGraph<String> graph = CraftGraph.<String>builder()
+                .pattern(makeB).pattern(makeE).pattern(recoverA)
+                .stock("A", 1)
+                .stock("C", 8)
+                .build();
+
+        CraftPlan<String> plan = CraftPlannerV2.plan(graph, "E", 8);
+
+        assertTrue(plan.feasible());
+        assertEquals(1L, plan.usedStock().get("A"));
+        assertEquals(8L, plan.usedStock().get("C"));
+        assertEquals(8L, firingsOf(plan, makeB));
+        assertEquals(8L, firingsOf(plan, makeE));
+        assertEquals(7L, firingsOf(plan, recoverA));
+        assertTrue(plan.missing().isEmpty());
+    }
+
+    @Test
+    void balancedSelfReturnCraftsOneSeedFromAnAcyclicProducerFirst() {
+        CraftPattern<String> makeSeed = new CraftPattern<>(
+                "seed", 1, List.of(CraftInput.of("raw", 1)), "raw_to_seed");
+        CraftPattern<String> catalyzed = new CraftPattern<>(
+                "product", 1, List.of(CraftInput.of("seed", 1)),
+                List.of(CraftOutput.of("seed", 1)), "seed_to_product_and_seed");
+        CraftGraph<String> graph = CraftGraph.<String>builder()
+                .pattern(makeSeed)
+                .pattern(catalyzed)
+                .stock("raw", 1)
+                .build();
+
+        CraftPlan<String> plan = CraftPlannerV2.plan(graph, "product", 1);
+
+        assertTrue(plan.feasible(), () -> plan.toString());
+        assertEquals(1L, plan.usedStock().get("raw"));
+        assertEquals(1L, firingsOf(plan, makeSeed));
+        assertEquals(1L, firingsOf(plan, catalyzed));
+        assertTrue(plan.missing().isEmpty());
     }
 
     @Test
