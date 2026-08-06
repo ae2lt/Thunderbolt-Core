@@ -13,12 +13,11 @@ public final class CraftingEngineConfig {
 
     private static final ModConfigSpec.ConfigValue<String> ENGINE = BUILDER
             .comment(
-                    "Machine-default AE2 crafting-calculation engine. Used by machines/automation;",
-                    "each player can pick their own engine in the terminal GUI (persisted per-player).",
-                    "  none        = original AE2 calculation (default)",
-                    "  thunderbolt = Thunderbolt's own linear-time fast planner",
-                    "  <other id>  = a registered third-party engine (e.g. vm, eco)",
-                    "Admin switch with: /thunderbolt engine <id|list> (machine default)")
+                    "全局机器 AE2 合成计算引擎（机器/自动化默认路由）：",
+                    "  none        = 原版 AE2 计算（默认）",
+                    "  thunderbolt = 闪电线性快速规划",
+                    "  <other id>  = 已注册的第三方引擎（如 vm、eco）",
+                    "管理员命令: /thunderbolt engine <id|list>；玩家个人引擎用终端齿轮按钮")
             .define("craftingEngine", CraftingEngineRegistry.NONE);
 
     public static final ModConfigSpec SPEC = BUILDER.build();

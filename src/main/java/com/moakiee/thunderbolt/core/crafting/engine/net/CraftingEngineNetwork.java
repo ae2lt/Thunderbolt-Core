@@ -7,6 +7,7 @@ import io.netty.buffer.ByteBuf;
 import net.minecraft.network.codec.ByteBufCodecs;
 import net.minecraft.network.codec.StreamCodec;
 import net.minecraft.network.protocol.common.custom.CustomPacketPayload;
+import net.minecraft.network.chat.Component;
 import net.minecraft.resources.ResourceLocation;
 import net.minecraft.server.level.ServerPlayer;
 
@@ -30,6 +31,20 @@ public final class CraftingEngineNetwork {
         public static final StreamCodec<ByteBuf, SetCraftingEnginePayload> STREAM_CODEC = StreamCodec.composite(
                 ByteBufCodecs.STRING_UTF8, SetCraftingEnginePayload::engineId,
                 SetCraftingEnginePayload::new);
+
+        @Override
+        public Type<? extends CustomPacketPayload> type() {
+            return TYPE;
+        }
+    }
+
+    /** Client → server: set the global machine default engine (op required, affects all machines). */
+    public record SetGlobalEnginePayload(String engineId) implements CustomPacketPayload {
+        public static final Type<SetGlobalEnginePayload> TYPE = new Type<>(
+                ResourceLocation.fromNamespaceAndPath("thunderbolt", "set_global_engine"));
+        public static final StreamCodec<ByteBuf, SetGlobalEnginePayload> STREAM_CODEC = StreamCodec.composite(
+                ByteBufCodecs.STRING_UTF8, SetGlobalEnginePayload::engineId,
+                SetGlobalEnginePayload::new);
 
         @Override
         public Type<? extends CustomPacketPayload> type() {
@@ -68,6 +83,15 @@ public final class CraftingEngineNetwork {
                     }
                 }));
 
+        // Client → server: set the global machine default (op required, affects all machines).
+        registrar.playToServer(SetGlobalEnginePayload.TYPE, SetGlobalEnginePayload.STREAM_CODEC,
+                (payload, context) -> context.enqueueWork(() -> {
+                    var player = context.player();
+                    if (player instanceof ServerPlayer serverPlayer) {
+                        applyGlobalSelection(serverPlayer, payload.engineId());
+                    }
+                }));
+
         registrar.playToClient(SyncCraftingEnginePayload.TYPE, SyncCraftingEnginePayload.STREAM_CODEC,
                 (payload, context) -> context.enqueueWork(() -> {
                     payload.playerEngine().ifPresent(CraftingEngineSelection::seedPlayer);
@@ -97,6 +121,22 @@ public final class CraftingEngineNetwork {
     /** Sends the local player's personal engine choice to the server (called by the GUI). */
     public static void sendToServer(String engineId) {
         PacketDistributor.sendToServer(new SetCraftingEnginePayload(engineId));
+    }
+
+    /** Sends a request to set the global machine engine (called by the GUI). */
+    public static void sendToServerGlobal(String engineId) {
+        PacketDistributor.sendToServer(new SetGlobalEnginePayload(engineId));
+    }
+
+    /** Applies a new global machine default (op only). Rejects non-op players and resyncs them. */
+    public static boolean applyGlobalSelection(ServerPlayer player, String id) {
+        if (!player.hasPermissions(2)) {
+            player.sendSystemMessage(Component.literal(
+                    "[Thunderbolt Core] 无权更改全局机器引擎（需要管理员权限 2）"));
+            syncTo(player);
+            return false;
+        }
+        return applySelection(id);
     }
 
     /** Sends this player's personal engine choice and the machine default. */

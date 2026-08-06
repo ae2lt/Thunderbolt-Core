@@ -27,7 +27,9 @@ public class EngineSelectionScreen extends AEBaseScreen<EngineSelectionMenu> {
 
     private final Screen previous;
     private final List<Option> options = new ArrayList<>();
-    private String selectedId;
+    private boolean globalScope; // true = 全局机器（配置文件），false = 我的引擎（玩家 NBT）
+    private AECheckbox globalScopeBox;
+    private AECheckbox playerScopeBox;
     private StringWidget footerWidget;
 
     private record Option(AECheckbox checkbox, String id) {
@@ -37,7 +39,7 @@ public class EngineSelectionScreen extends AEBaseScreen<EngineSelectionMenu> {
         super(menu, playerInventory, title,
                 StyleManager.loadStyleDoc("/screens/thunderbolt_engine_selection.json"));
         this.previous = Minecraft.getInstance().screen;
-        this.selectedId = CraftingEngineSelection.playerCurrent();
+        this.globalScope = false;
     }
 
     /** 从侧边按钮打开：构造纯客户端幽灵菜单 + AE2 屏幕。 */
@@ -48,7 +50,7 @@ public class EngineSelectionScreen extends AEBaseScreen<EngineSelectionMenu> {
         }
         var menu = new EngineSelectionMenu(0, mc.player.getInventory());
         mc.setScreen(new EngineSelectionScreen(
-                menu, mc.player.getInventory(), Component.literal("我的合成计算引擎")));
+                menu, mc.player.getInventory(), Component.literal("合成计算引擎")));
     }
 
     @Override
@@ -57,12 +59,15 @@ public class EngineSelectionScreen extends AEBaseScreen<EngineSelectionMenu> {
         this.options.clear();
 
         int y = this.topPos + HEADER_OFFSET;
+        addScopeSelector(y);
+        y += ROW_HEIGHT + ROW_SPACING;
         addOption(CraftingEngineRegistry.NONE, "原版计算", y);
         y += ROW_HEIGHT + ROW_SPACING;
         for (var engine : CraftingEngineRegistry.available()) {
             addOption(engine.id(), engine.displayName() + " 快速规划", y);
             y += ROW_HEIGHT + ROW_SPACING;
         }
+        refreshScopeRadios();
         refreshRadios();
         addBottomButtons(y + 6);
         refreshFooter();
@@ -73,7 +78,7 @@ public class EngineSelectionScreen extends AEBaseScreen<EngineSelectionMenu> {
         if (this.footerWidget != null) {
             this.removeWidget(this.footerWidget);
         }
-        String footer = "机器默认: " + CraftingEngineSelection.current()
+        String footer = "全局机器: " + CraftingEngineSelection.current()
                 + "　我的引擎: " + CraftingEngineSelection.playerCurrent();
         Component footerText = Component.literal(footer);
         int textWidth = this.font.width(footerText);
@@ -106,6 +111,43 @@ public class EngineSelectionScreen extends AEBaseScreen<EngineSelectionMenu> {
         Minecraft.getInstance().setScreen(null);
     }
 
+    /** 顶部作用域单选：全局机器（配置文件）还是我的引擎（玩家 NBT）。 */
+    private void addScopeSelector(int y) {
+        this.globalScopeBox = new AECheckbox(
+                this.leftPos + ROW_LEFT, y, 90, ROW_HEIGHT, this.style,
+                Component.literal("全局机器"));
+        this.globalScopeBox.setRadio(true);
+        this.globalScopeBox.setChangeListener(() -> onScopeChange(true, this.globalScopeBox));
+        this.addRenderableWidget(this.globalScopeBox);
+
+        this.playerScopeBox = new AECheckbox(
+                this.leftPos + ROW_LEFT + 96, y, 90, ROW_HEIGHT, this.style,
+                Component.literal("我的引擎"));
+        this.playerScopeBox.setRadio(true);
+        this.playerScopeBox.setChangeListener(() -> onScopeChange(false, this.playerScopeBox));
+        this.addRenderableWidget(this.playerScopeBox);
+    }
+
+    private void onScopeChange(boolean global, AECheckbox clicked) {
+        if (clicked.isSelected()) {
+            this.globalScope = global;
+        }
+        this.refreshScopeRadios();
+        this.refreshRadios();
+    }
+
+    private void refreshScopeRadios() {
+        this.globalScopeBox.setSelected(this.globalScope);
+        this.playerScopeBox.setSelected(!this.globalScope);
+    }
+
+    /** 当前作用域高亮哪个引擎：全局机器=配置文件值，我的引擎=玩家个人选择。 */
+    private String activeEngineId() {
+        return this.globalScope
+                ? CraftingEngineSelection.current()
+                : CraftingEngineSelection.playerCurrent();
+    }
+
     private void addOption(String id, String label, int y) {
         var checkbox = new AECheckbox(
                 this.leftPos + ROW_LEFT, y, this.imageWidth - 2 * ROW_LEFT, ROW_HEIGHT,
@@ -117,16 +159,23 @@ public class EngineSelectionScreen extends AEBaseScreen<EngineSelectionMenu> {
     }
 
     private void refreshRadios() {
+        String active = activeEngineId();
         for (var option : this.options) {
-            option.checkbox().setSelected(option.id().equals(this.selectedId));
+            option.checkbox().setSelected(option.id().equals(active));
         }
     }
 
     private void onToggle(String id, AECheckbox clicked) {
         String next = clicked.isSelected() ? id : CraftingEngineRegistry.NONE;
-        this.selectedId = next;
+        if (this.globalScope) {
+            CraftingEngineNetwork.sendToServerGlobal(next);
+            CraftingEngineSelection.seed(next); // 本地即时反馈（服务端回包会覆盖）
+        } else {
+            CraftingEngineNetwork.sendToServer(next);
+            CraftingEngineSelection.seedPlayer(next); // 本地即时反馈
+        }
         this.refreshRadios();
-        CraftingEngineNetwork.sendToServer(next);
+        this.refreshFooter();
     }
 
     @Override

@@ -43,7 +43,7 @@ public final class CraftingEngineCommand {
             String personal = PlayerEngineSelection.get(player);
             playerPart = " | 我的引擎: " + (personal == null ? "默认（随机器）" : personal);
         }
-        String msg = "AE2 合成计算引擎 — 机器默认: " + CraftingEngineSelection.current()
+        String msg = "AE2 合成计算引擎 — 全局机器: " + CraftingEngineSelection.current()
                 + playerPart
                 + " | 可选: " + String.join(", ", CraftingEngineSelection.availableIds());
         source.sendSuccess(() -> Component.literal(msg), false);
@@ -69,7 +69,7 @@ public final class CraftingEngineCommand {
     private static int select(CommandSourceStack source, String id) {
         if (CraftingEngineNetwork.applySelection(id)) {
             source.sendSuccess(
-                    () -> Component.literal("合成计算引擎已切换到: " + CraftingEngineSelection.current()),
+                    () -> Component.literal("全局机器引擎已切换为: " + CraftingEngineSelection.current()),
                     true);
             return 1;
         }
