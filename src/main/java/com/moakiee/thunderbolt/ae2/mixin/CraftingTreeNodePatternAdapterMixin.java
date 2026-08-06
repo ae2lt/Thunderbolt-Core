@@ -15,15 +15,14 @@ import appeng.api.networking.crafting.ICraftingService;
 import appeng.api.stacks.AEKey;
 import appeng.crafting.CraftingTreeNode;
 
-import com.moakiee.thunderbolt.api.probability.ProbabilityPatternApi;
+import com.moakiee.thunderbolt.api.pattern.PatternRequestApi;
 
 /**
  * Adapts AE2's native crafting tree for addon-registered pattern adapters via the
- * public {@link ProbabilityPatternApi#adaptPatternForRequest} API.
+ * public {@link PatternRequestApi#adaptPatternForRequest} API.
  * <p>
- * Registered {@link com.moakiee.thunderbolt.api.probability.PatternRequestAdapter}s (e.g.
- * Probability-Pattern's statistical scaling) handle the actual wrapping, keeping
- * this mixin addon-agnostic.
+ * Registered {@link com.moakiee.thunderbolt.api.pattern.PatternRequestAdapter}s handle
+ * the actual wrapping, keeping this mixin addon-agnostic.
  */
 @Mixin(CraftingTreeNode.class)
 public abstract class CraftingTreeNodePatternAdapterMixin {
@@ -62,7 +61,7 @@ public abstract class CraftingTreeNodePatternAdapterMixin {
         var adapted = new ArrayList<IPatternDetails>(patterns.size());
         long amount = Math.max(1L, this.thunderbolt$adaptedRequestAmount);
         for (var p : patterns) {
-            adapted.add(ProbabilityPatternApi.adaptPatternForRequest(p, amount));
+            adapted.add(PatternRequestApi.adaptPatternForRequest(p, amount));
         }
         return adapted;
     }

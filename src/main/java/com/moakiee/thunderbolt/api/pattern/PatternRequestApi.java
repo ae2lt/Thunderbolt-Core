@@ -1,4 +1,4 @@
-package com.moakiee.thunderbolt.api.probability;
+package com.moakiee.thunderbolt.api.pattern;
 
 import java.util.List;
 import java.util.concurrent.CopyOnWriteArrayList;
@@ -6,21 +6,21 @@ import java.util.concurrent.CopyOnWriteArrayList;
 import appeng.api.crafting.IPatternDetails;
 
 /**
- * Public API for Probability-Pattern addons to hook into Thunderbolt's AE2 processing.
+ * Public API for addons to hook into Thunderbolt's pattern-request adaptation pipeline.
  * <p>
- * It allows an addon (e.g. Probability-Pattern) to register {@link PatternRequestAdapter}s
- * that adapt a pattern's {@link IPatternDetails} for a requested amount — invoked by
- * Thunderbolt's crafting-tree mixin. This keeps Thunderbolt's mixins addon-agnostic.
+ * Addons register {@link PatternRequestAdapter}s that can adapt a pattern's
+ * {@link IPatternDetails} for a specific requested amount. These adapters are invoked
+ * by Thunderbolt's crafting-tree mixin, keeping the mixin layer addon-agnostic.
  */
-public final class ProbabilityPatternApi {
+public final class PatternRequestApi {
     private static final List<PatternRequestAdapter> ADAPTERS = new CopyOnWriteArrayList<>();
 
-    private ProbabilityPatternApi() {}
+    private PatternRequestApi() {}
 
     /**
      * Register a pattern-request adapter provided by an addon.
      */
-    public static void registerPatternRequestAdapter(PatternRequestAdapter adapter) {
+    public static void registerAdapter(PatternRequestAdapter adapter) {
         if (adapter == null) return;
         ADAPTERS.add(adapter);
     }
@@ -28,7 +28,7 @@ public final class ProbabilityPatternApi {
     /**
      * Unregister a previously registered adapter.
      */
-    public static void unregisterPatternRequestAdapter(PatternRequestAdapter adapter) {
+    public static void unregisterAdapter(PatternRequestAdapter adapter) {
         if (adapter == null) return;
         ADAPTERS.remove(adapter);
     }
