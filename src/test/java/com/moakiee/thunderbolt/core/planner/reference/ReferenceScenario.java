@@ -4,7 +4,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
-import java.util.function.Predicate;
+import java.util.function.Function;
 
 import com.moakiee.thunderbolt.core.planner.CraftGraph;
 import com.moakiee.thunderbolt.core.planner.CraftPlan;
@@ -21,7 +21,25 @@ public record ReferenceScenario(
         boolean expectedFeasible,
         List<Map<String, Long>> minimalMissing,
         Map<String, Double> missingWeights,
-        Predicate<CraftPlan<String>> additionalValidator) {
+        boolean uniqueMinimalMissing,
+        Function<Map<String, Long>, CraftGraph<String>> refillGraph) {
+
+    public ReferenceScenario(
+            String id,
+            ReferenceCapability capability,
+            ReferenceMaterialMode materialMode,
+            int scale,
+            CraftGraph<String> graph,
+            String target,
+            long amount,
+            boolean expectedFeasible,
+            List<Map<String, Long>> minimalMissing,
+            Map<String, Double> missingWeights) {
+        this(id, capability, materialMode, scale, graph, target, amount, expectedFeasible,
+                minimalMissing, missingWeights,
+                minimalMissing != null && minimalMissing.size() == 1,
+                additions -> graph.withAdditionalStock(additions));
+    }
 
     public ReferenceScenario {
         Objects.requireNonNull(id, "id");
@@ -29,6 +47,7 @@ public record ReferenceScenario(
         Objects.requireNonNull(materialMode, "materialMode");
         Objects.requireNonNull(graph, "graph");
         Objects.requireNonNull(target, "target");
+        Objects.requireNonNull(refillGraph, "refillGraph");
         if (scale < 0 || amount <= 0) {
             throw new IllegalArgumentException("scale must be non-negative and amount positive");
         }
@@ -44,7 +63,6 @@ public record ReferenceScenario(
         }
         minimalMissing = List.copyOf(normalizedMissing);
         missingWeights = missingWeights == null ? Map.of() : Map.copyOf(missingWeights);
-        additionalValidator = additionalValidator == null ? ignored -> true : additionalValidator;
         if (expectedFeasible && !minimalMissing.isEmpty()) {
             throw new IllegalArgumentException("feasible scenarios cannot define missing baselines");
         }
@@ -54,42 +72,71 @@ public record ReferenceScenario(
     }
 
     Validation validate(CraftPlan<String> plan) {
-        if (plan == null || !plan.supported() || plan.feasible() != expectedFeasible
-                || !additionalValidator.test(plan)) {
-            return Validation.invalid();
+        if (plan == null || !plan.supported()) {
+            return Validation.declined();
         }
         if (expectedFeasible) {
-            return plan.missing().isEmpty() ? Validation.valid(1.0D) : Validation.invalid();
+            if (!plan.feasible() || hasPositiveMissing(plan.missing())) {
+                return Validation.falseNegative();
+            }
+            return ReferencePlanReplay.completes(this, plan, false)
+                    ? Validation.supported(1.0D)
+                    : Validation.falsePositive();
         }
 
-        double bestOverhead = Double.POSITIVE_INFINITY;
-        for (var baseline : minimalMissing) {
-            if (!sameMissingDomain(plan.missing(), baseline)) {
-                continue;
-            }
-            boolean sufficient = true;
-            for (var entry : baseline.entrySet()) {
-                if (plan.missing().getOrDefault(entry.getKey(), 0L) < entry.getValue()) {
-                    sufficient = false;
-                    break;
-                }
-            }
-            if (!sufficient) {
-                continue;
-            }
-            double minimumCost = weightedCost(baseline);
-            double reportedCost = weightedCost(plan.missing());
-            bestOverhead = Math.min(bestOverhead, reportedCost / minimumCost);
+        if (plan.feasible() && !hasPositiveMissing(plan.missing())) {
+            return ReferencePlanReplay.completes(this, plan, false)
+                    ? Validation.supported(1.0D)
+                    : Validation.falsePositive();
         }
-        return Double.isFinite(bestOverhead)
-                ? Validation.valid(bestOverhead)
-                : Validation.invalid();
+        if (!hasPositiveMissing(plan.missing())) {
+            return Validation.declined();
+        }
+        Map<String, Long> reported = positive(plan.missing());
+        double minimumCost = minimalMissing.stream()
+                .mapToDouble(this::weightedCost)
+                .min()
+                .orElseThrow();
+        double reportedCost = weightedCost(reported);
+        double overhead = reportedCost / minimumCost;
+        if (!uniqueMinimalMissing && reportedCost <= Math.nextUp(minimumCost)) {
+            // A report at the global minimum is itself another minimum witness; the runner separately
+            // verifies that supplying it makes production planning executable. Non-unique scenarios
+            // need not match the arbitrary representative retained by the bounded generator.
+            return Validation.supported(overhead);
+        }
+        long reportedTotal = total(reported);
+        long matchingMinimum = minimalMissing.stream()
+                .filter(candidate -> candidate.keySet().equals(reported.keySet()))
+                .mapToLong(ReferenceScenario::total)
+                .min()
+                .orElse(Long.MAX_VALUE);
+        if (matchingMinimum != Long.MAX_VALUE && reportedTotal >= matchingMinimum) {
+            return Validation.supported(overhead);
+        }
+        return uniqueMinimalMissing
+                ? Validation.partiallySupported(overhead)
+                : Validation.unknown();
     }
 
-    private boolean sameMissingDomain(Map<String, Long> reported, Map<String, Long> baseline) {
-        return reported.entrySet().stream()
-                .filter(entry -> entry.getValue() != null && entry.getValue() > 0)
-                .allMatch(entry -> baseline.containsKey(entry.getKey()));
+    private static boolean hasPositiveMissing(Map<String, Long> missing) {
+        return missing.values().stream().anyMatch(value -> value != null && value > 0);
+    }
+
+    private static Map<String, Long> positive(Map<String, Long> missing) {
+        return missing.entrySet().stream()
+                .filter(entry -> entry.getKey() != null
+                        && entry.getValue() != null && entry.getValue() > 0)
+                .collect(java.util.stream.Collectors.toUnmodifiableMap(
+                        Map.Entry::getKey, Map.Entry::getValue));
+    }
+
+    ReferenceScenario refilled(Map<String, Long> reportedMissing) {
+        Map<String, Long> supplied = positive(reportedMissing);
+        return new ReferenceScenario(
+                id + "/refill", capability, materialMode, scale,
+                refillGraph.apply(supplied), target, amount, true, List.of(), missingWeights,
+                false, refillGraph);
     }
 
     private double weightedCost(Map<String, Long> missing) {
@@ -102,13 +149,37 @@ public record ReferenceScenario(
         return total;
     }
 
-    record Validation(boolean valid, double missingOverhead) {
-        static Validation valid(double overhead) {
-            return new Validation(true, overhead);
+    private static long total(Map<String, Long> amounts) {
+        long total = 0L;
+        for (long amount : amounts.values()) {
+            total = com.moakiee.thunderbolt.core.planner.Sat.add(total, amount);
+        }
+        return total;
+    }
+
+    record Validation(ReferenceSupportStatus status, double missingOverhead) {
+        static Validation supported(double overhead) {
+            return new Validation(ReferenceSupportStatus.SUPPORTED, overhead);
         }
 
-        static Validation invalid() {
-            return new Validation(false, Double.NaN);
+        static Validation partiallySupported(double overhead) {
+            return new Validation(ReferenceSupportStatus.PARTIALLY_SUPPORTED, overhead);
+        }
+
+        static Validation unknown() {
+            return new Validation(ReferenceSupportStatus.UNKNOWN, Double.NaN);
+        }
+
+        static Validation declined() {
+            return new Validation(ReferenceSupportStatus.ATTEMPT_DECLINED, Double.NaN);
+        }
+
+        static Validation falseNegative() {
+            return new Validation(ReferenceSupportStatus.FALSE_NEGATIVE, Double.NaN);
+        }
+
+        static Validation falsePositive() {
+            return new Validation(ReferenceSupportStatus.FALSE_POSITIVE, Double.NaN);
         }
     }
 }

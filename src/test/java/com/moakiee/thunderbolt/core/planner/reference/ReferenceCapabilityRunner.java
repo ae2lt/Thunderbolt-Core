@@ -4,20 +4,27 @@ import java.time.Duration;
 import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
-import java.util.concurrent.atomic.AtomicReference;
 
 /** Runs one author reference case with a hard deadline and classifies the production path. */
 public final class ReferenceCapabilityRunner {
     private final Duration deadline;
-    private final Duration cancellationGrace;
+    private final Duration cancellationObservation;
 
-    public ReferenceCapabilityRunner(Duration deadline, Duration cancellationGrace) {
+    /**
+     * @param deadline hard limit shared by check + plan in one planning pass; a reported-missing
+     *                 refill starts a second planning pass with its own fresh deadline
+     * @param cancellationObservation diagnostic-only time used after the hard timeout to distinguish
+     *                                a cooperative interruption from a worker that remains alive;
+     *                                it never turns a late result into a successful result
+     */
+    public ReferenceCapabilityRunner(Duration deadline, Duration cancellationObservation) {
         if (deadline.isNegative() || deadline.isZero()
-                || cancellationGrace.isNegative() || cancellationGrace.isZero()) {
-            throw new IllegalArgumentException("deadline and cancellation grace must be positive");
+                || cancellationObservation.isNegative() || cancellationObservation.isZero()) {
+            throw new IllegalArgumentException(
+                    "deadline and cancellation observation must be positive");
         }
         this.deadline = deadline;
-        this.cancellationGrace = cancellationGrace;
+        this.cancellationObservation = cancellationObservation;
     }
 
     public ReferenceRunResult run(ReferencePlanner planner, ReferenceScenario scenario) {
@@ -25,29 +32,34 @@ public final class ReferenceCapabilityRunner {
         Objects.requireNonNull(scenario, "scenario");
         long started = System.nanoTime();
 
-        var checked = invoke(() -> planner.check(scenario));
+        var checked = invoke(() -> planner.check(scenario), started);
         if (checked.status != InvocationStatus.COMPLETED) {
             return failedInvocation(scenario, checked, started);
         }
         if (!checked.value) {
             // Diagnostic forced execution distinguishes a conservative false negative from a genuine
             // rejection. It never changes production support: check=false remains unsupported.
-            var forced = invoke(() -> planner.plan(scenario));
-            if (forced.status == InvocationStatus.COMPLETED && forced.value != null
-                    && forced.value.supported() && scenario.validate(forced.value).valid()) {
+            var forced = invoke(() -> planner.plan(scenario), started);
+            var forcedValidation = forced.status == InvocationStatus.COMPLETED
+                    && forced.value != null && forced.value.supported()
+                            ? scenario.validate(forced.value)
+                            : null;
+            if (scenario.expectedFeasible() && forcedValidation != null
+                    && (forcedValidation.status() == ReferenceSupportStatus.SUPPORTED
+                            || forcedValidation.status() == ReferenceSupportStatus.FALSE_NEGATIVE)) {
                 return result(scenario, ReferenceSupportStatus.FALSE_NEGATIVE, started,
-                        scenario.validate(forced.value).missingOverhead(), forced.value, null);
+                        forcedValidation.missingOverhead(), forced.value, null);
             }
             return result(scenario, ReferenceSupportStatus.CHECK_REJECTED, started,
                     Double.NaN, forced.value, forced.failure);
         }
 
-        var planned = invoke(() -> planner.plan(scenario));
+        var planned = invoke(() -> planner.plan(scenario), started);
         if (planned.status != InvocationStatus.COMPLETED) {
             return failedInvocation(scenario, planned, started);
         }
         if (planned.value == null) {
-            return result(scenario, ReferenceSupportStatus.FALSE_POSITIVE, started,
+            return result(scenario, ReferenceSupportStatus.ATTEMPT_DECLINED, started,
                     Double.NaN, null, null);
         }
         if (!planned.value.supported()) {
@@ -55,10 +67,53 @@ public final class ReferenceCapabilityRunner {
                     Double.NaN, planned.value, null);
         }
         var validation = scenario.validate(planned.value);
-        return result(scenario,
-                validation.valid() ? ReferenceSupportStatus.SUPPORTED
-                        : ReferenceSupportStatus.FALSE_POSITIVE,
-                started, validation.missingOverhead(), planned.value, null);
+        if (!scenario.expectedFeasible()
+                && (validation.status() == ReferenceSupportStatus.SUPPORTED
+                        || validation.status() == ReferenceSupportStatus.PARTIALLY_SUPPORTED
+                        || validation.status() == ReferenceSupportStatus.UNKNOWN)) {
+            return validateRefill(planner, scenario, planned.value, validation, started);
+        }
+        return result(scenario, validation.status(), started,
+                validation.missingOverhead(), planned.value, null);
+    }
+
+    /** A missing report is usable only if supplying it makes a fresh production plan executable. */
+    private ReferenceRunResult validateRefill(
+            ReferencePlanner planner,
+            ReferenceScenario original,
+            com.moakiee.thunderbolt.core.planner.CraftPlan<String> originalPlan,
+            ReferenceScenario.Validation initialValidation,
+            long started) {
+        ReferenceScenario refilled = original.refilled(originalPlan.missing());
+        long refillStarted = System.nanoTime();
+        var checked = invoke(() -> planner.check(refilled), refillStarted);
+        if (checked.status != InvocationStatus.COMPLETED) {
+            return failedInvocation(original, checked, started);
+        }
+        if (!checked.value) {
+            return result(original, ReferenceSupportStatus.ATTEMPT_DECLINED, started,
+                    Double.NaN, originalPlan, null);
+        }
+
+        var planned = invoke(() -> planner.plan(refilled), refillStarted);
+        if (planned.status != InvocationStatus.COMPLETED) {
+            return failedInvocation(original, planned, started);
+        }
+        if (planned.value == null || !planned.value.supported()) {
+            return result(original, ReferenceSupportStatus.ATTEMPT_DECLINED, started,
+                    Double.NaN, originalPlan, null);
+        }
+        var refillValidation = refilled.validate(planned.value);
+        if (refillValidation.status() == ReferenceSupportStatus.FALSE_POSITIVE) {
+            return result(original, ReferenceSupportStatus.FALSE_POSITIVE, started,
+                    Double.NaN, originalPlan, null);
+        }
+        if (refillValidation.status() != ReferenceSupportStatus.SUPPORTED) {
+            return result(original, ReferenceSupportStatus.ATTEMPT_DECLINED, started,
+                    Double.NaN, originalPlan, null);
+        }
+        return result(original, initialValidation.status(), started,
+                initialValidation.missingOverhead(), originalPlan, null);
     }
 
     private ReferenceRunResult failedInvocation(
@@ -84,14 +139,18 @@ public final class ReferenceCapabilityRunner {
                 missingOverhead, plan, failure);
     }
 
-    private <T> Invocation<T> invoke(ThrowingSupplier<T> operation) {
-        var workerRef = new AtomicReference<Thread>();
+    private <T> Invocation<T> invoke(ThrowingSupplier<T> operation, long runStarted) {
+        long elapsed = Math.max(0L, System.nanoTime() - runStarted);
+        long remaining = deadline.toNanos() - Math.min(deadline.toNanos(), elapsed);
+        if (remaining <= 0L) {
+            return Invocation.timeout(new java.util.concurrent.TimeoutException(
+                    "reference scenario exceeded its shared deadline"));
+        }
         var future = new CompletableFuture<T>();
         Thread worker = Thread.ofPlatform()
                 .daemon(true)
                 .name("thunderbolt-reference-capability")
                 .unstarted(() -> {
-                    workerRef.set(Thread.currentThread());
                     try {
                         future.complete(operation.get());
                     } catch (Throwable failure) {
@@ -100,12 +159,14 @@ public final class ReferenceCapabilityRunner {
                 });
         worker.start();
         try {
-            return Invocation.completed(future.get(deadline.toNanos(), java.util.concurrent.TimeUnit.NANOSECONDS));
+            return Invocation.completed(future.get(
+                    remaining, java.util.concurrent.TimeUnit.NANOSECONDS));
         } catch (java.util.concurrent.TimeoutException timeout) {
             worker.interrupt();
             try {
-                long graceNanos = cancellationGrace.toNanos();
-                worker.join(graceNanos / 1_000_000L, (int) (graceNanos % 1_000_000L));
+                long observationNanos = cancellationObservation.toNanos();
+                worker.join(observationNanos / 1_000_000L,
+                        (int) (observationNanos % 1_000_000L));
             } catch (InterruptedException interrupted) {
                 Thread.currentThread().interrupt();
                 return Invocation.error(interrupted);

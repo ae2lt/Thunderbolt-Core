@@ -16,4 +16,8 @@ public record ReferenceRunResult(
     public boolean supported() {
         return status == ReferenceSupportStatus.SUPPORTED;
     }
+
+    public boolean partiallySupported() {
+        return status == ReferenceSupportStatus.PARTIALLY_SUPPORTED;
+    }
 }

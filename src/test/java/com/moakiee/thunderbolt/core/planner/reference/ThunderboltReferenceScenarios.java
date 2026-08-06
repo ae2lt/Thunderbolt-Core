@@ -1,23 +1,20 @@
 package com.moakiee.thunderbolt.core.planner.reference;
 
 import java.util.ArrayList;
-import java.util.Comparator;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.function.Predicate;
 
 import com.moakiee.thunderbolt.core.planner.CraftGraph;
 import com.moakiee.thunderbolt.core.planner.CraftInput;
 import com.moakiee.thunderbolt.core.planner.CraftOutput;
-import com.moakiee.thunderbolt.core.planner.CraftPlan;
-import com.moakiee.thunderbolt.core.planner.CraftPattern;
 import com.moakiee.thunderbolt.core.planner.ReusableStockSource;
 
 /** Canonical offline cases from the author-facing reference standard. */
 public final class ThunderboltReferenceScenarios {
     private static final long UNBOUNDED_STOCK = 1_000_000_000_000L;
+    private static final int REFERENCE_DAG_DEPTH = 32;
 
     private ThunderboltReferenceScenarios() {
     }
@@ -25,11 +22,12 @@ public final class ThunderboltReferenceScenarios {
     public static List<ReferenceScenario> all() {
         var result = new ArrayList<ReferenceScenario>();
         addDispersedSingleDag(result);
-        addFibonacciSingleDag(result, 32);
+        addFibonacciSingleDag(result, REFERENCE_DAG_DEPTH);
         addGreedyTrapMultiDag(result, 64);
-        addFibonacciMultiDag(result, 12);
+        addFibonacciMultiDag(result, REFERENCE_DAG_DEPTH);
         addConversionCycle(result);
-        addSelfGrowthCycle(result, 2);
+        // AE2 rejects ordinary patterns that consume and produce the same key as recursive.
+        // Self-growth is therefore an optional extension, not a parity capability requirement.
         addCatalyst(result, 1_000);
         addRawCatalystLoop(result, 8);
         addLossyFeedbackLoop(result, 8);
@@ -113,7 +111,7 @@ public final class ThunderboltReferenceScenarios {
         List<Map<String, Long>> frontier = fibonacciMultiMinimumFrontier(depth);
         Map<String, Long> minimum = frontier.getFirst();
         addThreeModes(out, "multi-dag/fibonacci", ReferenceCapability.MULTI_DAG, depth,
-                "X" + depth, 1, minimum, Map.of(), frontier,
+                "X" + depth, 1, minimum, Map.of(), frontier, false,
                 stock -> fibonacciMultiDag(depth, stock));
     }
 
@@ -132,34 +130,24 @@ public final class ThunderboltReferenceScenarios {
     }
 
     private static List<Map<String, Long>> fibonacciMultiMinimumFrontier(int depth) {
-        var options = new ArrayList<List<Map<String, Long>>>();
-        options.add(List.of(Map.of("X0", 1L)));
-        options.add(List.of(Map.of("X1", 1L)));
-        options.add(List.of(Map.of("X2", 1L)));
+        // Missing reports are validated by replay, so the frontier only needs one deterministic
+        // minimum-cost witness for the overhead denominator. Retaining every tied vector grows
+        // exponentially and would make the depth-32 reference generator the benchmark bottleneck.
+        var options = new ArrayList<Map<String, Long>>();
+        options.add(Map.of("X0", 1L));
+        options.add(Map.of("X1", 1L));
+        options.add(Map.of("X2", 1L));
         for (int i = 3; i <= depth; i++) {
-            var candidates = new ArrayList<Map<String, Long>>();
-            combine(options.get(i - 1), options.get(i - 2), candidates);
-            combine(options.get(i - 2), options.get(i - 3), candidates);
-            long minimumCost = candidates.stream().mapToLong(ThunderboltReferenceScenarios::total).min()
-                    .orElseThrow();
-            options.add(candidates.stream()
-                    .filter(candidate -> total(candidate) == minimumCost)
-                    .distinct()
-                    .sorted(Comparator.comparing(Map::toString))
-                    .toList());
+            Map<String, Long> first = addDemand(options.get(i - 1), options.get(i - 2));
+            Map<String, Long> second = addDemand(options.get(i - 2), options.get(i - 3));
+            long firstCost = total(first);
+            long secondCost = total(second);
+            options.add(firstCost < secondCost
+                    || (firstCost == secondCost && first.toString().compareTo(second.toString()) <= 0)
+                            ? first
+                            : second);
         }
-        return options.get(depth);
-    }
-
-    private static void combine(
-            List<Map<String, Long>> left,
-            List<Map<String, Long>> right,
-            List<Map<String, Long>> destination) {
-        for (var a : left) {
-            for (var b : right) {
-                destination.add(addDemand(a, b));
-            }
-        }
+        return List.of(options.get(depth));
     }
 
     private static void addConversionCycle(List<ReferenceScenario> out) {
@@ -176,28 +164,6 @@ public final class ThunderboltReferenceScenarios {
                 .pattern("B", 9, List.of(CraftInput.of("A", 1)))
                 .pattern("B", 1, List.of(CraftInput.of("C", 9)))
                 .pattern("C", 9, List.of(CraftInput.of("B", 1)));
-        stock.forEach(builder::stock);
-        return builder.build();
-    }
-
-    private static void addSelfGrowthCycle(List<ReferenceScenario> out, int amount) {
-        Predicate<CraftPlan<String>> cutWithoutFiring = plan -> plan.firings().isEmpty();
-        addScenario(out, "cycle/self-growth-cut", ReferenceCapability.CYCLE_CUTTING,
-                ReferenceMaterialMode.MISSING, amount, selfGrowthCycle(Map.of()),
-                "A", amount, false, List.of(Map.of("A", (long) amount)), cutWithoutFiring);
-        addScenario(out, "cycle/self-growth-cut", ReferenceCapability.CYCLE_CUTTING,
-                ReferenceMaterialMode.MINIMUM, amount, selfGrowthCycle(Map.of("A", 1L)),
-                "A", amount, false, List.of(Map.of("A", amount - 1L)), cutWithoutFiring);
-        addScenario(out, "cycle/self-growth-cut", ReferenceCapability.CYCLE_CUTTING,
-                ReferenceMaterialMode.UNBOUNDED, amount,
-                selfGrowthCycle(Map.of("A", UNBOUNDED_STOCK)),
-                "A", amount, true, List.of(), cutWithoutFiring);
-    }
-
-    /** Completion is optional, but an unseeded A->2A loop must never invent its first A. */
-    private static CraftGraph<String> selfGrowthCycle(Map<String, Long> stock) {
-        var builder = CraftGraph.<String>builder()
-                .pattern("A", 2, List.of(CraftInput.of("A", 1)));
         stock.forEach(builder::stock);
         return builder.build();
     }
@@ -278,7 +244,8 @@ public final class ThunderboltReferenceScenarios {
         var source = new ReusableStockSource("host", "fuzzy-reference");
         addScenario(out, "fuzzy/variant-route", ReferenceCapability.FUZZY_VARIANT,
                 ReferenceMaterialMode.MISSING, amount, fuzzyVariant(source, Map.of()),
-                "product", amount, false, List.of(Map.of("logical_tool", 1L)));
+                "product", amount, false, List.of(Map.of("logical_tool", 1L)), true,
+                supplied -> fuzzyVariant(source, supplied));
         addScenario(out, "fuzzy/variant-route", ReferenceCapability.FUZZY_VARIANT,
                 ReferenceMaterialMode.MINIMUM, amount,
                 fuzzyVariant(source, Map.of("damaged_tool", 1L)),
@@ -309,8 +276,26 @@ public final class ThunderboltReferenceScenarios {
             Map<String, Long> starvedStock,
             List<Map<String, Long>> minimalMissing,
             GraphFactory factory) {
+        addThreeModes(out, id, capability, scale, target, amount, minimumStock, starvedStock,
+                minimalMissing, minimalMissing.size() == 1, factory);
+    }
+
+    private static void addThreeModes(
+            List<ReferenceScenario> out,
+            String id,
+            ReferenceCapability capability,
+            int scale,
+            String target,
+            long amount,
+            Map<String, Long> minimumStock,
+            Map<String, Long> starvedStock,
+            List<Map<String, Long>> minimalMissing,
+            boolean uniqueMinimalMissing,
+            GraphFactory factory) {
         addScenario(out, id, capability, ReferenceMaterialMode.MISSING, scale,
-                factory.build(starvedStock), target, amount, false, minimalMissing);
+                factory.build(starvedStock), target, amount, false, minimalMissing,
+                uniqueMinimalMissing,
+                supplied -> factory.build(mergedStock(starvedStock, supplied)));
         addScenario(out, id, capability, ReferenceMaterialMode.MINIMUM, scale,
                 factory.build(minimumStock), target, amount, true, List.of());
         var unbounded = new HashMap<String, Long>();
@@ -330,8 +315,8 @@ public final class ThunderboltReferenceScenarios {
             long amount,
             boolean feasible,
             List<Map<String, Long>> missing) {
-        addScenario(out, id, capability, mode, scale, graph, target, amount,
-                feasible, missing, ignored -> true);
+        addScenario(out, id, capability, mode, scale, graph, target, amount, feasible, missing,
+                missing.size() == 1, graph::withAdditionalStock);
     }
 
     private static void addScenario(
@@ -345,10 +330,20 @@ public final class ThunderboltReferenceScenarios {
             long amount,
             boolean feasible,
             List<Map<String, Long>> missing,
-            Predicate<CraftPlan<String>> additionalValidator) {
+            boolean uniqueMinimalMissing,
+            java.util.function.Function<Map<String, Long>, CraftGraph<String>> refillGraph) {
         out.add(new ReferenceScenario(
                 id + "/" + mode.name().toLowerCase(), capability, mode, scale,
-                graph, target, amount, feasible, missing, Map.of(), additionalValidator));
+                graph, target, amount, feasible, missing, Map.of(),
+                uniqueMinimalMissing, refillGraph));
+    }
+
+    private static Map<String, Long> mergedStock(
+            Map<String, Long> stock, Map<String, Long> additions) {
+        var merged = new HashMap<>(stock);
+        additions.forEach((key, amount) -> merged.merge(
+                key, amount, com.moakiee.thunderbolt.core.planner.Sat::add));
+        return Map.copyOf(merged);
     }
 
     private static Map<String, Long> addDemand(Map<String, Long> left, Map<String, Long> right) {

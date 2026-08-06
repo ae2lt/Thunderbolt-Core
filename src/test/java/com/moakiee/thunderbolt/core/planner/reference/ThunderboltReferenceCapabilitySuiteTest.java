@@ -13,6 +13,7 @@ import com.moakiee.thunderbolt.core.planner.CraftPlannerV2;
 
 /** Runs Thunderbolt V2 itself through the public author reference scenarios. */
 class ThunderboltReferenceCapabilitySuiteTest {
+    /** Each check+plan pass gets 1s; the extra 100ms only observes cancellation after its cutoff. */
     private static final ReferenceCapabilityRunner RUNNER = new ReferenceCapabilityRunner(
             Duration.ofSeconds(1), Duration.ofMillis(100));
     /** Explicit current-engine limitations. They remain visible but do not make the report task fail. */

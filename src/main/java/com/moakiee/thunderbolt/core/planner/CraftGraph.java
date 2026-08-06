@@ -62,6 +62,22 @@ public final class CraftGraph<K> {
         return candidates != null ? candidates : List.of(plannedKey);
     }
 
+    /**
+     * Returns the same immutable pattern/reusable-stock snapshot with ordinary stock added.
+     * Reference adapters with host-private stock should rebuild through their host-aware graph
+     * factory instead; this method is the safe default for ordinary inventory scenarios.
+     */
+    public CraftGraph<K> withAdditionalStock(Map<K, Long> additionalStock) {
+        var merged = new HashMap<>(stock);
+        additionalStock.forEach((key, amount) -> {
+            if (key != null && amount != null && amount > 0) {
+                merged.merge(key, amount, Sat::add);
+            }
+        });
+        return new CraftGraph<>(patternsByOutput, Map.copyOf(merged), reusableStock,
+                reusableStockRoutes);
+    }
+
     Map<ReusableStockKey<K>, Long> reusableStock() {
         return reusableStock;
     }

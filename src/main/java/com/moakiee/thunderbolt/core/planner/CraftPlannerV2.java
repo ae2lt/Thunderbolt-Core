@@ -3177,6 +3177,7 @@ public final class CraftPlannerV2<K> {
             Map<CraftPattern<K>, Long> capUnits,
             Map<CraftPattern<K>, Long> fixedFirings,
             Set<K> fixedItems) {
+        Map<K, Long> diagnosticUnitCosts = diagnosticUnitCosts(order);
         Map<K, Long> need = new HashMap<>();
         Map<K, Long> bp = new HashMap<>();       // byproduct / surplus pool
         Map<K, Long> stockL = new HashMap<>();   // remaining inventory
@@ -3239,7 +3240,17 @@ public final class CraftPlannerV2<K> {
                 miss.merge(x, d, Sat::add);
                 continue;
             }
-            allocateLinear(x, d, ps, need, bp, returnedSeedReserve, fired, capUnits, allocatedUnits);
+            allocateLinear(
+                    x,
+                    d,
+                    ps,
+                    need,
+                    bp,
+                    returnedSeedReserve,
+                    fired,
+                    capUnits,
+                    allocatedUnits,
+                    diagnosticUnitCosts);
         }
 
         return new LinearPassState<>(
@@ -3313,7 +3324,8 @@ public final class CraftPlannerV2<K> {
                                 Map<K, Long> returnedSeedReserve,
                                 Map<CraftPattern<K>, Long> fired,
                                 Map<CraftPattern<K>, Long> capUnits,
-                                Map<CraftPattern<K>, Long> allocatedUnits) {
+                                Map<CraftPattern<K>, Long> allocatedUnits,
+                                Map<K, Long> diagnosticUnitCosts) {
         List<CraftPattern<K>> ordered = new ArrayList<>(ps);
         ordered.sort((a, b) -> Long.compare(capRemainingVia(b, need), capRemainingVia(a, need)));
 
@@ -3336,12 +3348,11 @@ public final class CraftPlannerV2<K> {
             fireLinear(x, r, t, consumed, need, bp, returnedSeedReserve, fired);
             d -= consumed;
         }
-        // Leftover nobody had capacity for: push demand down the primary recipe; the deficit surfaces
-        // at the raw leaves. When sibling routes share a direct constrained input, prefer a route
-        // that is component-wise no worse on those shared inputs. Route-private inputs affect
-        // capacity above, but are not mixed into this diagnostic comparison.
+        // Leftover nobody had capacity for: push demand down one concrete recipe so the deficit
+        // surfaces at raw leaves. Prefer a route component-wise no worse on shared constrained inputs,
+        // then use the ordinary downstream raw cost to avoid an arbitrarily inflated missing report.
         if (d > 0) {
-            CraftPattern<K> r0 = diagnosticRoute(d, ordered, need);
+            CraftPattern<K> r0 = diagnosticRoute(d, ordered, need, diagnosticUnitCosts);
             long t = Sat.ceilDiv(d, r0.outputAmount());
             allocatedUnits.merge(r0, d, Sat::add);
             fireLinear(x, r0, t, d, need, bp, returnedSeedReserve, fired);
@@ -3350,6 +3361,14 @@ public final class CraftPlannerV2<K> {
 
     private CraftPattern<K> diagnosticRoute(
             long demand, List<CraftPattern<K>> ordered, Map<K, Long> need) {
+        return diagnosticRoute(demand, ordered, need, Map.of());
+    }
+
+    private CraftPattern<K> diagnosticRoute(
+            long demand,
+            List<CraftPattern<K>> ordered,
+            Map<K, Long> need,
+            Map<K, Long> diagnosticUnitCosts) {
         if (ordered.size() <= 1) {
             return ordered.get(0);
         }
@@ -3368,18 +3387,67 @@ public final class CraftPlannerV2<K> {
                 shared.add(key);
             }
         });
-        if (shared.isEmpty()) {
-            return ordered.get(0);
-        }
-
         CraftPattern<K> best = ordered.get(0);
         for (int i = 1; i < ordered.size(); i++) {
             CraftPattern<K> candidate = ordered.get(i);
-            if (projectedSharedBetter(candidate, best, demand, need, shared)) {
+            boolean candidateSharedBetter = !shared.isEmpty()
+                    && projectedSharedBetter(candidate, best, demand, need, shared);
+            boolean bestSharedBetter = !shared.isEmpty()
+                    && projectedSharedBetter(best, candidate, demand, need, shared);
+            if (candidateSharedBetter
+                    || (!bestSharedBetter
+                            && diagnosticRawCost(candidate, demand, diagnosticUnitCosts)
+                                    < diagnosticRawCost(best, demand, diagnosticUnitCosts))) {
                 best = candidate;
             }
         }
         return best;
+    }
+
+    /**
+     * Bottom-up raw-material cost used only to choose a concrete missing route when every recipe has
+     * zero executable capacity. It never changes feasibility or credits unavailable material. Stateful
+     * inputs and byproducts stay on the established route order because their startup/reuse semantics
+     * cannot be represented by an additive raw cost.
+     */
+    private Map<K, Long> diagnosticUnitCosts(List<K> order) {
+        Map<K, Long> costs = new HashMap<>(order.size() * 2);
+        for (int i = order.size() - 1; i >= 0; i--) {
+            K item = order.get(i);
+            List<CraftPattern<K>> patterns = patternsByOutput.getOrDefault(item, List.of());
+            if (patterns.isEmpty()) {
+                costs.put(item, 1L);
+                continue;
+            }
+            long best = Sat.SAT;
+            for (CraftPattern<K> pattern : patterns) {
+                best = Math.min(best, diagnosticRawCost(pattern, 1L, costs));
+            }
+            if (best < Sat.SAT) {
+                costs.put(item, best);
+            }
+        }
+        return costs;
+    }
+
+    private long diagnosticRawCost(
+            CraftPattern<K> pattern, long demand, Map<K, Long> diagnosticUnitCosts) {
+        if (diagnosticUnitCosts.isEmpty() || !pattern.byproducts().isEmpty()) {
+            return Sat.SAT;
+        }
+        long firings = Sat.ceilDiv(demand, pattern.outputAmount());
+        long total = 0L;
+        for (CraftInput<K> input : pattern.inputs()) {
+            if (input.returned() || input.remainder() != null) {
+                return Sat.SAT;
+            }
+            Long unitCost = diagnosticUnitCosts.get(input.key());
+            if (unitCost == null) {
+                return Sat.SAT;
+            }
+            total = Sat.add(total, Sat.mul(input.unitsFor(firings), unitCost));
+        }
+        return total;
     }
 
     private boolean projectedSharedBetter(

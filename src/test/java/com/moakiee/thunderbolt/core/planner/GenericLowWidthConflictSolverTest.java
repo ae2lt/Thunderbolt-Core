@@ -70,6 +70,35 @@ class GenericLowWidthConflictSolverTest {
     }
 
     @Test
+    void starvedDepthThirtyTwoRecurrenceReportsMinimumRawCostWithinOneSecond() {
+        CraftGraph.Builder<String> builder = CraftGraph.builder();
+        for (int i = 3; i <= 32; i++) {
+            builder.pattern("X" + i, 1, List.of(
+                    CraftInput.of("X" + (i - 1), 1),
+                    CraftInput.of("X" + (i - 2), 1)));
+            builder.pattern("X" + i, 1, List.of(
+                    CraftInput.of("X" + (i - 2), 1),
+                    CraftInput.of("X" + (i - 3), 1)));
+        }
+
+        PlanningResult<String> result = org.junit.jupiter.api.Assertions.assertTimeoutPreemptively(
+                Duration.ofSeconds(1),
+                () -> CraftPlannerV2.planDetailed(builder.build(), "X32", 1));
+
+        assertFalse(result.plan().feasible());
+        assertEquals(Map.of("X1", 2_513L, "X2", 3_329L), result.plan().missing());
+        assertEquals(5_842L, result.plan().missing().values().stream()
+                .mapToLong(Long::longValue)
+                .sum());
+        assertFalse(result.plan().budgetExhausted());
+        assertEquals(1, result.diagnostics().lowWidthInfeasible());
+        assertEquals(0, result.diagnostics().lowWidthAttempts());
+        assertFalse(result.diagnostics().searchCutoff());
+        assertFalse(result.diagnostics().resolutionCutoff());
+        assertFalse(result.diagnostics().fallbackCutoff());
+    }
+
+    @Test
     void longRequestWithPartialBaseInventoryStaysOnLinearPath() {
         int depth = 30;
         long amount = 1_000_000_000L;
