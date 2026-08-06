@@ -962,6 +962,15 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
     private OverloadInsert acceptOverloadWaitingItem(
             TimeWheelJob activeJob, AEKey what, long amount, Actionable type) {
         if (amount <= 0) return OverloadInsert.EMPTY;
+        // 认领前复查取消：link 已被外部取消、但 tick 尚未转入 soft-cancel 排水阶段时，
+        // 不得再执行 overload 认领（包括 link.insert 与 pendingRequesterOutputs 记账）。
+        // softCancelling 期间 link.isCanceled() 同样为 true，但那是合法的内部回插排水
+        // 路径，必须放行，因此守卫条件必须排除 softCancelling。
+        // 返回 EMPTY 表示不认领任何数量，未接受部分留给调用方按既有取消兜底处理，
+        // 保证已取消 link 的物品不丢失、不重复记账。
+        if (!activeJob.softCancelling && activeJob.link.isCanceled()) {
+            return OverloadInsert.EMPTY;
+        }
         var preview = OverloadCpuStateManager.INSTANCE.claim(
                 this, what, amount, Actionable.SIMULATE,
                 (consumer, expected) -> loopSeedLedgers.acceptsReturnedVariant(
@@ -1174,7 +1183,11 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
     }
 
     private void finishSuccessfulIfReady(TimeWheelJob activeJob) {
-        if (job != activeJob || activeJob.softCancelling) return;
+        // 收尾前复查取消：link 已被外部取消的作业不得以“成功”收尾，
+        // 否则会和请求方的取消语义冲突；交给 tick 循环既有的
+        // beginSoftCancel/cancel 分支接管后续清理。
+        if (job != activeJob || activeJob.softCancelling
+                || activeJob.link.isCanceled()) return;
         // Also repairs persisted jobs written by versions that could leave deferred credits after
         // the final demand had already reached zero.
         capPendingRequesterOutputsToRemaining(activeJob.remainingAmount, null);

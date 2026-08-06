@@ -2,10 +2,14 @@ package com.moakiee.thunderbolt;
 
 import java.util.Collection;
 
+import com.mojang.logging.LogUtils;
 import com.moakiee.thunderbolt.core.util.FastWildcardMatcher;
+import org.slf4j.Logger;
 
 /** Lightweight host-configured values shared by Thunderbolt's low-level hooks. */
 public final class CoreConfig {
+    private static final Logger LOGGER = LogUtils.getLogger();
+
     /**
      * Channel capacity granted per overloaded controller by the channel/max-flow grid mixins.
      * Defaults to 128; the host mod (AE2 Lightning Tech) overwrites it from its own config during
@@ -20,7 +24,13 @@ public final class CoreConfig {
     }
 
     public static void setChannelsPerController(int value) {
-        channelsPerController = value;
+        // 该值作为每个控制器的渠道容量注入 Dinic 最大流计算，
+        // 0 或负数会导致全网渠道瘫痪或未定义行为，必须钳制到至少 1。
+        int clamped = Math.max(1, value);
+        if (value != clamped) {
+            LOGGER.warn("非法的 channelsPerController 配置值: {}，已钳制为 {}", value, clamped);
+        }
+        channelsPerController = clamped;
     }
 
     /**

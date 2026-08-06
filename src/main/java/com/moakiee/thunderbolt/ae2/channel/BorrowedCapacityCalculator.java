@@ -3,6 +3,7 @@ package com.moakiee.thunderbolt.ae2.channel;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Deque;
 import java.util.List;
 import java.util.Queue;
 import java.util.Set;
@@ -422,16 +423,63 @@ public final class BorrowedCapacityCalculator {
             return level[t] >= 0;
         }
 
-        private int dfs(int v, int t, int pushed) {
-            if (v == t) return pushed;
-            for (; cur[v] != -1; cur[v] = nxt[cur[v]]) {
-                int e = cur[v];
-                if (cap[e] > 0 && level[to[e]] == level[v] + 1) {
-                    int d = dfs(to[e], t, Math.min(pushed, cap[e]));
-                    if (d > 0) {
-                        cap[e] -= d;
-                        cap[e ^ 1] += d;
-                        return d;
+        /**
+         * Dinic DFS 显式栈帧（迭代模式参照 core/planner 的 CycleAnalysis.DfsFrame）。
+         *
+         * @param node   路径上的当前节点
+         * @param pushed 到达该节点时剩余可推送的流量（递归版的 pushed 入参）
+         * @param edge   从父节点进入该节点所使用的边；根帧为 -1
+         */
+        private record DfsFrame(int node, int pushed, int edge) {}
+
+        /**
+         * 阻塞流 DFS 的迭代实现，与原递归版逐点等价：
+         * <ul>
+         *   <li>current arc（cur[]）推进逻辑一致：边不可用或子树返回 0 时
+         *       推进到 nxt[e]；成功增广的边不推进；</li>
+         *   <li>命中汇点后沿显式栈回溯整条路径扣减/回补残余容量，
+         *       等价于递归版各层返回 d 时的 cap[e]-=d / cap[e^1]+=d；</li>
+         *   <li>返回值（本次增广量）与递归版相同，maxFlow 的调用方式不变。</li>
+         * </ul>
+         * 用显式栈替代递归，避免深链网络下 StackOverflowError。
+         * 层级图中 level 每下降一层严格 +1，路径长度 ≤ size，不会栈溢出。
+         */
+        private int dfs(int s, int t, int limit) {
+            Deque<DfsFrame> stack = new ArrayDeque<>();
+            stack.push(new DfsFrame(s, limit, -1));
+            while (!stack.isEmpty()) {
+                DfsFrame frame = stack.peek();
+                int v = frame.node();
+                if (v == t) {
+                    // 命中汇点：增广量为路径上的最小残余容量，
+                    // 沿栈回溯逐边更新残余容量（即递归回溯时逐层扣减流量）。
+                    int d = frame.pushed();
+                    for (DfsFrame f : stack) {
+                        if (f.edge() == -1) break;
+                        cap[f.edge()] -= d;
+                        cap[f.edge() ^ 1] += d;
+                    }
+                    return d;
+                }
+                // 沿 current arc 扫描，与递归版 for 循环条件完全一致。
+                boolean advanced = false;
+                while (cur[v] != -1) {
+                    int e = cur[v];
+                    if (cap[e] > 0 && level[to[e]] == level[v] + 1) {
+                        stack.push(new DfsFrame(to[e], Math.min(frame.pushed(), cap[e]), e));
+                        advanced = true;
+                        break;
+                    }
+                    cur[v] = nxt[e];
+                }
+                if (!advanced) {
+                    // 所有出边耗尽，等价于递归返回 0。弹出当前帧，并推进
+                    // 父帧的 current arc 跳过进入本帧的边 —— 对应递归版
+                    // 子调用返回 0 后 for 循环的 cur[v] = nxt[cur[v]] 步进。
+                    stack.pop();
+                    DfsFrame parent = stack.peek();
+                    if (parent != null) {
+                        cur[parent.node()] = nxt[frame.edge()];
                     }
                 }
             }

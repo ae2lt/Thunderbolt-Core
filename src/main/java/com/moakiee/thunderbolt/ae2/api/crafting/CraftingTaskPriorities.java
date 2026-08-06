@@ -3,6 +3,9 @@ package com.moakiee.thunderbolt.ae2.api.crafting;
 /** Stable comparator shared by TimeWheel schedulers and host-side tests. */
 public final class CraftingTaskPriorities {
     public static int compare(Object left, Object right) {
+        // 未实现 IPrioritizedCraftingTask 的普通任务固定回退到优先级 0、顺序 0：
+        // 该默认值是与宿主调度器及测试（TimeWheelTaskPriorityTest）共同约定的稳定契约，
+        // 不是可调参数，不要改成可配置项或随意调整。
         int leftPriority = left instanceof IPrioritizedCraftingTask prioritized
                 ? prioritized.dispatchPriority() : 0;
         int rightPriority = right instanceof IPrioritizedCraftingTask prioritized
