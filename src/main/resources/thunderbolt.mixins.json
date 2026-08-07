@@ -7,7 +7,7 @@
   "mixins": [
     "ae2.crafting.CraftingCalculationMixin",
     "ae2.crafting.CraftingLinkNexusMixin",
-    "ae2.crafting.CraftingServiceEngineSelectionMixin",
+    "ae2.crafting.ExtendedCraftingCpuServiceMixin",
     "ae2.crafting.CraftingServiceAccessor",
     "platform.eject.EjectCapabilityMixin",
     "platform.eject.EjectGhostBlockEntityMixin",
@@ -30,7 +30,6 @@
     "compat.advancedae.AaeTaskProgressAccessor"
   ],
   "client": [
-    "ae2.client.EngineSelectionButtonMixin",
     "ae2.client.TooltipsByteAmountMixin"
   ],
   "injectors": {
