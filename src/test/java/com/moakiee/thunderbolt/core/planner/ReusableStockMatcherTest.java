@@ -89,4 +89,30 @@ class ReusableStockMatcherTest {
         assertEquals(size, candidateCalls.get());
         assertEquals((long) size * size, candidateVisits.get());
     }
+
+    @Test
+    void oversizedPotentialMatrixReturnsConservativeInfeasibleBeforeCandidateExpansion() {
+        int size = 513;
+        var available = new LinkedHashMap<ReusableStockKey<Integer>, Long>();
+        var demand = new LinkedHashMap<ReusableStockRouteKey<Integer>, Long>();
+        for (int i = 0; i < size; i++) {
+            available.put(new ReusableStockKey<>("host", i), 1L);
+            demand.put(new ReusableStockRouteKey<>(
+                    new ReusableStockSource("host", "shared", "route-" + i), i), 1L);
+        }
+        var candidateCalls = new AtomicInteger();
+
+        var result = assertTimeout(Duration.ofSeconds(1), () -> ReusableStockMatcher.allocate(
+                available,
+                demand,
+                ignored -> {
+                    candidateCalls.incrementAndGet();
+                    return List.of();
+                }));
+
+        assertFalse(result.feasible());
+        assertTrue(result.allocation().isEmpty());
+        assertEquals(0, candidateCalls.get(),
+                "the cartesian preflight must run before materializing route candidates");
+    }
 }

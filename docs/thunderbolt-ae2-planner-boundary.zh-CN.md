@@ -13,14 +13,14 @@
 
 本分支已经完成以下结构性变更：
 
-1. Thunderbolt 正式稳定面收敛为 `api.channel`、`api.crafting` 和 `api.eject`；其中合成域包含算法注册/节点提供器、扩展 CPU、Planner 与 Batch 契约。旧 `ae2.api` 属于冻结前实验接口，本次直接迁移，不作为已发布稳定 ABI 保留。
+1. Thunderbolt 正式稳定面收敛为 `api.channel`、`api.crafting` 和 `api.eject`；其中合成域包含算法注册/节点提供器、扩展 CPU 与 Batch 契约。旧 `ae2.api` 属于冻结前实验接口，本次直接迁移，不作为已发布稳定 ABI 保留。
 2. `supportsSingleSeedBatch()` 保留为 Batch SPI 的兼容方法；新调度器调用中立的 `supportsSharedBatchInputs()`，其默认实现反向调用旧方法，因此已有 override 继续生效。
-3. Planner SPI 已实现确定性优先级、单终结规划器和 `EXACT_FEASIBLE`、`EXACT_INFEASIBLE`、`UNSUPPORTED`、`BUDGET_EXHAUSTED` 四态结果；未终结时进入 Thunderbolt 默认规划器或 AE2 回退。
+3. `CraftingPlanningEngines` 是唯一算法注册入口；节点提供器给出玩家优先级和所选算法，算法注册给出作者声明的算法优先级，解析后锁定一个规划会话，未处理时才进入下一算法或 AE2 回退。
 4. Eject API 不再暴露 `WeakReference`、ghost BlockEntity、SavedData 或运行时索引；这些实现分别进入 `core.eject` 和 `mixin.platform.eject`。
-5. Thunderbolt 的生产 Java 包除入口/配置外只使用 `api`、`mixin`、`core`。频道公共类型已使用 `ChannelSourceRegistry`、`HighCapacityChannelOwner`、`ConnectionChannelCapacityProvider` 等中立命名；`FastCraftingPlanner` 位于 `mixin.ae2.crafting.support`，纯算法位于 `core.crafting.planner`。
+5. Thunderbolt 的生产 Java 包除入口/配置外只使用 `api`、`mixin`、`core`。频道公共类型已使用 `ChannelSourceRegistry`、`HighCapacityChannelOwner`、`ConnectionChannelCapacityProvider` 等中立命名；默认 AE2 规划桥位于 `core.crafting.support`，纯算法位于 `core.crafting.planner`。
 6. TimeWheel、闭环计划/任务、LT 种子接口、过载模型/匹配/认领/CPU 状态、无线模型和 Matrix CraftingCore 已迁回 AE2LT 命名空间；Thunderbolt 只保留不含产品语义的扩展 CPU 发现、提交和兼容性契约。
 7. 通用规划器不导入 `com.moakiee.ae2lt.*`，也不判断 `TimeWheel`、`LoopCraftingPlan`、`ReusableSeedPattern` 或 `OverloadedProviderOnlyPatternDetails`。专用计划由其规划会话在最终阶段生成，再由扩展 CPU 的 `canHandle(plan)` 判断兼容性。
-8. Channel、Crafting Algorithm/CPU/Planner/Batch、Eject 稳定 API 均有契约测试，覆盖优先级解析、节点动态发现、计划兼容性、旧 Batch 方法兼容和未安装 Eject runtime 时的安全 no-op，并使用非 AE2LT 的伪第三方实现。
+8. Channel、Crafting Algorithm/CPU/Batch、Eject 稳定 API 均有契约测试，覆盖优先级解析、计划兼容性、旧 Batch 方法兼容和未安装 Eject runtime 时的安全 no-op，并使用非 AE2LT 的伪第三方实现。
 9. Thunderbolt 全量测试通过；AE2LT 迁入的 `crafting.runtime`、`crafting.timewheel`、`overload.runtime` 定向测试通过。AE2LT 全量测试仍有 16 个既有无线 cadence 实验失败，均位于创建分支前已经修改的文件中，不属于本次迁移。
 
 ## 定位决策
@@ -33,12 +33,12 @@ Thunderbolt 不应继续承载只服务于 AE2LT 具体物品、机器或玩法�
 
 据此确定以下边界：
 
-1. `api` 只保留需要长期兼容的公共契约，当前包括频道 API、合成算法/节点提供器/扩展 CPU/Planner/Batch 契约和 Eject capability 投影 API。
+1. `api` 只保留需要长期兼容的公共契约，当前包括频道 API、合成算法/节点提供器/扩展 CPU/Batch 契约和 Eject capability 投影 API。
 2. `mixin` 负责把上述稳定契约接入 AE2，并兼容没有主动适配 Thunderbolt 的附属模组；Mixin、Accessor、反射桥和目标模组版本判断都属于不稳定实现层。
 3. `core` 提供频道分配、配方图、整数求解、冲突核、批量调度等关键算法和默认实现，但不新增面向某个玩法的 SPI。
 4. 天枢闭环样板的求解语义、TimeWheel CPU、种子账本和持久化实现移动回 AE2LT。
 5. LT 过载样板的 `STRICT`、`ID_ONLY`、`MIXED` 匹配以及输出认领算法移动回 AE2LT。
-6. 不再因为某个具体模组提出接入需求，就在 Thunderbolt 中增加对应 API。具体模组应实现既有规划器 SPI、Batch SPI 或频道 API；现有契约不能表达时，先留在模组自身，等出现第二个独立用例再评估是否抽象。
+6. 不再因为某个具体模组提出接入需求，就在 Thunderbolt 中增加对应 API。具体模组应注册统一规划算法、实现 Batch SPI 或频道 API；现有契约不能表达时，先留在模组自身，等出现第二个独立用例再评估是否抽象。
 
 ## 三层包结构
 
@@ -262,7 +262,7 @@ Thunderbolt 可以维护一个面向 AE2 原版语义及通用附属模组扩展
 - 闭环首次启动种子的借用与状态转换；
 - 闭环消费者和生产者之间的种子路由。
 
-这些能力不属于公开 Planner SPI。实施后，闭环样板分析、宿主/池身份、计划绑定、种子账本和持久化都由 AE2LT 负责；Thunderbolt `core` 只保留不带产品类型的可复用库存路由算法。后续若拆出独立 `ClosedLoopPlanner`，它负责：
+这些能力不属于公开 Crafting Algorithm API。实施后，闭环样板分析、宿主/池身份、计划绑定、种子账本和持久化都由 AE2LT 负责；Thunderbolt `core` 只保留不带产品类型的可复用库存路由算法。后续若拆出独立 `ClosedLoopPlanner`，它负责：
 
 1. 识别天枢闭环宏样板；
 2. 分析闭环成员和强连通状态；
@@ -272,7 +272,7 @@ Thunderbolt 可以维护一个面向 AE2 原版语义及通用附属模组扩展
 6. 将普通物料依赖交给 Thunderbolt 通用求解器；
 7. 将闭环元数据交给 AE2LT 的专用 CPU 执行。
 
-Thunderbolt 只提供统一的 Crafting Planner SPI 和可复用的 `core` 算法。不能为了闭环再增加绑定计划、计划装饰、种子槽或样板展开等独立公共接口。Thunderbolt 的核心求解器中也不能出现 `TimeWheel`、`Tianshu`、`LoopSeed` 或 AE2LT 具体类型判断。当前过渡实现由 AE2LT 通过非稳定的 core 元数据接口调用默认求解器；这些接口不是新的公共 SPI。
+Thunderbolt 只提供统一的 Crafting Algorithm API 和可复用的 `core` 算法。不能为了闭环再增加绑定计划、计划装饰、种子槽或样板展开等独立公共接口。Thunderbolt 的核心求解器中也不能出现 `TimeWheel`、`Tianshu`、`LoopSeed` 或 AE2LT 具体类型判断。当前过渡实现由 AE2LT 通过非稳定的 core 元数据接口调用默认求解器；这些接口不是新的公共 SPI。
 
 ## 应移动回 AE2LT 的过载语义
 
@@ -288,7 +288,7 @@ LT 过载样板的下列机制属于产品规则，不属于 AE2 原版语义：
 
 重构前 `FastCraftingPlanner` 直接依赖 `OverloadedProviderOnlyPatternDetails`，CPU Mixin 也直接维护过载状态。当前直接依赖已删除，且没有增加输出路由或 Overload 专用公共 API：
 
-- 独立过载规划器若需要终结整个请求，直接实现统一 Crafting Planner SPI；当前实现先通过中立 core hook 复用默认规划器；
+- 独立过载规划器若需要终结整个请求，直接注册统一 Crafting Planning Engine；当前实现先通过中立 core hook 复用默认规划器；
 - 过载规划器可以复用 Thunderbolt `core` 的配方图、整数和搜索算法；
 - `ID_ONLY`、输出认领和持久化仍由 AE2LT 自己实现；
 - Thunderbolt 不导入 `com.moakiee.ae2lt.*`，也不导入 LT 专用过载模型；
@@ -359,22 +359,18 @@ Channel API 只描述频道问题中外部实现必须提供的事实，例如�
 
 频道 API 加通用算法仍是当前最合适的方案。仅靠事件无法维护整棵 pathing 图的不变量；让每个模组自行 Mixin 又会产生不可组合的注入冲突。
 
-### Crafting Planner SPI
+### Crafting Algorithm API
 
-规划器 SPI 是所有特殊规划语义的唯一入口。它至少需要稳定定义：
+`CraftingPlanningEngines` 是所有特殊规划语义的唯一注册入口：
 
-- 不可变的规划请求和可取消/有预算的规划上下文；
-- 规划器身份、确定性的选择顺序和重复注册处理；
-- `EXACT_FEASIBLE`、`EXACT_INFEASIBLE`、`UNSUPPORTED`、`BUDGET_EXHAUSTED` 四种结果；
-- 标准 AE2 计划、Missing 和诊断的所有权；
-- `UNSUPPORTED` 与预算耗尽后的安全回退，不允许把部分计划当作成功结果；
-- Planner 抛异常时的隔离和日志策略，不能吞掉 `ThreadDeath`、`OutOfMemoryError` 等 `Throwable`。
+- 算法用稳定 ID 注册实现、作者声明的算法优先级以及是否公开；
+- 节点提供器只声明当前选择的算法和玩家优先级；
+- 玩家优先级先比较，算法优先级只在玩家优先级相同时决定顺序；
+- 每次计算锁定一个 `PlanningEngineSession`，后续数量探测复用同一会话；
+- 算法在第一次探测返回 `DECLINE` 时才尝试下一算法；一旦接管，后续探测不得静默换算法；
+- 原版算法始终是最后的公开回退。
 
-Thunderbolt 自带 AE2 原版语义规划器和通用快速规划器。Probability-Pattern、AE2LT 闭环和 AE2LT 过载如果需要特殊规划，都应实现该 SPI；不能再分别增加概率样板、计划装饰、候选输入或输出路由 API。
-
-规划器可以复用 `core.crafting`，但 Planner SPI 的请求和结果不能直接暴露 `CraftPlannerV2` 的可变内部状态。这样核心算法可以重写，第三方规划器的二进制契约仍保持稳定。
-
-Planner SPI 第一版只选择一个对完整请求负责的终结规划器，不提供按注册顺序层层改写计划的 decorator 链。一个请求同时包含多种特殊语义时，只有明确声明支持该组合的规划器才能接管；否则返回 `UNSUPPORTED` 并走下一个规划器或 AE2 回退。这样可以避免多个模组按加载顺序修改同一计划而产生不可验证的组合语义。
+Thunderbolt 自带通用快速算法。Probability-Pattern、AE2LT 闭环和 AE2LT 过载如果需要特殊规划，应注册新的 `CraftingPlanningEngine`，不能再增加第二套内部 planner registry。算法可以复用 `core.crafting`，但公共请求和结果不暴露 `CraftPlannerV2` 的可变内部状态。
 
 ### Batch 合成 SPI
 
@@ -421,7 +417,7 @@ Eject 注册必须返回稳定句柄或使用稳定 ID，明确同一位置/面�
 
 - `BoundCraftingPlan`、`CraftingPlanDecorator`：不创建；特殊计划由对应规划器和产品执行层负责；
 - `PatternFiringExpander`、`IPlannedSeedSlotPattern`、`ISeedPreservingCraftingTask`：闭环语义，移回 AE2LT；
-- `PlannerInputSemantics`、概率样板 Adapter、通用输出路由：不创建，交由完整 Planner SPI 实现；
+- `PlannerInputSemantics`、概率样板 Adapter、通用输出路由：不创建，交由完整 Crafting Planning Engine 实现；
 - `IPrioritizedCraftingTask`、`IProviderLookupPattern`、`CraftingTaskPriorities`、`CraftingPatternDelegates`：若默认实现仍需要，降为 `core` 或 `mixin` 内部协议，不作为第三方稳定 SPI；
 - `api.wireless`：LT 无线连接产品机制，移动回 AE2LT；Eject capability 投影作为独立中立 API 保留；
 - `IIndexedStorageCellItem`：AE2 cell handler 的默认实现配置，不升级为新的一级 SPI。
@@ -497,25 +493,25 @@ AE2-Lightning-Tech
 | 当前区域 | 当前规模/代表类型 | 目标处理 |
 |---|---|---|
 | `ae2/mixin` | 34 个 Mixin、Accessor 和选择器 | 移到 `mixin.ae2`、`mixin.platform` 或 `mixin.compat.<mod>`；LT 菜单和闭环 Mixin 移回 LT，Eject Mixin 留在 platform 适配层 |
-| `ae2/api/crafting` | 11 个类型 | Planner/Batch、算法提供器与中立扩展 CPU 契约迁入 `api.crafting`；种子、任务优先级和产品 provider delegate 等降为内部或移回 LT |
+| `ae2/api/crafting` | 11 个类型 | Batch、算法提供器与中立扩展 CPU 契约迁入 `api.crafting`；种子、任务优先级和产品 provider delegate 等降为内部或移回 LT |
 | `ae2/channel` | `ChannelProviderRegistry`、`BorrowedCapacityCalculator`、多个 `Overloaded*` | 稳定事实契约进 `api.channel`，算法进 `core.channel`，AE2 索引桥进 `mixin`，LT 命名移回 LT |
-| `ae2/crafting` | `FastCraftingPlanner`、扩展 CPU、闭环计划和样板 | AE2 规划/CPU 入口适配进 `mixin`；通用算法与 CPU 索引进 `core.crafting`；闭环产品类型移回 LT |
+| `ae2/crafting` | `FastCraftingPlanner`、扩展 CPU、闭环计划和样板 | AE2 注入入口进 `mixin`；默认规划桥、通用算法与 CPU 索引进 `core.crafting`；闭环产品类型移回 LT |
 | `ae2/batch` | CPU/AAE/NeoECO 批量执行 | 通用调度进 `core.crafting.batch`；目标模组访问和 Accessor 进 `mixin.compat` |
-| `ae2/timewheel`、`ae2/overload` | 17 个 TimeWheel 文件、32 个过载文件 | 整体迁回 AE2LT，只通过 Planner SPI 或 Batch SPI 使用 Thunderbolt |
+| `ae2/timewheel`、`ae2/overload` | 17 个 TimeWheel 文件、32 个过载文件 | 整体迁回 AE2LT，只通过 Crafting Algorithm API 或 Batch SPI 使用 Thunderbolt |
 | `api/wireless` | LT 无线连接模型 | 迁回 AE2LT，不保留 Thunderbolt 公共 API |
 | `api/eject` | 远程 capability 投影，但当前混合 public API、运行时索引、SavedData 和 ghost BE | 中立契约保留在 `api.eject`；索引/持久化进 `core.eject`；侵入桥进 `mixin.platform.eject` |
 | `ae2/cell`、`core/cell` | indexed cell 默认实现与索引算法 | 算法和默认实现可进 `core.storage`，但不形成新的稳定 SPI |
 | `core/craft` | `CraftingCore`、`MolecularCopyAssembler` 等 | 当前只被 LT Matrix 使用且含 AE2LT/共享种子语义；先移回 LT，只有净化成独立通用 Batch 算法后才回 `core` |
 | `internal/*`、`registry/*` | eject ghost BE、SavedData、BlockEntity 注册 | Eject 实现按 `core.eject`/`mixin.platform.eject` 拆分；其余产品注册随对应机制回 LT；根包不保留第四个领域层 |
 
-`FastCraftingPlanner` 虽然不是 Mixin 类，但它读取 AE2 服务并把 AE2 对象转换为 `core` 模型，属于 Mixin 入口背后的 AE2 bridge，不属于稳定 API。最终可放在 `mixin.ae2.crafting.support`；名称中的 `Mixin` 表示这一整层的接入职责，不要求其中每个帮助类都带 `@Mixin` 注解。
+`FastCraftingPlanner` 读取 AE2 服务并把 AE2 对象转换为 `core` 模型，是默认算法的内部 bridge，不属于稳定 API；当前位于 `core.crafting.support`，通过中立的输入、库存和包装模式接口与 AE2LT 产品类型隔离。
 
 ## 已执行的迁移顺序
 
 ### 阶段 1：冻结最小稳定 API
 
-1. 建立 `api.channel`、`api.crafting.planner`、`api.crafting.batch`、`api.eject`；
-2. 为 Planner SPI 锁定请求、结果状态、选择顺序、取消、预算和回退；
+1. 建立 `api.channel`、`api.crafting`、`api.crafting.batch`、`api.crafting.cpu`、`api.eject`；
+2. 为 Crafting Algorithm API 锁定注册、提供器优先级、会话选择、取消和回退；
 3. 保留 `supportsSingleSeedBatch` 的兼容行为，把语义重述为通用 shared-batch-input capability，并冻结容量、shared input 与 leftover 语义；
 4. 将频道接口改为中立容量/需求/边模型，删除 `Overloaded`、`Wireless` 产品命名；
 5. 将 Eject 的端点契约与运行时索引、SavedData、ghost BE 和 Mixin 拆开；
@@ -528,7 +524,7 @@ AE2-Lightning-Tech
 2. 将 `LoopCraftingPlan`、`ExecuteLoopPattern` 和闭环种子接口移动到 AE2LT；
 3. 移动 TimeWheel 菜单和 AE2CT 兼容 Mixin；
 4. 将 `PatternFiringExpander` 和种子任务接口移动到 AE2LT；Thunderbolt 只保留中立的扩展 CPU 接入契约；
-5. Planner SPI 已作为唯一专用规划入口接入 AE2；当前过渡实现仍由 Thunderbolt 默认规划器计算普通依赖，再由 AE2LT 绑定闭环计划，后续独立闭环规划器可直接注册该 SPI；
+5. Crafting Algorithm API 已作为唯一专用规划入口接入 AE2；当前过渡实现仍由 Thunderbolt 默认算法计算普通依赖，再由 AE2LT 绑定闭环计划，后续独立闭环算法可直接注册；
 6. 将类名从实现算法名改为产品职责名；
 7. 保持已有 NBT 标签、任务 UUID 和存档版本兼容。
 
@@ -538,14 +534,14 @@ AE2-Lightning-Tech
 2. 从 `FastCraftingPlanner` 移除 `ReusableSeedPattern` 和 LT 过载模型直接依赖，改为非稳定的中立 core 策略接口；
 3. 普通 AE2 语义继续通过通用图求解；
 4. 闭环求解器在 AE2LT 中复用 Thunderbolt 图、整数和诊断工具；
-5. 将 `FastCraftingPlanner` 作为 AE2 bridge 放入 `mixin` 支持层，核心算法不再导入 AE2 内部实现；
-6. 明确 `EXACT / UNSUPPORTED / BUDGET_EXHAUSTED` 结果契约。
+5. 将 `FastCraftingPlanner` 作为默认算法内部 bridge 放入 `core.crafting.support`，纯求解核心不导入 AE2 内部实现；
+6. 明确 `DECLINE / HANDLED`、会话锁定与取消传播契约。
 
 ### 阶段 4：移动过载算法
 
 1. 将过载样板模型、匹配模式和编辑状态移动回 AE2LT；
 2. 将输出认领和 CPU 状态移动回 AE2LT；
-3. AE2LT 过载匹配、认领和持久化留在 LT；当前候选扩展通过非稳定的中立 core hook 接入默认规划器，不新增通用输入候选或输出路由 SPI；若以后需要独立终结规划，则直接实现统一 Planner SPI；
+3. AE2LT 过载匹配、认领和持久化留在 LT；当前候选扩展通过非稳定的中立 core hook 接入默认规划器，不新增通用输入候选或输出路由 SPI；若以后需要独立终结规划，则注册统一 Crafting Planning Engine；
 4. 普通 AE2、AdvancedAE、NeoECO 执行适配不得再引用 LT 过载具体类型。
 
 ### 阶段 5：整理 Mixin 与 Core
@@ -572,16 +568,16 @@ AE2-Lightning-Tech
 - `FastCraftingPlanner` 不导入 LT 闭环或过载具体类型；
 - Thunderbolt 不包含 `Ae2LtTimeWheelCraftingCpuLogic` 等产品实现；
 - Thunderbolt 不包含 `api.probability`、`api.overload`、`api.timewheel` 或 `api.wireless`；
-- Channel、Crafting Algorithm/CPU/Planner/Batch、Eject 稳定 API 有独立契约测试；
+- Channel、Crafting Algorithm/CPU/Batch、Eject 稳定 API 有独立契约测试；
 - AdvancedAE、NeoECO 等目标模组名称只出现在 `mixin` 的兼容实现/选择器、测试和构建依赖中。
 
 ### API 稳定性
 
 - 本分支冻结后的 `api.*` 消费者可通过后续兼容测试继续加载；冻结前 `ae2.*` 实验包按迁移说明升级；
 - 新增默认方法不会改变旧实现的行为；
-- Planner 注册顺序与结果选择在不同 JVM 和加载顺序下保持确定；
-- 无第三方 Planner/Batch/Channel provider 时完整回退到 AE2/Thunderbolt 默认行为；
-- `UNSUPPORTED`、`BUDGET_EXHAUSTED`、暂时容量为零和严格失败不会互相混淆；
+- 算法注册顺序与提供器解析在不同 JVM 和加载顺序下保持确定；
+- 无第三方 Algorithm/Batch/Channel provider 时完整回退到 AE2/Thunderbolt 默认行为；
+- `DECLINE`、取消、暂时容量为零和严格失败不会互相混淆；
 - API DTO 的集合和上下文不可被调用方修改；
 - 旧 `supportsSingleSeedBatch()` 实现通过兼容默认方法继续生效，新 shared-input 名称不改变旧 provider 行为；
 - Eject API 类型签名不出现 WeakReference、ghost BlockEntity、SavedData 或 Mixin 类型；
@@ -618,6 +614,6 @@ AE2-Lightning-Tech
 
 Thunderbolt 的目标不是积累许多功能接口，而是维持三个职责清晰的包：稳定契约放 `api`，AE2 与未主动兼容模组的侵入适配放 `mixin`，关键算法和默认实现放 `core`。
 
-稳定 API 保留 Channel、Crafting Algorithm/CPU/Planner/Batch 与 Eject capability 投影。`supportsSingleSeedBatch()` 作为通用 Batch shared-input 能力兼容保留。概率样板、闭环、过载等特殊规划通过统一规划接口接入；无线、绑定计划注册表、计划装饰、样板展开和 LT 种子类型不形成独立 Thunderbolt API。
+稳定 API 保留 Channel、Crafting Algorithm/CPU/Batch 与 Eject capability 投影。`supportsSingleSeedBatch()` 作为通用 Batch shared-input 能力兼容保留。概率样板、闭环、过载等特殊规划通过统一算法接口接入；无线、第二套 planner 注册表、绑定计划注册表、计划装饰、样板展开和 LT 种子类型不形成独立 Thunderbolt API。
 
-TimeWheel CPU 是当前闭环样板的必要执行器，却不是 Thunderbolt 的通用实现；它应留在 AE2LT。闭环种子求解和 LT 过载匹配同样留在 AE2LT。Thunderbolt 只保留统一接入它们所需的算法提供器、扩展 CPU、Planner/Batch 契约、中立 Eject capability 投影、AE2/NeoForge Mixin 接缝以及可独立复用的频道、图、整数、存储和批量算法。
+TimeWheel CPU 是当前闭环样板的必要执行器，却不是 Thunderbolt 的通用实现；它应留在 AE2LT。闭环种子求解和 LT 过载匹配同样留在 AE2LT。Thunderbolt 只保留统一接入它们所需的算法提供器、扩展 CPU、Batch 契约、中立 Eject capability 投影、AE2/NeoForge Mixin 接缝以及可独立复用的频道、图、整数、存储和批量算法。

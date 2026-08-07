@@ -146,6 +146,13 @@ public final class FastPlanningWatchdog {
                 + ", equivalentPruned=" + diagnostics.equivalentRoutesPruned()
                 + ", memoHits=" + diagnostics.failureMemoHits()
                 + ", frontierPeak=" + diagnostics.frontierPeak()
+                + ", lowWidth(width/attempts/solved/infeasible/cutoffs/nodes)="
+                + diagnostics.separatorWidthPeak() + "/"
+                + diagnostics.lowWidthAttempts() + "/"
+                + diagnostics.lowWidthSolved() + "/"
+                + diagnostics.lowWidthInfeasible() + "/"
+                + diagnostics.lowWidthCutoffs() + "/"
+                + diagnostics.lowWidthIntegerNodes()
                 + ", cutoff(search/resolution/fallback)=" + diagnostics.searchCutoff()
                 + "/" + diagnostics.resolutionCutoff()
                 + "/" + diagnostics.fallbackCutoff()

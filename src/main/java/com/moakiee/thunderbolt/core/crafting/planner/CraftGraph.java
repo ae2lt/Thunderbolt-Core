@@ -50,6 +50,7 @@ public final class CraftGraph<K> {
     public long reusableStock(ReusableStockSource source, K plannedKey) {
         long total = 0L;
         for (var actual : reusableStockCandidates(source, plannedKey)) {
+            PlanningCancellation.check();
             total = Sat.add(total, reusableStock(source.storageScope(), actual));
         }
         return total;
@@ -116,6 +117,7 @@ public final class CraftGraph<K> {
             var route = new ReusableStockRouteKey<>(source, plannedKey);
             var accepted = reusableStockRoutes.computeIfAbsent(route, ignored -> new LinkedHashSet<>());
             for (var actual : actualVariants) {
+                PlanningCancellation.check();
                 if (actual != null) accepted.add(actual);
             }
             return this;
@@ -123,10 +125,15 @@ public final class CraftGraph<K> {
 
         public CraftGraph<K> build() {
             Map<K, List<CraftPattern<K>>> frozen = new HashMap<>();
-            patterns.forEach((k, v) -> frozen.put(k, List.copyOf(v)));
+            for (var entry : patterns.entrySet()) {
+                PlanningCancellation.check();
+                frozen.put(entry.getKey(), List.copyOf(entry.getValue()));
+            }
             var frozenRoutes = new HashMap<ReusableStockRouteKey<K>, List<K>>();
-            reusableStockRoutes.forEach((route, variants) ->
-                    frozenRoutes.put(route, List.copyOf(variants)));
+            for (var entry : reusableStockRoutes.entrySet()) {
+                PlanningCancellation.check();
+                frozenRoutes.put(entry.getKey(), List.copyOf(entry.getValue()));
+            }
             return new CraftGraph<>(frozen, Map.copyOf(stock), Map.copyOf(reusableStock),
                     Map.copyOf(frozenRoutes));
         }
