@@ -80,10 +80,17 @@ dependencies {
     // MixinExtras (@WrapOperation/@Local) is built into NeoForge but NOT Forge — required explicitly.
     // mixinextras-forge is a jar-in-jar shell (classes live in META-INF/jars/MixinExtras-0.4.1.jar),
     // so javac cannot see the classes from the shell artifact. Compile against mixinextras-common
-    // (plain jar with all classes), keep the forge jar-in-jar artifact on the runtime classpath.
+    // (plain jar with all classes), keep the forge shell on the runtime classpath.
+    //
+    // implementation(jarJar(...)) is the official ForgeGradle 6 idiom: the shell is put on the dev
+    // runtime classpath AND embedded into META-INF/jarjar/ of the released jar, so players' modpacks
+    // get the MixinExtras classes automatically. Without it every @WrapOperation/@Local injection
+    // fails at load time with ClassNotFoundException.
     compileOnly "io.github.llamalad7:mixinextras-common:0.4.1"
     annotationProcessor "io.github.llamalad7:mixinextras-common:0.4.1"
-    runtimeOnly fg.deobf("io.github.llamalad7:mixinextras-forge:0.4.1")
+    implementation(jarJar("io.github.llamalad7:mixinextras-forge:0.4.1")) {
+        jarJar.ranged(it, "[0.4.1,)")
+    }
 
     // Mixin annotation processor — generates thunderbolt.refmap.json.
     annotationProcessor 'org.spongepowered:mixin:0.8.5:processor'

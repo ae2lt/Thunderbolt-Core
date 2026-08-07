@@ -171,6 +171,10 @@ public final class EjectRegistrationSavedData extends SavedData {
      * bootstrapped, which plain JUnit cannot do, so the key is built via the private factory
      * instead. The registry name ({@code minecraft:dimension}) matches
      * {@code Registries.DIMENSION.location()} exactly, so keys compare equal to runtime ones.
+     *
+     * <p>The factory is private and its reflective lookup must try both names: {@code create}
+     * (dev, mojmap) and {@code m_135790_} (release, srg) — the method is renamed at obfuscation
+     * and the reflective string is never remapped.
      */
     @SuppressWarnings("unchecked")
     static ResourceKey<Level> dimension(String id) {
@@ -186,13 +190,17 @@ public final class EjectRegistrationSavedData extends SavedData {
     private static final Method RESOURCE_KEY_CREATE = reflectResourceKeyCreate();
 
     private static Method reflectResourceKeyCreate() {
-        try {
-            var create = ResourceKey.class.getDeclaredMethod(
-                    "create", ResourceLocation.class, ResourceLocation.class);
-            create.setAccessible(true);
-            return create;
-        } catch (ReflectiveOperationException e) {
-            throw new ExceptionInInitializerError(e);
+        for (String name : new String[]{"create", "m_135790_"}) {
+            try {
+                var create = ResourceKey.class.getDeclaredMethod(
+                        name, ResourceLocation.class, ResourceLocation.class);
+                create.setAccessible(true);
+                return create;
+            } catch (NoSuchMethodException ignored) {
+                // try the other mapping
+            }
         }
+        throw new ExceptionInInitializerError(new NoSuchMethodException(
+                "ResourceKey.create(ResourceLocation, ResourceLocation)"));
     }
 }
