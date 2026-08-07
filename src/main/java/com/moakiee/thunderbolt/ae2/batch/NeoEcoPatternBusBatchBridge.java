@@ -17,7 +17,15 @@ import appeng.blockentity.crafting.IMolecularAssemblerSupportedPattern;
 import com.moakiee.thunderbolt.ae2.api.crafting.BatchDispatchContext;
 import com.moakiee.thunderbolt.ae2.util.MixinReflectionSupport;
 
-/** Reflection bridge to NeoECO's optional verified batch fast path. */
+/**
+ * Reflection bridge to NeoECO's optional verified batch fast path.
+ * <p>
+ * Reflection targets are locked to the NeoECO published artifacts 1.3.4 and 2.1.10
+ * ({@code getAvailableThreadSlots}, {@code findBatchFastPathOffer}, {@code pushPattern},
+ * {@code pushBatch}, {@code ECOExtractedPatternExecution.create}); see
+ * {@code NeoEcoBinaryShapeTest}. The upstream 1.20.1 branch HEAD has drifted to a new
+ * binary shape which is not supported yet.
+ */
 public final class NeoEcoPatternBusBatchBridge {
     private static final @Nullable Class<?> BUS_CLASS = MixinReflectionSupport.findClassSafe(
             "cn.dancingsnow.neoecoae.blocks.entity.crafting.ECOCraftingPatternBusBlockEntity");

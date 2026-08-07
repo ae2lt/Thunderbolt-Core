@@ -382,6 +382,44 @@ public final class IndexedStorage {
                 continue;
             }
 
+            int existingId = keyToId.getInt(key);
+            if (existingId != -1) {
+                // Corrupted save contains the same key twice. Saturating-merge this entry's
+                // amount into the existing slot and recycle the duplicate id, so keyToId,
+                // idToKey, totalTypes and typeCounts stay consistent. The normal single-entry
+                // path below is untouched.
+                long dupLo = id < pLo.length ? pLo[id] : 0L;
+                long dupHi = id < pHi.length ? pHi[id] : 0L;
+                long newHi = hi[existingId] + dupHi;
+                if (newHi < 0) {
+                    hi[existingId] = Long.MAX_VALUE;
+                    lo[existingId] = Long.MAX_VALUE;
+                } else {
+                    hi[existingId] = newHi;
+                    long newLo = lo[existingId] + dupLo;
+                    if (newLo < 0) {
+                        newLo &= Long.MAX_VALUE;
+                        hi[existingId]++;
+                        if (hi[existingId] < 0) {
+                            hi[existingId] = Long.MAX_VALUE;
+                            lo[existingId] = Long.MAX_VALUE;
+                        } else {
+                            lo[existingId] = newLo;
+                        }
+                    } else {
+                        lo[existingId] = newLo;
+                    }
+                }
+                AEKeyType duplicateType = key.getType();
+                long sumLo = typeAmountLo.getLong(duplicateType) + dupLo;
+                long sumHi = typeAmountHi.getLong(duplicateType) + dupHi;
+                if (sumLo < 0) { sumLo &= Long.MAX_VALUE; sumHi++; }
+                typeAmountLo.put(duplicateType, sumLo);
+                typeAmountHi.put(duplicateType, sumHi);
+                addFree(id);
+                continue;
+            }
+
             keyToId.put(key, id);
             idToKey[id] = key;
             lo[id] = id < pLo.length ? pLo[id] : 0L;

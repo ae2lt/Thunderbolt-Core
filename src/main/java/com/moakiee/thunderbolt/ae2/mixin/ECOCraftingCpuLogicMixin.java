@@ -48,6 +48,12 @@ import com.moakiee.thunderbolt.ae2.overload.pattern.OverloadedProviderOnlyPatter
  * {@code ElapsedTimeTracker} classes. All access to those optional types is therefore reflective;
  * Thunderbolt never hard-links NeoECO classes when the addon is absent. ECO also lacks an
  * {@code updateOutput} hook, so the corresponding monitor-update calls are intentionally omitted.
+ * <p>
+ * Supported binary shapes: the NeoECO published artifacts 1.3.4 and 2.1.10 (locked by
+ * {@code NeoEcoBinaryShapeTest}: 4-arg {@code executeCrafting}, the cross-method
+ * {@code getProviders} aggregation of exactly one, and the two-arg {@code writeToNBT}).
+ * The upstream 1.20.1 branch HEAD has since drifted to a new shape (6-arg
+ * {@code executeCrafting}, {@code collectProviders}, long parameters) which is not supported yet.
  */
 @Pseudo
 @Mixin(targets = "cn.dancingsnow.neoecoae.api.me.ECOCraftingCPULogic", remap = false)

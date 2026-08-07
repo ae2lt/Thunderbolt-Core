@@ -13,9 +13,10 @@ final class ExtendedAePlusMixinPriorityContractTest {
                 "src/main/java/com/moakiee/thunderbolt/ae2/mixin/"
                         + "ExtendedAePlusVirtualCompletionSuppressionMixin.java"));
 
-        // EAEP's PatternProviderLogicCompatMixin has priority 500. Lower priorities are applied
-        // later, after eap$compatTryVirtualCompletion and eap$compatIsVirtualCraftingEnabled exist.
-        assertTrue(source.contains("@Mixin(value = PatternProviderLogic.class, priority = 400, remap = false)"));
+        // EAEP's PatternProviderLogicCompatMixin has class-level priority 500 and EAEP's
+        // mixins.json sets config-level priority 1000. Higher priorities are applied later,
+        // after eap$compatTryVirtualCompletion and eap$compatIsVirtualCraftingEnabled exist.
+        assertTrue(source.contains("@Mixin(value = PatternProviderLogic.class, priority = 1100, remap = false)"));
         assertTrue(source.contains("method = \"eap$compatTryVirtualCompletion\""));
         assertTrue(source.contains("method = \"eap$compatIsVirtualCraftingEnabled\""));
     }

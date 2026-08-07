@@ -86,6 +86,8 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
     private static final int MAX_TASK_PROBES_PER_TICK = 262_144;
     private static final int RETRY_DELAY_TICKS = 4;
     private static final int PARKED_TASK_SAFETY_DELAY_TICKS = 32;
+    /** Shared read-only tracker returned when no job is active; avoids per-call allocation. */
+    private static final ElapsedTimeTracker EMPTY_TIME_TRACKER = new ElapsedTimeTracker();
     private static final String TAG_INVENTORY = "inventory";
     private static final String TAG_JOB = "job";
     private static final String TAG_OVERLOAD_STATE = "ae2ltOverloadState";
@@ -2092,7 +2094,7 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
     }
 
     public ElapsedTimeTracker getElapsedTimeTracker() {
-        return this.job != null ? this.job.timeTracker : new ElapsedTimeTracker();
+        return this.job != null ? this.job.timeTracker : EMPTY_TIME_TRACKER;
     }
 
     public void addListener(Consumer<AEKey> listener) {
@@ -2721,7 +2723,21 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
         var missing = new HashSet<AEKey>();
         for (var entry : exactRequired.entrySet()) {
             long required = entry.getValue();
-            if (required > 0 && inventory.extract(entry.getKey(), required, Actionable.SIMULATE) < required) {
+            if (required <= 0) {
+                continue;
+            }
+            // Reserved seeds and retained final outputs physically sit in this inventory but
+            // must not be consumed as pattern inputs; mirror the delivery-path protection.
+            long reusableReserve = Math.max(
+                    seedReturnQuota.get(entry.getKey()),
+                    loopSeedLedgers.totalReserved(entry.getKey()));
+            long reserved = addSaturated(reusableReserve, retainedFinalOutputs.get(entry.getKey()));
+            // Cap the probe at required + reserved: capping at just required would truncate the
+            // result to min(held, required), which always fails the check below when reserved > 0
+            // even if held >= required + reserved.
+            long available = inventory.extract(
+                    entry.getKey(), addSaturated(required, reserved), Actionable.SIMULATE);
+            if (available - reserved < required) {
                 missing.add(entry.getKey());
             }
         }
@@ -2894,7 +2910,8 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
     private void notifyJobOwner(TimeWheelJob activeJob, CraftingJobStatusPacket.Status status) {
         this.lastModifiedOnTick = TickHandler.instance().getCurrentTick();
         var playerId = activeJob.playerId;
-        if (playerId == null || cpu.getLevel() == null || cpu.getLevel().getServer() == null) {
+        if (playerId == null || activeJob.finalOutput == null
+                || cpu.getLevel() == null || cpu.getLevel().getServer() == null) {
             return;
         }
 
@@ -2934,6 +2951,11 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
     }
 
     private double patternPowerFor(IPatternDetails details, KeyCounter[] craftingContainer) {
+        // Fuzzy inputs (multiple candidates) resolve to different actual keys per push, so the
+        // per-pattern cached power can be stale; compute it directly for those patterns.
+        if (!hasOnlyExactInputs(details)) {
+            return CraftingCpuHelper.calculatePatternPower(craftingContainer);
+        }
         var cached = patternPowerCache.get(details);
         if (cached != null) {
             return cached;

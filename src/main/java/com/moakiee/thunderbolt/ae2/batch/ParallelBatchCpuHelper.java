@@ -243,7 +243,7 @@ public final class ParallelBatchCpuHelper {
     }
 
     private static long saturatingAdd(long left, long right) {
-        return left >= Long.MAX_VALUE - right ? Long.MAX_VALUE : left + right;
+        return left > Long.MAX_VALUE - right ? Long.MAX_VALUE : left + right;
     }
 
     private static long saturatingMultiply(long left, long right) {

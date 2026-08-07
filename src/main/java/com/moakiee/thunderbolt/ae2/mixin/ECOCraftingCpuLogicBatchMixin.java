@@ -30,7 +30,16 @@ import com.moakiee.thunderbolt.ae2.batch.BatchProviderFilterIterable;
 import com.moakiee.thunderbolt.ae2.batch.NeoEcoBatchJobView;
 import com.moakiee.thunderbolt.ae2.util.MixinReflectionSupport;
 
-/** Makes NeoECO CPUs dispatch compatible patterns through Thunderbolt batch providers. */
+/**
+ * Makes NeoECO CPUs dispatch compatible patterns through Thunderbolt batch providers.
+ * <p>
+ * Supports the NeoECO published artifacts 1.3.4 and 2.1.10 dual binary shapes: the
+ * {@code method = {"executeCrafting", "collectAvailableProviders"}} aggregation resolves to
+ * exactly one injection per shape (1.3.4 keeps {@code getProviders} inside
+ * {@code executeCrafting}, 2.1.10 inside {@code collectAvailableProviders}); see
+ * {@code NeoEcoBinaryShapeTest}. The upstream 1.20.1 branch HEAD has drifted to a new
+ * shape (6-arg {@code executeCrafting}, {@code collectProviders}) which is not supported yet.
+ */
 @Pseudo
 @Mixin(targets = "cn.dancingsnow.neoecoae.api.me.ECOCraftingCPULogic", remap = false)
 public abstract class ECOCraftingCpuLogicBatchMixin {
