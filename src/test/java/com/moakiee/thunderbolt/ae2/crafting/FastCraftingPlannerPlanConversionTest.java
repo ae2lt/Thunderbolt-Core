@@ -29,12 +29,13 @@ import appeng.crafting.CraftingPlan;
 import appeng.crafting.inv.ChildCraftingSimulationState;
 import appeng.crafting.inv.ICraftingInventory;
 
+import com.moakiee.thunderbolt.core.crafting.pattern.CraftingStockPolicy;
 import com.moakiee.thunderbolt.core.crafting.planner.CraftGraph;
 import com.moakiee.thunderbolt.core.crafting.planner.CraftInput;
 import com.moakiee.thunderbolt.core.crafting.planner.CraftPattern;
 import com.moakiee.thunderbolt.core.crafting.planner.CraftPlan;
 import com.moakiee.thunderbolt.core.crafting.planner.CraftPlannerV2;
-import com.moakiee.thunderbolt.core.crafting.support.CraftingStockPolicy;
+import com.moakiee.thunderbolt.core.crafting.planner.FastCraftingPlanner;
 
 import org.junit.jupiter.api.Test;
 

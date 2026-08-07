@@ -7,7 +7,7 @@ import java.util.Map;
 import appeng.api.stacks.AEKey;
 import appeng.crafting.CraftingPlan;
 
-/** Short-lived bridge for host-owned plan wrappers; entries are removed when read. */
+/** Short-lived bridge from a planning-engine session to Thunderbolt's plan finalizer. */
 public final class PlanningMetadataStore {
 
     private static final Map<CraftingPlan, Map<ReusableStockUsageKey<AEKey>, Long>> REUSABLE_STOCK =

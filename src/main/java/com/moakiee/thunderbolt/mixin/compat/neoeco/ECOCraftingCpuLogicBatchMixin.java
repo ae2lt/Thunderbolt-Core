@@ -27,8 +27,8 @@ import appeng.me.service.CraftingService;
 import com.moakiee.thunderbolt.core.crafting.batch.BatchCpuAccounting;
 import com.moakiee.thunderbolt.core.crafting.batch.BatchExecutor;
 import com.moakiee.thunderbolt.core.crafting.batch.BatchProviderFilterIterable;
-import com.moakiee.thunderbolt.mixin.compat.neoeco.NeoEcoBatchJobView;
-import com.moakiee.thunderbolt.mixin.support.MixinReflectionSupport;
+import com.moakiee.thunderbolt.core.crafting.batch.NeoEcoBatchJobView;
+import com.moakiee.thunderbolt.core.util.MixinReflectionSupport;
 
 /** Makes NeoECO CPUs dispatch compatible patterns through Thunderbolt batch providers. */
 @Pseudo

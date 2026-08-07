@@ -13,7 +13,7 @@ import appeng.api.stacks.KeyCounter;
 import com.moakiee.thunderbolt.CoreConfig;
 import com.moakiee.thunderbolt.api.crafting.batch.BatchDispatchContext;
 import com.moakiee.thunderbolt.api.crafting.batch.IBatchCraftingProvider;
-import com.moakiee.thunderbolt.mixin.compat.neoeco.NeoEcoPatternBusBatchBridge;
+import com.moakiee.thunderbolt.core.crafting.batch.NeoEcoPatternBusBatchBridge;
 
 /** Adds Thunderbolt's batch-provider contract to NeoECO's native verified batch bus. */
 @Pseudo
