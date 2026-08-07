@@ -52,12 +52,4 @@ class OptionalMixinSelectorTest {
         assertTrue(OptionalMixinSelector.shouldApply("CraftingCalculationMixin", ignored -> false));
         assertTrue(OptionalMixinSelector.shouldApply("ExtendedCraftingCpuServiceMixin", ignored -> false));
     }
-
-    @Test
-    void skipsInsertBridgeWhenAdvancedAeOverwritesInsertIntoCpus() {
-        assertFalse(OptionalMixinSelector.shouldApply(
-                "ExtendedCraftingCpuInsertMixin", "advanced_ae"::equals));
-        assertTrue(OptionalMixinSelector.shouldApply(
-                "ExtendedCraftingCpuInsertMixin", ignored -> false));
-    }
 }

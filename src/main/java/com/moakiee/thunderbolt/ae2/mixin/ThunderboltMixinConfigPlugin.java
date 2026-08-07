@@ -4,19 +4,15 @@ import java.util.List;
 import java.util.Set;
 
 import org.objectweb.asm.tree.ClassNode;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 import org.spongepowered.asm.mixin.extensibility.IMixinConfigPlugin;
 import org.spongepowered.asm.mixin.extensibility.IMixinInfo;
 
 // Forge 1.20.1: ModList lives in fmlcore as net.minecraftforge.fml.ModList.
 // (The neoform-era package net.minecraftforge.fml.loading.moddiscovery.ModList does not exist here.)
 import net.minecraftforge.fml.ModList;
-import net.minecraftforge.fml.loading.LoadingModList;
 
 /** Applies optional-addon mixins only when their owning mod is present. */
 public final class ThunderboltMixinConfigPlugin implements IMixinConfigPlugin {
-    private static final Logger LOGGER = LoggerFactory.getLogger("thunderbolt");
     @Override
     public void onLoad(String mixinPackage) {
     }
@@ -28,30 +24,16 @@ public final class ThunderboltMixinConfigPlugin implements IMixinConfigPlugin {
 
     @Override
     public boolean shouldApplyMixin(String targetClassName, String mixinClassName) {
-        boolean apply = OptionalMixinSelector.shouldApply(
-                mixinClassName, ThunderboltMixinConfigPlugin::isModLoaded);
-        LOGGER.info("Mixin select: {} -> {} : {}", mixinClassName, targetClassName, apply);
-        return apply;
+        return OptionalMixinSelector.shouldApply(mixinClassName, ThunderboltMixinConfigPlugin::isModLoaded);
     }
 
     private static boolean isModLoaded(String modId) {
-        // Mixin application runs before ModList.init() fills its mod-file index, so query the
-        // early loading list first: it is populated right after the mods folder is scanned.
-        try {
-            var loading = LoadingModList.get();
-            if (loading != null && loading.getModFileById(modId) != null) {
-                return true;
-            }
-        } catch (RuntimeException ignored) {
-            // fall through to the full ModList below
-        }
         try {
             var modList = ModList.get();
             return modList != null && modList.getModFileById(modId) != null;
         } catch (RuntimeException ignored) {
-            // Neither list is usable (e.g. a non-standard loader invokes the plugin before mod
-            // discovery). Prefer skipping optional mixins over force-applying them: that keeps
-            // the game bootable when the target mod is absent.
+            // ModList 不可用时（例如非标准加载器在模组列表就绪前调用了本插件），
+            // 宁可跳过可选 mixin，也不要强制应用：否则在目标模组未安装时会直接崩溃。
             return false;
         }
     }
