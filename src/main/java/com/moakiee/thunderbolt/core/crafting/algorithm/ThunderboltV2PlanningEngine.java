@@ -7,6 +7,7 @@ import appeng.api.networking.IGrid;
 import appeng.api.networking.crafting.ICraftingPlan;
 import appeng.api.stacks.AEKey;
 import appeng.crafting.CraftingPlan;
+import net.minecraft.network.chat.Component;
 import net.minecraft.resources.ResourceLocation;
 
 import com.moakiee.thunderbolt.ThunderboltCore;
@@ -14,10 +15,10 @@ import com.moakiee.thunderbolt.api.crafting.CraftingPlanningEngine;
 import com.moakiee.thunderbolt.api.crafting.PlanningAttempt;
 import com.moakiee.thunderbolt.api.crafting.PlanningEngineSession;
 import com.moakiee.thunderbolt.api.crafting.PlanningRequest;
+import com.moakiee.thunderbolt.core.crafting.pattern.CraftingStockPolicy;
 import com.moakiee.thunderbolt.core.crafting.planner.PlanningMetadataStore;
 import com.moakiee.thunderbolt.core.crafting.planner.ReusableStockUsageKey;
-import com.moakiee.thunderbolt.core.crafting.support.CraftingStockPolicy;
-import com.moakiee.thunderbolt.core.crafting.support.FastCraftingPlanner;
+import com.moakiee.thunderbolt.core.crafting.planner.FastCraftingPlanner;
 
 /** Adapter that exposes Thunderbolt's V2 planner through the multi-algorithm API. */
 public final class ThunderboltV2PlanningEngine implements CraftingPlanningEngine {
@@ -31,6 +32,11 @@ public final class ThunderboltV2PlanningEngine implements CraftingPlanningEngine
     @Override
     public ResourceLocation id() {
         return ID;
+    }
+
+    @Override
+    public Component getName() {
+        return Component.translatable("algorithm.thunderbolt.v2");
     }
 
     @Override

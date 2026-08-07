@@ -7,7 +7,7 @@ import org.spongepowered.asm.mixin.injection.ModifyVariable;
 import appeng.api.networking.crafting.ICraftingPlan;
 import appeng.menu.me.crafting.CraftingPlanSummary;
 
-import com.moakiee.thunderbolt.mixin.ae2.crafting.support.CraftingPlanSummaryAdapter;
+import com.moakiee.thunderbolt.ae2.crafting.CraftingPlanSummaryAdapter;
 
 /**
  * Gives summary-only integrations a concrete AE2 plan while retaining the original plan for

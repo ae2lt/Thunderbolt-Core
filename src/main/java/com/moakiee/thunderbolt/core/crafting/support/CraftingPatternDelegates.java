@@ -1,6 +1,7 @@
 package com.moakiee.thunderbolt.core.crafting.support;
 
 import appeng.api.crafting.IPatternDetails;
+import com.moakiee.thunderbolt.core.crafting.pattern.IProviderLookupPattern;
 import java.util.Collections;
 import java.util.IdentityHashMap;
 import java.util.Objects;

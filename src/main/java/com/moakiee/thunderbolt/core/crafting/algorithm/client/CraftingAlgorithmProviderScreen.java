@@ -2,9 +2,17 @@ package com.moakiee.thunderbolt.core.crafting.algorithm.client;
 
 import net.minecraft.client.gui.GuiGraphics;
 import net.minecraft.client.gui.components.Button;
+import net.minecraft.client.gui.components.Tooltip;
 import net.minecraft.client.gui.screens.inventory.AbstractContainerScreen;
 import net.minecraft.network.chat.Component;
 import net.minecraft.world.entity.player.Inventory;
+import net.neoforged.neoforge.network.PacketDistributor;
+
+import appeng.client.gui.Icon;
+import appeng.client.gui.implementations.AESubScreen;
+import appeng.client.gui.widgets.TabButton;
+import appeng.core.network.serverbound.SwitchGuisPacket;
+import appeng.menu.implementations.PriorityMenu;
 
 import com.moakiee.thunderbolt.core.crafting.algorithm.menu.CraftingAlgorithmProviderMenu;
 
@@ -21,7 +29,7 @@ public final class CraftingAlgorithmProviderScreen
             CraftingAlgorithmProviderMenu menu, Inventory inventory, Component title) {
         super(menu, inventory, title);
         imageWidth = 256;
-        imageHeight = 126;
+        imageHeight = 106;
         titleLabelX = 10;
         titleLabelY = 8;
         inventoryLabelY = 10_000;
@@ -38,22 +46,24 @@ public final class CraftingAlgorithmProviderScreen
                 CraftingAlgorithmProviderMenu.NEXT_ALGORITHM))
                 .bounds(leftPos + imageWidth - 34, y, 24, 20).build());
 
-        int priorityY = topPos + 88;
-        addPriorityButton(leftPos + 10, priorityY, "-10",
-                CraftingAlgorithmProviderMenu.PRIORITY_MINUS_TEN);
-        addPriorityButton(leftPos + 55, priorityY, "-1",
-                CraftingAlgorithmProviderMenu.PRIORITY_MINUS_ONE);
-        addPriorityButton(leftPos + 100, priorityY, "0",
-                CraftingAlgorithmProviderMenu.PRIORITY_RESET);
-        addPriorityButton(leftPos + 145, priorityY, "+1",
-                CraftingAlgorithmProviderMenu.PRIORITY_PLUS_ONE);
-        addPriorityButton(leftPos + 190, priorityY, "+10",
-                CraftingAlgorithmProviderMenu.PRIORITY_PLUS_TEN);
-    }
+        var backLabel = menu.getHost().getMainMenuIcon().getHoverName();
+        var back = new TabButton(Icon.BACK, backLabel, ignored -> AESubScreen.goBack());
+        back.setTooltip(Tooltip.create(backLabel));
+        back.setSize(20, 20);
+        back.setPosition(leftPos + imageWidth - 24, topPos - 5);
+        addRenderableWidget(back);
 
-    private void addPriorityButton(int x, int y, String text, int id) {
-        addRenderableWidget(Button.builder(Component.literal(text), ignored -> sendButton(id))
-                .bounds(x, y, 40, 20).build());
+        var priorityLabel = Component.translatable(
+                "gui.thunderbolt.algorithm_provider.selection_priority");
+        var priority = new TabButton(
+                Icon.PRIORITY,
+                priorityLabel,
+                ignored -> PacketDistributor.sendToServer(
+                        SwitchGuisPacket.openSubMenu(PriorityMenu.TYPE)));
+        priority.setTooltip(Tooltip.create(priorityLabel));
+        priority.setSize(20, 20);
+        priority.setPosition(leftPos + imageWidth - 46, topPos - 5);
+        addRenderableWidget(priority);
     }
 
     private void sendButton(int id) {
@@ -86,16 +96,33 @@ public final class CraftingAlgorithmProviderScreen
         graphics.drawString(font,
                 Component.translatable("gui.thunderbolt.algorithm_provider.algorithm"),
                 10, 27, MUTED, false);
-        var id = menu.selectedAlgorithm().toString();
-        graphics.drawCenteredString(font, id, imageWidth / 2, 47, TEXT);
-        graphics.drawCenteredString(font,
+        drawCenteredString(graphics, menu.selectedAlgorithmName(), 47, TEXT);
+        drawCenteredString(graphics,
                 Component.translatable(menu.selectedAlgorithmIsPublic()
                         ? "gui.thunderbolt.algorithm_provider.public"
                         : "gui.thunderbolt.algorithm_provider.provider_required"),
-                imageWidth / 2, 64, MUTED);
-        graphics.drawCenteredString(font,
+                64, MUTED);
+        Component algorithmPriority;
+        if (menu.selectedAlgorithmIsVanilla()) {
+            algorithmPriority = Component.translatable(
+                    "gui.thunderbolt.algorithm_provider.algorithm_priority.vanilla");
+        } else if (menu.selectedAlgorithmIsKnown()) {
+            algorithmPriority = Component.translatable(
+                    "gui.thunderbolt.algorithm_provider.algorithm_priority",
+                    menu.selectedAlgorithmPriority());
+        } else {
+            algorithmPriority = Component.translatable(
+                    "gui.thunderbolt.algorithm_provider.algorithm_priority.unknown");
+        }
+        drawCenteredString(graphics, algorithmPriority, 77, TEXT);
+        drawCenteredString(graphics,
                 Component.translatable(
-                        "gui.thunderbolt.algorithm_provider.priority", menu.priority()),
-                imageWidth / 2, 77, TEXT);
+                        "gui.thunderbolt.algorithm_provider.player_priority", menu.priority()),
+                88, TEXT);
+    }
+
+    private void drawCenteredString(
+            GuiGraphics graphics, Component text, int y, int color) {
+        graphics.drawString(font, text, (imageWidth - font.width(text)) / 2, y, color, false);
     }
 }

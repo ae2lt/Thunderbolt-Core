@@ -12,8 +12,6 @@ import appeng.api.stacks.GenericStack;
 import appeng.api.stacks.KeyCounter;
 import appeng.crafting.CraftingPlan;
 
-import com.moakiee.thunderbolt.mixin.ae2.crafting.support.CraftingPlanSummaryAdapter;
-
 import org.junit.jupiter.api.Test;
 
 class CraftingPlanSummaryAdapterTest {

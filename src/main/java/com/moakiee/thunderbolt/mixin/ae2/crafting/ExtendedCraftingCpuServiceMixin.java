@@ -265,12 +265,15 @@ public abstract class ExtendedCraftingCpuServiceMixin {
         }
 
         // AE2 has already selected the best concrete cluster. Compare that winner against the
-        // best extended cluster with the same preferred/power/storage order, keeping vanilla on
-        // an exact tie so installing Thunderbolt does not arbitrarily move ordinary jobs.
+        // best extended cluster with the shared priority/preferred/power/storage order. Vanilla
+        // concrete clusters have priority 0; an exact tie stays on vanilla so installing
+        // Thunderbolt does not arbitrarily move ordinary jobs.
         if (cpuCluster == null || CraftingCpuSelectionOrder.compare(
+                extendedCluster.getCpuPriority(),
                 extendedCluster.isPreferredFor(src),
                 extendedCluster.getCoProcessors(),
                 extendedCluster.getAvailableStorage(),
+                0,
                 cpuCluster.isPreferredFor(src),
                 cpuCluster.getCoProcessors(),
                 cpuCluster.getAvailableStorage(),
@@ -431,9 +434,11 @@ public abstract class ExtendedCraftingCpuServiceMixin {
         }
 
         valid.sort((a, b) -> CraftingCpuSelectionOrder.compare(
+                a.getCpuPriority(),
                 a.isPreferredFor(src),
                 a.getCoProcessors(),
                 a.getAvailableStorage(),
+                b.getCpuPriority(),
                 b.isPreferredFor(src),
                 b.getCoProcessors(),
                 b.getAvailableStorage(),

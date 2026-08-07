@@ -54,7 +54,7 @@ public final class ThunderboltCore {
             StorageCells.addCellHandler(IndexedStorageCellHandler.INSTANCE);
             GridServices.register(ICraftingPlanningService.class, CraftingPlanningService.class);
             CraftingPlanningEngines.register(
-                    ThunderboltV2PlanningEngine.INSTANCE, 1_000, true);
+                    ThunderboltV2PlanningEngine.INSTANCE, 1_000, false);
         });
     }
 }

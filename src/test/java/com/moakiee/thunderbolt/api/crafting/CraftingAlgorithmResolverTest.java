@@ -70,27 +70,59 @@ class CraftingAlgorithmResolverTest {
         var resolved = CraftingAlgorithmResolver.resolve(List.of(
                 new CraftingAlgorithmSelection(CraftingPlanningEngines.VANILLA_ID, 100)));
 
+        assertEquals(ResourceLocation.fromNamespaceAndPath("ae2", "vanilla"),
+                CraftingPlanningEngines.VANILLA_ID);
         assertEquals(List.of(PlanningChoice.VANILLA), resolved);
         assertTrue(CraftingPlanningEngines.isPublic(CraftingPlanningEngines.VANILLA_ID));
         assertTrue(CraftingPlanningEngines.getPublic().contains(
                 CraftingPlanningEngines.VANILLA_ID));
+        var missing = id("missing_registration");
+        assertEquals(missing.toString(), CraftingPlanningEngines.getName(missing).getString());
     }
 
     @Test
-    void defaultStateRoundTripsUnknownIdsAndNotifiesOnlyOnEdits() {
+    void defaultStatePreservesUnknownNbtAndNotifiesOnlyOnValidEdits() {
         var changes = new AtomicInteger();
-        var state = new DefaultCraftingAlgorithmProviderState(PUBLIC_HIGH, 4, changes::incrementAndGet);
+        var state = new DefaultCraftingAlgorithmProviderState(
+                PRIVATE_HIGH, 4, changes::incrementAndGet);
         var unknown = id("temporarily_missing");
-        state.setSelection(new CraftingAlgorithmSelection(unknown, -7));
-        state.setSelection(new CraftingAlgorithmSelection(unknown, -7));
+        state.setSelection(new CraftingAlgorithmSelection(PUBLIC_HIGH, -7));
+        state.setSelection(new CraftingAlgorithmSelection(PUBLIC_HIGH, -7));
 
         var tag = new CompoundTag();
-        state.writeToNBT(tag);
-        var loaded = new DefaultCraftingAlgorithmProviderState(PUBLIC_LOW, 0, changes::incrementAndGet);
+        tag.putString("Algorithm", unknown.toString());
+        tag.putInt("Priority", -7);
+        var loaded = new DefaultCraftingAlgorithmProviderState(
+                PRIVATE_HIGH, 0, changes::incrementAndGet);
         loaded.readFromNBT(tag);
 
         assertEquals(new CraftingAlgorithmSelection(unknown, -7), loaded.snapshot());
         assertEquals(1, changes.get());
+    }
+
+    @Test
+    void providerCanSelectOnlyItsOwnAlgorithmOrAPublicAlgorithm() {
+        var state = new DefaultCraftingAlgorithmProviderState(
+                PRIVATE_HIGH, 0, () -> { });
+
+        state.setSelection(new CraftingAlgorithmSelection(PUBLIC_LOW, 9));
+
+        assertEquals(PRIVATE_HIGH, state.getProvidedAlgorithm());
+        assertEquals(new CraftingAlgorithmSelection(PUBLIC_LOW, 9), state.snapshot());
+        assertThrows(IllegalArgumentException.class, () -> state.setSelection(
+                new CraftingAlgorithmSelection(PRIVATE_LOW, 9)));
+    }
+
+    @Test
+    void providerMenuChoicesExcludeOtherNodesPrivateAlgorithms() {
+        var selectable = CraftingPlanningEngines.selectableFor(PRIVATE_LOW);
+
+        assertEquals(List.of(
+                PUBLIC_HIGH,
+                PRIVATE_LOW,
+                PUBLIC_LOW,
+                CraftingPlanningEngines.VANILLA_ID), selectable);
+        assertFalse(selectable.contains(PRIVATE_HIGH));
     }
 
     @Test

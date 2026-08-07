@@ -19,7 +19,7 @@ import appeng.me.service.CraftingService;
 import com.moakiee.thunderbolt.api.crafting.batch.IBatchCraftingProvider;
 import com.moakiee.thunderbolt.api.crafting.batch.BatchDispatchContext;
 import com.moakiee.thunderbolt.api.crafting.batch.BatchDispatchMode;
-import com.moakiee.thunderbolt.api.crafting.batch.BatchCopyLimitPattern;
+import com.moakiee.thunderbolt.core.crafting.batch.BatchCopyLimitPattern;
 import com.moakiee.thunderbolt.core.crafting.support.CraftingPatternDelegates;
 
 public final class BatchExecutor {

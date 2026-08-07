@@ -85,6 +85,19 @@ test {
     }
 }
 
+tasks.register("referenceCapabilityTest", Test) {
+    description = "Runs the planner capability reference kit and prints its auditable result rows."
+    group = "verification"
+    useJUnitPlatform()
+    filter {
+        includeTestsMatching "com.moakiee.thunderbolt.core.crafting.planner.reference.*"
+    }
+    testLogging {
+        events "passed", "skipped", "failed"
+        showStandardStreams = true
+    }
+}
+
 var generateModMetadata = tasks.register("generateModMetadata", ProcessResources) {
     var replaceProperties = [
         minecraft_version      : minecraft_version,

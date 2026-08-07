@@ -33,7 +33,7 @@ CraftingPlanningEngines.register(engine, algorithmPriority, publicAlgorithm);
 - `publicAlgorithm=true`：没有任何提供器节点时仍可参与规划；
 - `publicAlgorithm=false`：必须由至少一个在线节点选择才可参与规划；
 - 重复 ID 不允许替换已有实现或元数据；
-- `thunderbolt:vanilla` 是保留 ID，代表 AE2 原版规划器。
+- `ae2:vanilla` 是保留 ID，代表 AE2 原版规划器。
 
 注册表提供：
 
@@ -44,23 +44,27 @@ CraftingPlanningEngines.isPublic(id);
 CraftingPlanningEngines.allIds();
 ```
 
-`getPublic()` 和 `isPublic()` 都把 `thunderbolt:vanilla` 视为公开算法。Vanilla
+`getPublic()` 和 `isPublic()` 都把 `ae2:vanilla` 视为公开算法。Vanilla
 不注册为普通 `CraftingPlanningEngine`；解析器遇到这个保留 ID 时进入 AE2 原版路径。
 
 ## 3. 最小提供器 API
 
-一个 Grid 节点只选择一个算法：
+一个 Grid 节点固定提供一个私有算法，并在“自己的算法 + 所有公开算法”中选择当前算法：
 
 ```java
 public interface CraftingAlgorithmProvider extends IGridNodeService {
+    ResourceLocation getProvidedAlgorithm();
+
     ResourceLocation getSelectedAlgorithm();
 
     int getPriority();
 }
 ```
 
-提供器可以选择公开算法，包括 Vanilla。含义是为该公开算法赋予这个节点配置的玩家
-优先级，而不是注册第二份算法实现。
+`getProvidedAlgorithm()` 是节点自身提供且不会随 GUI 选择改变的算法。提供器可以选择
+公开算法，包括 Vanilla；含义是为该公开算法赋予这个节点配置的玩家优先级，而不是
+注册第二份算法实现。提供器不能选择其他节点拥有的私有算法，默认 GUI 与 Grid 解析
+都会校验这一限制。
 
 同一算法由多个节点选择时只生成一个候选项，玩家优先级取这些节点中的最大值。
 
@@ -102,7 +106,7 @@ Vanilla 在没有显式节点选择时，算法优先级为最低，因此自然
 
 | 算法 | 公开 | 算法优先级 | 在线提供器优先级 | 有效玩家优先级 |
 | --- | --- | ---: | --- | ---: |
-| Thunderbolt V2 | 是 | 1000 | CPU-A: 20 | 20 |
+| Thunderbolt V2 | 否 | 1000 | 闪电 CPU-A: 20 | 20 |
 | Third Party | 否 | 800 | CPU-B: 30 | 30 |
 | Other Public | 是 | 500 | 无 | 0 |
 | Vanilla | 是 | 最低 | 无 | 0 |

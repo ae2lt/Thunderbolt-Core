@@ -5,9 +5,16 @@ import org.spongepowered.asm.mixin.gen.Accessor;
 
 import appeng.me.service.CraftingService;
 import appeng.me.service.helpers.NetworkCraftingProviders;
+import com.moakiee.thunderbolt.core.crafting.support.CraftingProviderChangeTracker;
 
 @Mixin(value = CraftingService.class, remap = false)
-public interface CraftingServiceAccessor {
+public abstract class CraftingServiceAccessor
+        implements CraftingProviderChangeTracker.ProviderStateView {
     @Accessor("craftingProviders")
-    NetworkCraftingProviders thunderbolt$getCraftingProviders();
+    public abstract NetworkCraftingProviders thunderbolt$getCraftingProviders();
+
+    @Override
+    public long thunderbolt$getCraftingProvidersLastModifiedOnTick() {
+        return thunderbolt$getCraftingProviders().getLastModifiedOnTick();
+    }
 }

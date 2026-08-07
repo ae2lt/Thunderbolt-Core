@@ -13,6 +13,7 @@ public record CraftingPlanningEngineDescriptor(
     public CraftingPlanningEngineDescriptor {
         Objects.requireNonNull(engine, "engine");
         Objects.requireNonNull(engine.id(), "engine.id()");
+        Objects.requireNonNull(engine.getName(), "engine.getName()");
     }
 
     public ResourceLocation id() {

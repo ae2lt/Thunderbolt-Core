@@ -15,15 +15,22 @@ public final class DefaultCraftingAlgorithmProviderState
     private static final String TAG_ALGORITHM = "Algorithm";
     private static final String TAG_PRIORITY = "Priority";
 
+    private final ResourceLocation providedAlgorithm;
     private final CraftingAlgorithmSelection defaultSelection;
     private final Runnable changedCallback;
     private CraftingAlgorithmSelection selection;
 
     public DefaultCraftingAlgorithmProviderState(
             ResourceLocation defaultAlgorithm, int defaultPriority, Runnable changedCallback) {
-        this.defaultSelection = new CraftingAlgorithmSelection(defaultAlgorithm, defaultPriority);
+        this.providedAlgorithm = Objects.requireNonNull(defaultAlgorithm, "defaultAlgorithm");
+        this.defaultSelection = new CraftingAlgorithmSelection(providedAlgorithm, defaultPriority);
         this.selection = defaultSelection;
         this.changedCallback = Objects.requireNonNull(changedCallback, "changedCallback");
+    }
+
+    @Override
+    public ResourceLocation getProvidedAlgorithm() {
+        return providedAlgorithm;
     }
 
     @Override
@@ -44,6 +51,10 @@ public final class DefaultCraftingAlgorithmProviderState
     @Override
     public void setSelection(CraftingAlgorithmSelection selection) {
         var normalized = Objects.requireNonNull(selection, "selection");
+        if (!canSelectAlgorithm(normalized.algorithmId())) {
+            throw new IllegalArgumentException(
+                    "Algorithm provider cannot select " + normalized.algorithmId());
+        }
         if (!this.selection.equals(normalized)) {
             this.selection = normalized;
             changedCallback.run();
@@ -57,6 +68,11 @@ public final class DefaultCraftingAlgorithmProviderState
 
     public void readFromNBT(CompoundTag tag) {
         var algorithm = ResourceLocation.tryParse(tag.getString(TAG_ALGORITHM));
+        if (algorithm != null
+                && CraftingPlanningEngines.isKnown(algorithm)
+                && !canSelectAlgorithm(algorithm)) {
+            algorithm = null;
+        }
         int priority = tag.contains(TAG_PRIORITY) ? tag.getInt(TAG_PRIORITY) : defaultSelection.priority();
         selection = new CraftingAlgorithmSelection(
                 algorithm == null ? defaultSelection.algorithmId() : algorithm,

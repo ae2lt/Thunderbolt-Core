@@ -9,13 +9,14 @@ import java.util.Objects;
 
 import org.jetbrains.annotations.Nullable;
 
+import net.minecraft.network.chat.Component;
 import net.minecraft.resources.ResourceLocation;
 
 /** Process-wide engine registry. Registration is only allowed during mod initialization. */
 public final class CraftingPlanningEngines {
     /** Public sentinel used when a provider explicitly selects AE2's native planner. */
     public static final ResourceLocation VANILLA_ID = ResourceLocation.fromNamespaceAndPath(
-            "thunderbolt", "vanilla");
+            "ae2", "vanilla");
 
     private static final Map<ResourceLocation, CraftingPlanningEngineDescriptor> ENGINES =
             new LinkedHashMap<>();
@@ -82,6 +83,22 @@ public final class CraftingPlanningEngines {
         return List.copyOf(result);
     }
 
+    /** Public algorithms plus the one private algorithm owned by a provider node. */
+    public static List<ResourceLocation> selectableFor(ResourceLocation providedAlgorithm) {
+        Objects.requireNonNull(providedAlgorithm, "providedAlgorithm");
+        var result = new ArrayList<ResourceLocation>(ordered.size() + 1);
+        for (var descriptor : ordered) {
+            if (descriptor.publicAlgorithm() || descriptor.id().equals(providedAlgorithm)) {
+                result.add(descriptor.id());
+            }
+        }
+        if (!VANILLA_ID.equals(providedAlgorithm) && !result.contains(providedAlgorithm)) {
+            result.addFirst(providedAlgorithm);
+        }
+        result.add(VANILLA_ID);
+        return List.copyOf(result);
+    }
+
     /** Public algorithms that do not require a provider node, including vanilla. */
     public static List<ResourceLocation> getPublic() {
         return publicIds;
@@ -101,6 +118,15 @@ public final class CraftingPlanningEngines {
         }
         var descriptor = ENGINES.get(id);
         return descriptor == null ? Integer.MIN_VALUE : descriptor.algorithmPriority();
+    }
+
+    /** Player-facing name, with useful fallbacks for vanilla and unavailable registrations. */
+    public static Component getName(ResourceLocation id) {
+        if (VANILLA_ID.equals(id)) {
+            return Component.translatable("algorithm.thunderbolt.ae2_vanilla");
+        }
+        var descriptor = ENGINES.get(id);
+        return descriptor == null ? Component.literal(id.toString()) : descriptor.engine().getName();
     }
 
     public static boolean isKnown(ResourceLocation id) {

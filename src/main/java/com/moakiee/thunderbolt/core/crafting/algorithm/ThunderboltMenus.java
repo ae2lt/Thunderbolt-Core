@@ -2,7 +2,6 @@ package com.moakiee.thunderbolt.core.crafting.algorithm;
 
 import net.minecraft.core.registries.Registries;
 import net.minecraft.world.inventory.MenuType;
-import net.neoforged.neoforge.common.extensions.IMenuTypeExtension;
 import net.neoforged.neoforge.registries.DeferredHolder;
 import net.neoforged.neoforge.registries.DeferredRegister;
 
@@ -16,7 +15,7 @@ public final class ThunderboltMenus {
     public static final DeferredHolder<MenuType<?>, MenuType<CraftingAlgorithmProviderMenu>>
             CRAFTING_ALGORITHM_PROVIDER = TYPES.register(
                     "crafting_algorithm_provider",
-                    () -> IMenuTypeExtension.create(CraftingAlgorithmProviderMenu::clientCreate));
+                    () -> CraftingAlgorithmProviderMenu.TYPE);
 
     private ThunderboltMenus() {
     }

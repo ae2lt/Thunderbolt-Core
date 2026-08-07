@@ -28,8 +28,11 @@ import com.moakiee.thunderbolt.api.crafting.PlanningAttempt;
 import com.moakiee.thunderbolt.api.crafting.PlanningChoice;
 import com.moakiee.thunderbolt.api.crafting.PlanningEngineSession;
 import com.moakiee.thunderbolt.api.crafting.PlanningRequest;
+import com.moakiee.thunderbolt.core.crafting.algorithm.CraftingAlgorithmCalculationStatus;
 import com.moakiee.thunderbolt.core.crafting.algorithm.CraftingPlanningControl;
 import com.moakiee.thunderbolt.core.crafting.algorithm.ThunderboltV2PlanningEngine;
+import com.moakiee.thunderbolt.core.crafting.plan.LoopCraftingPlan;
+import com.moakiee.thunderbolt.core.crafting.planner.PlanningMetadataStore;
 import com.moakiee.thunderbolt.core.crafting.support.FastCraftingControl;
 import com.moakiee.thunderbolt.core.crafting.support.FastPlanningWatchdog;
 
@@ -157,8 +160,12 @@ public abstract class CraftingCalculationMixin implements CraftingPlanningContro
         var result = cir.getReturnValue();
         if (thunderbolt$selectedSession != null) {
             result = thunderbolt$selectedSession.finish(result);
-            cir.setReturnValue(result);
         }
+        if (result instanceof CraftingPlan craftingPlan) {
+            result = LoopCraftingPlan.wrapIfNeeded(
+                    craftingPlan, PlanningMetadataStore.take(craftingPlan));
+        }
+        cir.setReturnValue(result);
         double wallMs = TimeUnit.NANOSECONDS.toMicros(Math.max(
                 0L, System.nanoTime() - thunderbolt$calculationStartedNanos)) / 1_000.0D;
         ThunderboltCore.LOGGER.info(
@@ -199,13 +206,13 @@ public abstract class CraftingCalculationMixin implements CraftingPlanningContro
             return;
         }
         if (thunderbolt$grid == null || thunderbolt$request == null) {
-            thunderbolt$selectedVanilla = true;
+            thunderbolt$selectVanilla();
             return;
         }
 
         for (var choice : thunderbolt$candidates) {
             if (choice.kind() == PlanningChoice.Kind.VANILLA) {
-                thunderbolt$selectedVanilla = true;
+                thunderbolt$selectVanilla();
                 return;
             }
             var engine = CraftingPlanningEngines.get(choice.engineId());
@@ -227,6 +234,8 @@ public abstract class CraftingCalculationMixin implements CraftingPlanningContro
                 }
                 thunderbolt$selectedEngine = choice.engineId();
                 thunderbolt$selectedSession = candidateSession;
+                CraftingAlgorithmCalculationStatus.select(
+                        simRequester, thunderbolt$selectedEngine);
                 thunderbolt$handle(attempt, simulate, amount, cir);
                 return;
             } catch (CancellationException cancelled) {
@@ -239,7 +248,14 @@ public abstract class CraftingCalculationMixin implements CraftingPlanningContro
                         choice.engineId(), output, amount, simulate, failure);
             }
         }
+        thunderbolt$selectVanilla();
+    }
+
+    @Unique
+    private void thunderbolt$selectVanilla() {
         thunderbolt$selectedVanilla = true;
+        CraftingAlgorithmCalculationStatus.select(
+                simRequester, CraftingPlanningEngines.VANILLA_ID);
     }
 
     @Unique

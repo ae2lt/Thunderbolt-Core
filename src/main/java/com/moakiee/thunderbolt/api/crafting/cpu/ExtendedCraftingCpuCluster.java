@@ -23,6 +23,11 @@ import appeng.crafting.CraftingPlan;
 public interface ExtendedCraftingCpuCluster extends ICraftingCPU {
     boolean isActive();
 
+    /** Player-configured priority used when automatically choosing between crafting CPUs. */
+    default int getCpuPriority() {
+        return 0;
+    }
+
     default boolean isFastPlanningEnabled() {
         return false;
     }

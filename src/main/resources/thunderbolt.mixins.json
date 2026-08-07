@@ -6,6 +6,7 @@
   "compatibilityLevel": "JAVA_21",
   "mixins": [
     "ae2.crafting.CraftingCalculationMixin",
+    "ae2.crafting.CraftConfirmMenuMixin",
     "ae2.crafting.Ae2CraftingTreeCompatibilityMixin",
     "ae2.crafting.CraftingLinkNexusMixin",
     "ae2.crafting.ExtendedCraftingCpuServiceMixin",
@@ -31,6 +32,7 @@
     "compat.advancedae.AaeTaskProgressAccessor"
   ],
   "client": [
+    "ae2.client.CraftConfirmScreenMixin",
     "ae2.client.TooltipsByteAmountMixin"
   ],
   "injectors": {
