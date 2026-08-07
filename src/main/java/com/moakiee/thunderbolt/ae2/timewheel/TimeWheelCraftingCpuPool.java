@@ -9,6 +9,9 @@ import java.util.UUID;
 import java.util.function.Consumer;
 
 import org.jetbrains.annotations.Nullable;
+import org.slf4j.Logger;
+
+import com.mojang.logging.LogUtils;
 
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.HolderLookup;
@@ -42,6 +45,7 @@ import com.moakiee.thunderbolt.ae2.crafting.LoopCraftingPlan;
  * Shared-capacity time-wheel CPU that creates one virtual CPU per crafting job.
  */
 public final class TimeWheelCraftingCpuPool implements ExtendedCraftingCpuCluster {
+    private static final Logger LOGGER = LogUtils.getLogger();
     private static final int PRODUCTIVE_DISPATCH_QUANTUM = 32;
     private static final int DATA_VERSION = 1;
     private static final String TAG_VERSION = "version";
@@ -337,6 +341,18 @@ public final class TimeWheelCraftingCpuPool implements ExtendedCraftingCpuCluste
         activeCpus.clear();
         remainingStorage = totalStorage;
         cpuListChanged = false;
+
+        if (!tag.contains(TAG_VERSION, Tag.TAG_INT)) {
+            LOGGER.warn("Time-wheel CPU pool data is missing the version marker; "
+                    + "keeping an empty pool instead of loading potentially incompatible data.");
+            return;
+        }
+        int version = tag.getInt(TAG_VERSION);
+        if (version > DATA_VERSION) {
+            LOGGER.warn("Time-wheel CPU pool data version {} is newer than the supported "
+                    + "version {}; keeping an empty pool instead of loading it.", version, DATA_VERSION);
+            return;
+        }
 
         var cpuList = tag.getList(TAG_CPUS, Tag.TAG_COMPOUND);
         for (int i = 0; i < cpuList.size(); i++) {

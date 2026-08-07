@@ -2,6 +2,10 @@ package com.moakiee.thunderbolt.ae2.overload.pattern;
 
 import java.util.Objects;
 
+import org.slf4j.Logger;
+
+import com.mojang.logging.LogUtils;
+
 import net.minecraft.nbt.CompoundTag;
 import net.minecraft.nbt.ListTag;
 import net.minecraft.nbt.Tag;
@@ -16,6 +20,7 @@ import com.moakiee.thunderbolt.ae2.overload.model.OverloadPatternSlot;
  * This keeps item persistence concerns out of the model objects themselves.
  */
 public final class OverloadPatternPayloadTagCodec {
+    private static final Logger LOGGER = LogUtils.getLogger();
     private static final String TAG_HOST_KIND = "HostKind";
     private static final String TAG_SOURCE_PATTERN = "SourcePattern";
     private static final String TAG_RULES = "Rules";
@@ -40,7 +45,10 @@ public final class OverloadPatternPayloadTagCodec {
     public static OverloadPatternPayload readPayload(CompoundTag tag) {
         Objects.requireNonNull(tag, "tag");
 
-        var hostKind = PatternExecutionHostKind.valueOf(tag.getString(TAG_HOST_KIND));
+        var hostKind = tryParse(
+                PatternExecutionHostKind.class,
+                tag.getString(TAG_HOST_KIND),
+                PatternExecutionHostKind.OVERLOADED_PATTERN_PROVIDER);
         var sourcePattern = SourcePatternSnapshot.fromTag(tag.getCompound(TAG_SOURCE_PATTERN));
         var encodedPattern = readEncodedPattern(tag.getCompound(TAG_RULES));
         return new OverloadPatternPayload(hostKind, sourcePattern, encodedPattern);
@@ -64,7 +72,9 @@ public final class OverloadPatternPayloadTagCodec {
             var inputs = tag.getList(TAG_INPUTS, Tag.TAG_COMPOUND);
             for (int i = 0; i < inputs.size(); i++) {
                 var slotTag = inputs.getCompound(i);
-                builder.input(slotTag.getInt(TAG_SLOT), MatchMode.valueOf(slotTag.getString(TAG_MODE)));
+                builder.input(
+                        slotTag.getInt(TAG_SLOT),
+                        tryParse(MatchMode.class, slotTag.getString(TAG_MODE), MatchMode.STRICT));
             }
         }
 
@@ -72,11 +82,34 @@ public final class OverloadPatternPayloadTagCodec {
             var outputs = tag.getList(TAG_OUTPUTS, Tag.TAG_COMPOUND);
             for (int i = 0; i < outputs.size(); i++) {
                 var slotTag = outputs.getCompound(i);
-                builder.output(slotTag.getInt(TAG_SLOT), MatchMode.valueOf(slotTag.getString(TAG_MODE)));
+                builder.output(
+                        slotTag.getInt(TAG_SLOT),
+                        tryParse(MatchMode.class, slotTag.getString(TAG_MODE), MatchMode.STRICT));
             }
         }
 
         return builder.build();
+    }
+
+    /**
+     * 容错解析枚举：物品 NBT 可能被损坏、手改或在模组版本更迭后残留未知枚举名，
+     * {@code Enum.valueOf} 会对其抛出未捕获的 IllegalArgumentException 并使整份
+     * payload 读取失败。此处降级为语义最保守的默认值并记录一次警告，保证读取
+     * 路径不再因单个坏值而崩溃。
+     */
+    private static <E extends Enum<E>> E tryParse(Class<E> type, String name, E fallback) {
+        if (name == null || name.isEmpty()) {
+            LOGGER.warn("Missing {} value in overload pattern payload; falling back to {}.",
+                    type.getSimpleName(), fallback);
+            return fallback;
+        }
+        try {
+            return Enum.valueOf(type, name);
+        } catch (IllegalArgumentException unknown) {
+            LOGGER.warn("Unknown {} value '{}' in overload pattern payload; falling back to {}.",
+                    type.getSimpleName(), name, fallback);
+            return fallback;
+        }
     }
 
     private static ListTag writeSlots(Iterable<OverloadPatternSlot> slots) {

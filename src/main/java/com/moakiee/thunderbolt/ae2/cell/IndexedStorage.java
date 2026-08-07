@@ -163,8 +163,9 @@ public final class IndexedStorage {
         long sumHi = typeAmountHi.getLong(kt);
         if (sumLo < 0) { sumLo &= Long.MAX_VALUE; sumHi--; }
         if (keyRemoved) {
+            // fastutil addTo returns the PREVIOUS value: the last key of a type sees 1 here.
             int remaining = typeCounts.addTo(kt, -1);
-            if (remaining <= 0) {
+            if (remaining <= 1) {
                 typeCounts.removeInt(kt);
                 typeAmountLo.removeLong(kt);
                 typeAmountHi.removeLong(kt);
