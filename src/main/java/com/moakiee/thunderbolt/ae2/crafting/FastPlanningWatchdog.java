@@ -28,7 +28,7 @@ public final class FastPlanningWatchdog {
     private static final Logger LOG = LoggerFactory.getLogger("thunderbolt-fast-crafting");
 
     private static final long WARN_AFTER_MS = Long.getLong("thunderbolt.watchdogMs", 4_000L);
-    private static final long REPEAT_MS = Long.getLong("thunderbolt.watchdogRepeatMs", 4_000L);
+    private static final long REPEAT_MS = Long.getLong("thunderbolt.watchdogRepeatMs", 30_000L);
 
     private static final Map<Thread, Watch> ACTIVE = new ConcurrentHashMap<>();
     private static volatile ScheduledExecutorService exec;
@@ -47,7 +47,9 @@ public final class FastPlanningWatchdog {
             return;
         }
         long elapsed = System.currentTimeMillis() - watch.startMs;
-        if (elapsed >= WARN_AFTER_MS) {
+        // If the ticker already emitted a full stack dump, the calculation-level completion summary
+        // records the outcome. Avoid printing nearly identical watchdog diagnostics again here.
+        if (elapsed >= WARN_AFTER_MS && watch.lastReportMs == 0L) {
             LOG.warn("[thunderbolt] SLOW crafting calc completed after {}ms\n    {}{}",
                     elapsed, watch.label, formatDiagnostics(watch));
         }

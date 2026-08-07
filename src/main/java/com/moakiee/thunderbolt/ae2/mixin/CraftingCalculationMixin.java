@@ -119,9 +119,11 @@ public abstract class CraftingCalculationMixin implements FastCraftingControl {
         thunderbolt$fastFallbackAttempts = 0;
         thunderbolt$cachedSimulationAttempts = 0;
         thunderbolt$fastFailures = 0;
-        ThunderboltCore.LOGGER.info(
-                "[Thunderbolt Core][crafting-timing] started: output={} requested={} fastEnabled={}",
-                output, requestedAmount, ae2lt$isFastPlanningEnabled());
+        if (ae2lt$isFastPlanningEnabled()) {
+            ThunderboltCore.LOGGER.debug(
+                    "[Thunderbolt Core][crafting-timing] started: output={} requested={}",
+                    output, requestedAmount);
+        }
     }
 
     @Inject(method = "run", at = @At("RETURN"), cancellable = true, remap = false)
@@ -139,14 +141,16 @@ public abstract class CraftingCalculationMixin implements FastCraftingControl {
                 ? 0L
                 : Math.max(0L, System.nanoTime() - thunderbolt$calculationStartedNanos);
         double wallMs = TimeUnit.NANOSECONDS.toMicros(elapsedNanos) / 1_000.0D;
-        ThunderboltCore.LOGGER.info(
-                "[Thunderbolt Core][crafting-timing] finished: output={} requested={} wallMs={} "
-                        + "fastEnabled={} attempts={} fastHandled={} fastFallback={} cachedSimulation={} "
-                        + "fastFailures={} result={}",
-                output, requestedAmount, wallMs, ae2lt$isFastPlanningEnabled(), thunderbolt$attempts,
-                thunderbolt$fastHandledAttempts, thunderbolt$fastFallbackAttempts,
-                thunderbolt$cachedSimulationAttempts, thunderbolt$fastFailures,
-                result == null ? "null" : result.getClass().getSimpleName());
+        if (ae2lt$isFastPlanningEnabled()) {
+            ThunderboltCore.LOGGER.info(
+                    "[Thunderbolt Core][crafting-timing] finished: output={} requested={} wallMs={} "
+                            + "attempts={} fastHandled={} fastFallback={} cachedSimulation={} "
+                            + "fastFailures={} result={}",
+                    output, requestedAmount, wallMs, thunderbolt$attempts,
+                    thunderbolt$fastHandledAttempts, thunderbolt$fastFallbackAttempts,
+                    thunderbolt$cachedSimulationAttempts, thunderbolt$fastFailures,
+                    result == null ? "null" : result.getClass().getSimpleName());
+        }
         thunderbolt$calculationStartedNanos = 0L;
     }
 
