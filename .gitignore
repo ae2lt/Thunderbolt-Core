@@ -50,3 +50,7 @@ libs/*.jar
 /decompiled/
 /unpacked/
 /*.local.md
+
+# Maintenance/self-check artifacts
+/.qoder-cn/
+/*.log
