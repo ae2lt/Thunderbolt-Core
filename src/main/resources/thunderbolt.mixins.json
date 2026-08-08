@@ -1,6 +1,7 @@
 {
   "required": true,
   "minVersion": "0.8.5",
+  "refmap": "thunderbolt.refmap.json",
   "package": "com.moakiee.thunderbolt.ae2.mixin",
   "plugin": "com.moakiee.thunderbolt.ae2.mixin.ThunderboltMixinConfigPlugin",
   "compatibilityLevel": "JAVA_17",
