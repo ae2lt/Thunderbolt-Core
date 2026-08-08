@@ -1,56 +1,41 @@
 package com.moakiee.thunderbolt;
 
+import com.moakiee.thunderbolt.core.util.FastWildcardMatcher;
 import java.util.Collection;
 
-import com.moakiee.thunderbolt.core.util.FastWildcardMatcher;
-
-/** Lightweight host-configured values shared by Thunderbolt's low-level hooks. */
 public final class CoreConfig {
-    /**
-     * Channel capacity granted per overloaded controller by the channel/max-flow grid mixins.
-     * Defaults to 128; the host mod (AE2 Lightning Tech) overwrites it from its own config during
-     * setup via {@link #setChannelsPerController(int)} so the value stays user-configurable.
-     */
-    private static volatile int channelsPerController = 128;
-    private static volatile BatchCopyLimitRules batchCopyLimitRules =
-            new BatchCopyLimitRules(0L, FastWildcardMatcher.empty());
+   private static volatile int channelsPerController = 128;
+   private static volatile CoreConfig.BatchCopyLimitRules batchCopyLimitRules = new CoreConfig.BatchCopyLimitRules(0L, FastWildcardMatcher.empty());
 
-    public static int channelsPerController() {
-        return channelsPerController;
-    }
+   public static int channelsPerController() {
+      return channelsPerController;
+   }
 
-    public static void setChannelsPerController(int value) {
-        channelsPerController = value;
-    }
+   public static void setChannelsPerController(int value) {
+      channelsPerController = value;
+   }
 
-    /**
-     * Returns the immutable, versioned block matcher used by hot-path batch targets.
-     * Callers may cache the result until {@link BatchCopyLimitRules#version()} changes.
-     */
-    public static BatchCopyLimitRules batchCopyLimitRules() {
-        return batchCopyLimitRules;
-    }
+   public static CoreConfig.BatchCopyLimitRules batchCopyLimitRules() {
+      return batchCopyLimitRules;
+   }
 
-    public static synchronized void setBatchCopyLimitedBlocks(
-            Collection<? extends String> patterns) {
-        var current = batchCopyLimitRules;
-        batchCopyLimitRules = new BatchCopyLimitRules(
-                current.version() + 1L,
-                FastWildcardMatcher.compile(patterns));
-    }
+   public static synchronized void setBatchCopyLimitedBlocks(Collection<? extends String> patterns) {
+      CoreConfig.BatchCopyLimitRules current = batchCopyLimitRules;
+      batchCopyLimitRules = new CoreConfig.BatchCopyLimitRules(current.version() + 1L, FastWildcardMatcher.compile(patterns));
+   }
 
-    public record BatchCopyLimitRules(long version, FastWildcardMatcher matcher) {
-        public static final int MATCHED_MAX_COPIES = 1024;
+   private CoreConfig() {
+   }
 
-        public boolean matches(String blockId) {
-            return matcher.matches(blockId);
-        }
+   public static record BatchCopyLimitRules(long version, FastWildcardMatcher matcher) {
+      public static final int MATCHED_MAX_COPIES = 1024;
 
-        public long limit(String blockId) {
-            return matches(blockId) ? MATCHED_MAX_COPIES : Long.MAX_VALUE;
-        }
-    }
+      public boolean matches(String blockId) {
+         return this.matcher.matches(blockId);
+      }
 
-    private CoreConfig() {
-    }
+      public long limit(String blockId) {
+         return this.matches(blockId) ? 1024L : Long.MAX_VALUE;
+      }
+   }
 }

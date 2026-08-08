@@ -1,32 +1,18 @@
 package com.moakiee.thunderbolt.ae2.mixin;
 
-import org.jetbrains.annotations.Nullable;
-import org.spongepowered.asm.mixin.Mixin;
-import org.spongepowered.asm.mixin.Shadow;
-import org.spongepowered.asm.mixin.Unique;
-import org.spongepowered.asm.mixin.injection.At;
-import org.spongepowered.asm.mixin.injection.Inject;
-
-import com.llamalad7.mixinextras.injector.wrapoperation.Operation;
-import com.llamalad7.mixinextras.injector.wrapoperation.WrapOperation;
-import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
-import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
-
-import net.minecraft.core.HolderLookup;
-import net.minecraft.nbt.CompoundTag;
-
 import appeng.api.config.Actionable;
 import appeng.api.crafting.IPatternDetails;
 import appeng.api.networking.crafting.ICraftingProvider;
 import appeng.api.stacks.AEKey;
 import appeng.api.stacks.GenericStack;
 import appeng.api.stacks.KeyCounter;
+import appeng.crafting.CraftingLink;
+import appeng.crafting.execution.CraftingCpuLogic;
 import appeng.crafting.execution.ExecutingCraftingJob;
 import appeng.crafting.inv.ListCraftingInventory;
 import appeng.me.cluster.implementations.CraftingCPUCluster;
-
-import com.moakiee.thunderbolt.ae2.mixin.ElapsedTimeTrackerAccessor;
-import com.moakiee.thunderbolt.ae2.mixin.ExecutingCraftingJobAccessor;
+import com.llamalad7.mixinextras.injector.wrapoperation.Operation;
+import com.llamalad7.mixinextras.injector.wrapoperation.WrapOperation;
 import com.moakiee.thunderbolt.ae2.api.crafting.CraftingPatternDelegates;
 import com.moakiee.thunderbolt.ae2.crafting.FinalOutputAccounting;
 import com.moakiee.thunderbolt.ae2.overload.cpu.InsertContext;
@@ -34,260 +20,247 @@ import com.moakiee.thunderbolt.ae2.overload.cpu.OverloadClaimResult;
 import com.moakiee.thunderbolt.ae2.overload.cpu.OverloadCpuInsertSupport;
 import com.moakiee.thunderbolt.ae2.overload.cpu.OverloadCpuStateManager;
 import com.moakiee.thunderbolt.ae2.overload.cpu.OverloadPatternReference;
+import com.moakiee.thunderbolt.ae2.overload.cpu.PendingOverloadClaim;
 import com.moakiee.thunderbolt.ae2.overload.pattern.OverloadedProviderOnlyPatternDetails;
+import net.minecraft.core.HolderLookup.Provider;
+import net.minecraft.nbt.CompoundTag;
+import java.util.Arrays;
+import org.jetbrains.annotations.Nullable;
+import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.Shadow;
+import org.spongepowered.asm.mixin.Unique;
+import org.spongepowered.asm.mixin.injection.At;
+import org.spongepowered.asm.mixin.injection.Inject;
+import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
+import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
 
-@Mixin(targets = "appeng.crafting.execution.CraftingCpuLogic", remap = false)
+@Mixin(value = CraftingCpuLogic.class, remap = false)
 public abstract class CraftingCpuLogicMixin {
-    @Shadow(remap = false)
-    CraftingCPUCluster cluster;
+   @Shadow(
+      remap = false
+   )
+   CraftingCPUCluster cluster;
+   @Unique
+   @Nullable
+   private InsertContext ae2lt$insertContext;
 
-    @Unique
-    @Nullable
-    private InsertContext ae2lt$insertContext;
+   @Inject(
+      method = {"insert"},
+      at = {@At("HEAD")}
+   )
+   private void ae2lt$beginInsertContext(AEKey what, long amount, Actionable type, CallbackInfoReturnable<Long> cir) {
+      this.ae2lt$insertContext = new InsertContext(what, amount, type);
+   }
 
-    @Inject(method = "insert", at = @At("HEAD"))
-    private void ae2lt$beginInsertContext(AEKey what, long amount, Actionable type,
-                                          CallbackInfoReturnable<Long> cir) {
-        this.ae2lt$insertContext = new InsertContext(what, amount, type);
-    }
+   @WrapOperation(
+      method = {"insert"},
+      at = {@At(
+         value = "INVOKE",
+         target = "Lappeng/crafting/inv/ListCraftingInventory;extract(Lappeng/api/stacks/AEKey;JLappeng/api/config/Actionable;)J",
+         ordinal = 0
+      )},
+      remap = false
+   )
+   private long ae2lt$captureStrictWaitingMatch(ListCraftingInventory waitingFor, AEKey what, long amount, Actionable mode, Operation<Long> original) {
+      long strictMatched = (Long)original.call(new Object[]{waitingFor, what, amount, mode});
+      if (mode == Actionable.SIMULATE && this.ae2lt$insertContext != null) {
+         strictMatched = OverloadCpuInsertSupport.nativeStrictMatch((CraftingCpuLogic)(Object)this, what, strictMatched, waitingFor.list.get(what));
+         this.ae2lt$insertContext.setStrictMatched(strictMatched);
+      }
 
-    @WrapOperation(
-            method = "insert",
-            at = @At(
-                    value = "INVOKE",
-                    target = "Lappeng/crafting/inv/ListCraftingInventory;extract(Lappeng/api/stacks/AEKey;JLappeng/api/config/Actionable;)J",
-                    ordinal = 0
-            ),
-            remap = false
-    )
-    private long ae2lt$captureStrictWaitingMatch(ListCraftingInventory waitingFor, AEKey what, long amount,
-                                                 Actionable mode, Operation<Long> original) {
-        long strictMatched = original.call(waitingFor, what, amount, mode);
-        if (mode == Actionable.SIMULATE && this.ae2lt$insertContext != null) {
-            strictMatched = OverloadCpuInsertSupport.nativeStrictMatch(
-                    (appeng.crafting.execution.CraftingCpuLogic) (Object) this,
-                    what,
-                    strictMatched,
-                    waitingFor.list.get(what));
-            this.ae2lt$insertContext.setStrictMatched(strictMatched);
-        }
-        return strictMatched;
-    }
+      return strictMatched;
+   }
 
-    @Inject(method = "insert", at = @At("RETURN"), cancellable = true)
-    private void ae2lt$claimOverloadRemainder(AEKey what, long amount, Actionable type,
-                                              CallbackInfoReturnable<Long> cir) {
-        var ctx = this.ae2lt$insertContext;
-        this.ae2lt$insertContext = null;
-        if (ctx == null || what == null || ctx.getRequestedAmount() <= 0) {
-            return;
-        }
+   @Inject(
+      method = {"insert"},
+      at = {@At("RETURN")},
+      cancellable = true
+   )
+   private void ae2lt$claimOverloadRemainder(AEKey what, long amount, Actionable type, CallbackInfoReturnable<Long> cir) {
+      InsertContext ctx = this.ae2lt$insertContext;
+      this.ae2lt$insertContext = null;
+      if (ctx != null && what != null && ctx.getRequestedAmount() > 0L) {
+         long remainder = Math.max(0L, ctx.getRequestedAmount() - ctx.getStrictMatched());
+         if (remainder > 0L) {
+            CraftingCpuLogic logic = (CraftingCpuLogic)(Object)this;
+            if (OverloadCpuStateManager.INSTANCE.hasAnyPending(logic)) {
+               OverloadClaimResult preview = OverloadCpuStateManager.INSTANCE.claim(logic, what, remainder, Actionable.SIMULATE);
+               if (preview.claimedAnything()) {
+                  ExecutingCraftingJob job = ((CraftingCpuLogicAccessor)logic).getJob();
+                  if (job != null) {
+                     ExecutingCraftingJobAccessor jobAccessor = (ExecutingCraftingJobAccessor)job;
+                     CraftingLink link = ((ExecutingCraftingJobAccessor)job).getLink();
+                     long requesterLimit = Math.min(preview.claimedForRequester(), Math.max(0L, jobAccessor.getRemainingAmount()));
+                     long requesterAccepted = 0L;
+                     if (requesterLimit > 0L) {
+                        requesterAccepted = link != null ? link.insert(what, requesterLimit, type) : 0L;
+                     }
 
-        long remainder = Math.max(0L, ctx.getRequestedAmount() - ctx.getStrictMatched());
-        if (remainder <= 0) {
-            return;
-        }
+                     long requesterCompleted = FinalOutputAccounting.completedAmount(true, requesterLimit, requesterAccepted);
+                     OverloadClaimResult claims = preview.partitionRequester(requesterLimit, requesterCompleted);
+                     if (type == Actionable.MODULATE) {
+                        claims = OverloadCpuStateManager.INSTANCE.commitPreview(logic, claims);
+                     }
 
-        var logic = (appeng.crafting.execution.CraftingCpuLogic) (Object) this;
-        if (!OverloadCpuStateManager.INSTANCE.hasAnyPending(logic)) {
-            return;
-        }
+                     if (claims.claimedAnything()) {
+                        long supplementalReturn = 0L;
+                        if (type == Actionable.MODULATE) {
+                           this.ae2lt$deductClaimedWaitingFor(job, claims);
+                           long inventoryAccepted = this.ae2lt$applyInventoryClaims(what, claims);
+                           this.ae2lt$applyRequesterClaims(what, claims);
+                           supplementalReturn = FinalOutputAccounting.physicallyAcceptedAmount(
+                              inventoryAccepted, claims.claimedForRequester(), requesterAccepted
+                           );
+                           this.cluster.markDirty();
+                        } else {
+                           supplementalReturn = FinalOutputAccounting.physicallyAcceptedAmount(
+                              claims.claimedForInventory(), claims.claimedForRequester(), requesterAccepted
+                           );
+                        }
 
-        var preview = OverloadCpuStateManager.INSTANCE.claim(
-                logic, what, remainder, Actionable.SIMULATE);
-        if (!preview.claimedAnything()) {
-            return;
-        }
-
-        var job = ((CraftingCpuLogicAccessor) logic).getJob();
-        if (job == null) return;
-        var jobAccessor = (ExecutingCraftingJobAccessor) job;
-        var link = ((ExecutingCraftingJobAccessor) job).getLink();
-        long requesterLimit = Math.min(
-                preview.claimedForRequester(),
-                Math.max(0L, jobAccessor.getRemainingAmount()));
-        long requesterAccepted = 0L;
-        if (requesterLimit > 0) {
-            requesterAccepted = link != null
-                    ? link.insert(what, requesterLimit, type) : 0L;
-        }
-        // Vanilla CraftingCpuLogic completes the offered final output even when
-        // its requester accepts zero and the item falls through to ME storage.
-        long requesterCompleted = FinalOutputAccounting.completedAmount(
-                true, requesterLimit, requesterAccepted);
-        var claims = preview.partitionRequester(
-                requesterLimit, requesterCompleted);
-        if (type == Actionable.MODULATE) {
-            claims = OverloadCpuStateManager.INSTANCE.commitPreview(logic, claims);
-        }
-        if (!claims.claimedAnything()) return;
-
-        long supplementalReturn = 0;
-        if (type == Actionable.MODULATE) {
-            ae2lt$deductClaimedWaitingFor(job, claims);
-            long inventoryAccepted = ae2lt$applyInventoryClaims(what, claims);
-            ae2lt$applyRequesterClaims(what, claims);
-            supplementalReturn = FinalOutputAccounting.physicallyAcceptedAmount(
-                    inventoryAccepted,
-                    claims.claimedForRequester(),
-                    requesterAccepted);
-            cluster.markDirty();
-        } else {
-            supplementalReturn = FinalOutputAccounting.physicallyAcceptedAmount(
-                    claims.claimedForInventory(),
-                    claims.claimedForRequester(),
-                    requesterAccepted);
-        }
-
-        cir.setReturnValue(cir.getReturnValue() + supplementalReturn);
-    }
-
-    @WrapOperation(
-            method = "executeCrafting",
-            at = @At(
-                    value = "INVOKE",
-                    target = "Lappeng/api/networking/crafting/ICraftingProvider;pushPattern(Lappeng/api/crafting/IPatternDetails;[Lappeng/api/stacks/KeyCounter;)Z"
-            ),
-            remap = false
-    )
-    private boolean ae2lt$registerOverloadExpectedOutputs(ICraftingProvider provider, IPatternDetails details,
-                                                          KeyCounter[] inputHolder, Operation<Boolean> original) {
-        var logic = (appeng.crafting.execution.CraftingCpuLogic) (Object) this;
-        var providerDetails = CraftingPatternDelegates.forProviderLookup(details);
-        var overloadDetails = providerDetails instanceof OverloadedProviderOnlyPatternDetails overload
-                ? overload : null;
-        if (overloadDetails == null) {
-            if (OverloadCpuInsertSupport.hasPendingCollisionWithOrdinaryPattern(logic, details)) {
-                return false;
+                        cir.setReturnValue((Long)cir.getReturnValue() + supplementalReturn);
+                     }
+                  }
+               }
             }
-            return original.call(provider, details, inputHolder);
-        }
+         }
+      }
+   }
 
-        var activeJob = ((CraftingCpuLogicAccessor) logic).getJob();
-        if (activeJob == null
-                || OverloadCpuInsertSupport.hasStrictCollisionWithOverloadPattern(
-                        logic,
-                        details,
-                        overloadDetails,
-                        ((ExecutingCraftingJobAccessor) activeJob).getWaitingFor().list)) {
-            return false;
-        }
-        var patternReference = new OverloadPatternReference(
-                overloadDetails.overloadPatternIdentity(),
-                overloadDetails.overloadPatternDetailsView().sourcePattern());
-        if (OverloadCpuStateManager.INSTANCE.hasAmbiguousOutputRegistration(
-                logic,
-                patternReference,
-                overloadDetails.overloadPatternDetailsView())) {
-            return false;
-        }
+   @WrapOperation(
+      method = {"executeCrafting"},
+      at = {@At(
+         value = "INVOKE",
+         target = "Lappeng/api/networking/crafting/ICraftingProvider;pushPattern(Lappeng/api/crafting/IPatternDetails;[Lappeng/api/stacks/KeyCounter;)Z"
+      )},
+      remap = false
+   )
+   private boolean ae2lt$registerOverloadExpectedOutputs(
+      ICraftingProvider provider, IPatternDetails details, KeyCounter[] inputHolder, Operation<Boolean> original
+   ) {
+      CraftingCpuLogic logic = (CraftingCpuLogic)(Object)this;
+      OverloadedProviderOnlyPatternDetails overloadDetails = CraftingPatternDelegates.forProviderLookup(details) instanceof OverloadedProviderOnlyPatternDetails overload
+         ? overload
+         : null;
+      if (overloadDetails == null) {
+         return OverloadCpuInsertSupport.hasPendingCollisionWithOrdinaryPattern(logic, details)
+            ? false
+            : (Boolean)original.call(new Object[]{provider, details, inputHolder});
+      } else {
+         ExecutingCraftingJob activeJob = ((CraftingCpuLogicAccessor)logic).getJob();
+         if (activeJob != null
+            && !OverloadCpuInsertSupport.hasStrictCollisionWithOverloadPattern(
+               logic, details, overloadDetails, ((ExecutingCraftingJobAccessor)activeJob).getWaitingFor().list
+            )) {
+            OverloadPatternReference patternReference = new OverloadPatternReference(
+               overloadDetails.overloadPatternIdentity(), overloadDetails.overloadPatternDetailsView().sourcePattern()
+            );
+            if (OverloadCpuStateManager.INSTANCE.hasAmbiguousOutputRegistration(logic, patternReference, overloadDetails.overloadPatternDetailsView())) {
+               return false;
+            } else {
+               boolean pushed = (Boolean)original.call(new Object[]{provider, details, inputHolder});
+               if (pushed) {
+                  ExecutingCraftingJob job = ((CraftingCpuLogicAccessor)logic).getJob();
+                  GenericStack finalOutput = job != null ? ((ExecutingCraftingJobAccessor)job).getFinalOutput() : null;
+                  AEKey finalOutputKey = finalOutput != null ? finalOutput.what() : null;
+                  OverloadCpuStateManager.INSTANCE
+                     .registerExpectedOutputs(logic, patternReference, overloadDetails.overloadPatternDetailsView(), Arrays.asList(details.getOutputs()), finalOutputKey, 1L);
+               }
 
-        boolean pushed = original.call(provider, details, inputHolder);
-        if (pushed) {
-            var job = ((CraftingCpuLogicAccessor) logic).getJob();
-            var finalOutput = job != null
-                    ? ((ExecutingCraftingJobAccessor) job).getFinalOutput()
-                    : null;
-            var finalOutputKey = finalOutput != null ? finalOutput.what() : null;
-            OverloadCpuStateManager.INSTANCE.registerExpectedOutputs(
-                    logic,
-                    patternReference,
-                    overloadDetails.overloadPatternDetailsView(),
-                    details.getOutputs(),
-                    finalOutputKey,
-                    1L);
-        }
-        return pushed;
-    }
-
-    @Inject(method = "writeToNBT", at = @At("RETURN"))
-    private void ae2lt$writeOverloadState(CompoundTag data, HolderLookup.Provider registries, CallbackInfo ci) {
-        var logic = (appeng.crafting.execution.CraftingCpuLogic) (Object) this;
-        var overloadStateTag = OverloadCpuStateManager.INSTANCE.writeToTag(logic, registries);
-        if (overloadStateTag != null) {
-            data.put("ae2ltOverloadState", overloadStateTag);
-        } else {
-            data.remove("ae2ltOverloadState");
-        }
-    }
-
-    @Inject(method = "readFromNBT", at = @At("RETURN"))
-    private void ae2lt$readOverloadState(CompoundTag data, HolderLookup.Provider registries, CallbackInfo ci) {
-        var logic = (appeng.crafting.execution.CraftingCpuLogic) (Object) this;
-        OverloadCpuStateManager.INSTANCE.clear(logic);
-        var job = ((CraftingCpuLogicAccessor) logic).getJob();
-        if (job != null && data.contains("ae2ltOverloadState", CompoundTag.TAG_COMPOUND)) {
-            OverloadCpuStateManager.INSTANCE.readFromTag(logic, data.getCompound("ae2ltOverloadState"), registries);
-        }
-    }
-
-    @Inject(method = "finishJob", at = @At("HEAD"))
-    private void ae2lt$clearOverloadState(boolean success, CallbackInfo ci) {
-        OverloadCpuStateManager.INSTANCE.clear((appeng.crafting.execution.CraftingCpuLogic) (Object) this);
-    }
-
-    @Unique
-    private long ae2lt$applyInventoryClaims(AEKey incoming, OverloadClaimResult claims) {
-        long claimed = claims.claimedForInventory();
-        if (claimed <= 0) {
-            return 0;
-        }
-
-        var logic = (appeng.crafting.execution.CraftingCpuLogic) (Object) this;
-        var job = ((CraftingCpuLogicAccessor) logic).getJob();
-        if (job == null) {
-            return 0;
-        }
-
-        var jobAccessor = (ExecutingCraftingJobAccessor) job;
-        ((ElapsedTimeTrackerAccessor) jobAccessor.getTimeTracker()).invokeDecrementItems(
-                claimed,
-                incoming.getType());
-        logic.getInventory().insert(incoming, claimed, Actionable.MODULATE);
-        return claimed;
-    }
-
-    @Unique
-    private void ae2lt$applyRequesterClaims(AEKey incoming, OverloadClaimResult claims) {
-        long claimed = claims.claimedForRequester();
-        if (claimed <= 0) {
-            return;
-        }
-
-        var logic = (appeng.crafting.execution.CraftingCpuLogic) (Object) this;
-        var logicAccessor = (CraftingCpuLogicAccessor) logic;
-        ExecutingCraftingJob job = logicAccessor.getJob();
-        if (job == null) {
-            return;
-        }
-
-        var jobAccessor = (ExecutingCraftingJobAccessor) job;
-        ((ElapsedTimeTrackerAccessor) jobAccessor.getTimeTracker()).invokeDecrementItems(
-                claimed,
-                incoming.getType());
-        logicAccessor.invokePostChange(incoming);
-
-        long remaining = Math.max(0L, jobAccessor.getRemainingAmount() - claimed);
-        jobAccessor.setRemainingAmount(remaining);
-
-        if (remaining <= 0) {
-            logicAccessor.invokeFinishJob(true);
-            cluster.updateOutput(null);
-        } else {
-            GenericStack finalOutput = jobAccessor.getFinalOutput();
-            if (finalOutput != null) {
-                cluster.updateOutput(new GenericStack(finalOutput.what(), remaining));
+               return pushed;
             }
-        }
+         } else {
+            return false;
+         }
+      }
+   }
 
-    }
+   @Inject(
+      method = {"writeToNBT"},
+      at = {@At("RETURN")}
+   )
+   private void ae2lt$writeOverloadState(CompoundTag data, Provider registries, CallbackInfo ci) {
+      CraftingCpuLogic logic = (CraftingCpuLogic)(Object)this;
+      CompoundTag overloadStateTag = OverloadCpuStateManager.INSTANCE.writeToTag(logic, registries);
+      if (overloadStateTag != null) {
+         data.put("ae2ltOverloadState", overloadStateTag);
+      } else {
+         data.remove("ae2ltOverloadState");
+      }
+   }
 
-    @Unique
-    private void ae2lt$deductClaimedWaitingFor(ExecutingCraftingJob job, OverloadClaimResult claims) {
-        var waitingFor = ((ExecutingCraftingJobAccessor) job).getWaitingFor();
-        for (var claim : claims.claims()) {
-            waitingFor.extract(claim.exactExpectedKey(), claim.claimedAmount(), Actionable.MODULATE);
-        }
-    }
+   @Inject(
+      method = {"readFromNBT"},
+      at = {@At("RETURN")}
+   )
+   private void ae2lt$readOverloadState(CompoundTag data, Provider registries, CallbackInfo ci) {
+      CraftingCpuLogic logic = (CraftingCpuLogic)(Object)this;
+      OverloadCpuStateManager.INSTANCE.clear(logic);
+      ExecutingCraftingJob job = ((CraftingCpuLogicAccessor)logic).getJob();
+      if (job != null && data.contains("ae2ltOverloadState", 10)) {
+         OverloadCpuStateManager.INSTANCE.readFromTag(logic, data.getCompound("ae2ltOverloadState"), registries);
+      }
+   }
 
+   @Inject(
+      method = {"finishJob"},
+      at = {@At("HEAD")}
+   )
+   private void ae2lt$clearOverloadState(boolean success, CallbackInfo ci) {
+      OverloadCpuStateManager.INSTANCE.clear((CraftingCpuLogic)(Object)this);
+   }
+
+   @Unique
+   private long ae2lt$applyInventoryClaims(AEKey incoming, OverloadClaimResult claims) {
+      long claimed = claims.claimedForInventory();
+      if (claimed <= 0L) {
+         return 0L;
+      } else {
+         CraftingCpuLogic logic = (CraftingCpuLogic)(Object)this;
+         ExecutingCraftingJob job = ((CraftingCpuLogicAccessor)logic).getJob();
+         if (job == null) {
+            return 0L;
+         } else {
+            ExecutingCraftingJobAccessor jobAccessor = (ExecutingCraftingJobAccessor)job;
+            ((ElapsedTimeTrackerAccessor)jobAccessor.getTimeTracker()).invokeDecrementItems(claimed, incoming.getType());
+            logic.getInventory().insert(incoming, claimed, Actionable.MODULATE);
+            return claimed;
+         }
+      }
+   }
+
+   @Unique
+   private void ae2lt$applyRequesterClaims(AEKey incoming, OverloadClaimResult claims) {
+      long claimed = claims.claimedForRequester();
+      if (claimed > 0L) {
+         CraftingCpuLogic logic = (CraftingCpuLogic)(Object)this;
+         CraftingCpuLogicAccessor logicAccessor = (CraftingCpuLogicAccessor)logic;
+         ExecutingCraftingJob job = logicAccessor.getJob();
+         if (job != null) {
+            ExecutingCraftingJobAccessor jobAccessor = (ExecutingCraftingJobAccessor)job;
+            ((ElapsedTimeTrackerAccessor)jobAccessor.getTimeTracker()).invokeDecrementItems(claimed, incoming.getType());
+            logicAccessor.invokePostChange(incoming);
+            long remaining = Math.max(0L, jobAccessor.getRemainingAmount() - claimed);
+            jobAccessor.setRemainingAmount(remaining);
+            if (remaining <= 0L) {
+               logicAccessor.invokeFinishJob(true);
+               this.cluster.updateOutput(null);
+            } else {
+               GenericStack finalOutput = jobAccessor.getFinalOutput();
+               if (finalOutput != null) {
+                  this.cluster.updateOutput(new GenericStack(finalOutput.what(), remaining));
+               }
+            }
+         }
+      }
+   }
+
+   @Unique
+   private void ae2lt$deductClaimedWaitingFor(ExecutingCraftingJob job, OverloadClaimResult claims) {
+      ListCraftingInventory waitingFor = ((ExecutingCraftingJobAccessor)job).getWaitingFor();
+
+      for (PendingOverloadClaim claim : claims.claims()) {
+         waitingFor.extract(claim.exactExpectedKey(), claim.claimedAmount(), Actionable.MODULATE);
+      }
+   }
 }

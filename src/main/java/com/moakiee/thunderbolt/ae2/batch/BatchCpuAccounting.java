@@ -1,63 +1,78 @@
 package com.moakiee.thunderbolt.ae2.batch;
 
 public final class BatchCpuAccounting {
-    private BatchCpuAccounting() {
-    }
+   private BatchCpuAccounting() {
+   }
 
-    public enum Mode {
-        LINEAR,
-        QUADRATIC,
-        /** One successful provider call costs one dispatch, regardless of accepted copies. */
-        SUCCESSFUL_DISPATCH
-    }
+   public static long maxCopiesForCpuOps(int cpuOps, BatchCpuAccounting.Mode mode) {
+      if (cpuOps <= 0) {
+         return 0L;
+      } else if (mode == BatchCpuAccounting.Mode.LINEAR) {
+         return (long)cpuOps;
+      } else {
+         return mode == BatchCpuAccounting.Mode.SUCCESSFUL_DISPATCH ? Long.MAX_VALUE : (long)cpuOps * (long)cpuOps;
+      }
+   }
 
-    public static long maxCopiesForCpuOps(int cpuOps, Mode mode) {
-        if (cpuOps <= 0) return 0;
-        if (mode == Mode.LINEAR) return cpuOps;
-        if (mode == Mode.SUCCESSFUL_DISPATCH) return Long.MAX_VALUE;
-        return (long) cpuOps * cpuOps;
-    }
+   public static long maxCopiesForBatch(int remainingCpuOps, int maxBatchOps, long remainingCopies, BatchCpuAccounting.Mode mode) {
+      if (remainingCpuOps <= 0 || maxBatchOps <= 0 || remainingCopies <= 0L) {
+         return 0L;
+      } else if (mode == BatchCpuAccounting.Mode.SUCCESSFUL_DISPATCH) {
+         return remainingCopies;
+      } else {
+         int batchOps = Math.min(remainingCpuOps, maxBatchOps);
+         return Math.min(maxCopiesForCpuOps(batchOps, mode), remainingCopies);
+      }
+   }
 
-    public static long maxCopiesForBatch(
-            int remainingCpuOps, int maxBatchOps, long remainingCopies, Mode mode) {
-        if (remainingCpuOps <= 0 || maxBatchOps <= 0 || remainingCopies <= 0L) return 0L;
-        if (mode == Mode.SUCCESSFUL_DISPATCH) return remainingCopies;
-        int batchOps = Math.min(remainingCpuOps, maxBatchOps);
-        return Math.min(maxCopiesForCpuOps(batchOps, mode), remainingCopies);
-    }
+   public static int cpuOpsForCopies(int copies, BatchCpuAccounting.Mode mode) {
+      return cpuOpsForCopies((long)copies, mode);
+   }
 
-    public static int cpuOpsForCopies(int copies, Mode mode) {
-        return cpuOpsForCopies((long) copies, mode);
-    }
+   public static int cpuOpsForCopies(long copies, BatchCpuAccounting.Mode mode) {
+      if (copies <= 0L) {
+         return 0;
+      } else if (mode == BatchCpuAccounting.Mode.LINEAR) {
+         return copies >= 2147483647L ? Integer.MAX_VALUE : (int)copies;
+      } else {
+         return mode == BatchCpuAccounting.Mode.SUCCESSFUL_DISPATCH ? 1 : cpuOpsForCopies(copies);
+      }
+   }
 
-    public static int cpuOpsForCopies(long copies, Mode mode) {
-        if (copies <= 0) return 0;
-        if (mode == Mode.LINEAR) return copies >= Integer.MAX_VALUE ? Integer.MAX_VALUE : (int) copies;
-        if (mode == Mode.SUCCESSFUL_DISPATCH) return 1;
-        return cpuOpsForCopies(copies);
-    }
+   public static long maxCopiesForCpuOps(int cpuOps) {
+      return cpuOps <= 0 ? 0L : (long)cpuOps * (long)cpuOps;
+   }
 
-    public static long maxCopiesForCpuOps(int cpuOps) {
-        if (cpuOps <= 0) return 0;
-        return (long) cpuOps * cpuOps;
-    }
+   public static int cpuOpsForCopies(int copies) {
+      return cpuOpsForCopies((long)copies);
+   }
 
-    public static int cpuOpsForCopies(int copies) {
-        return cpuOpsForCopies((long) copies);
-    }
+   public static int cpuOpsForCopies(long copies) {
+      if (copies <= 0L) {
+         return 0;
+      } else {
+         long maxRepresentableCopies = 4611686014132420609L;
+         if (copies >= maxRepresentableCopies) {
+            return Integer.MAX_VALUE;
+         } else {
+            long root = (long)Math.sqrt((double)copies);
 
-    public static int cpuOpsForCopies(long copies) {
-        if (copies <= 0) return 0;
-        long maxRepresentableCopies = (long) Integer.MAX_VALUE * Integer.MAX_VALUE;
-        if (copies >= maxRepresentableCopies) return Integer.MAX_VALUE;
+            while (root * root < copies) {
+               root++;
+            }
 
-        long root = (long) Math.sqrt(copies);
-        while (root * root < copies) {
-            root++;
-        }
-        while (root > 0 && (root - 1) * (root - 1) >= copies) {
-            root--;
-        }
-        return (int) root;
-    }
+            while (root > 0L && (root - 1L) * (root - 1L) >= copies) {
+               root--;
+            }
+
+            return (int)root;
+         }
+      }
+   }
+
+   public static enum Mode {
+      LINEAR,
+      QUADRATIC,
+      SUCCESSFUL_DISPATCH;
+   }
 }

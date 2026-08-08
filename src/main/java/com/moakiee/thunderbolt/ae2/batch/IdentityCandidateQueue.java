@@ -4,104 +4,122 @@ import java.util.IdentityHashMap;
 import java.util.Iterator;
 import java.util.NoSuchElementException;
 
-/** Identity-based active candidate queue with O(1) permanent removal and success affinity. */
 final class IdentityCandidateQueue<T> implements Iterable<T> {
-    private final IdentityHashMap<T, Node<T>> active = new IdentityHashMap<>();
-    private final IdentityHashMap<T, Boolean> blocked = new IdentityHashMap<>();
-    private Node<T> head;
-    private Node<T> tail;
-    private T preferred;
+   private final IdentityHashMap<T, IdentityCandidateQueue.Node<T>> active = new IdentityHashMap<>();
+   private final IdentityHashMap<T, Boolean> blocked = new IdentityHashMap<>();
+   private IdentityCandidateQueue.Node<T> head;
+   private IdentityCandidateQueue.Node<T> tail;
+   private T preferred;
 
-    IdentityCandidateQueue(Iterable<? extends T> candidates) {
-        for (var candidate : candidates) {
-            if (candidate == null || active.containsKey(candidate)) continue;
-            var node = new Node<>(candidate);
-            active.put(candidate, node);
-            if (tail == null) {
-                head = tail = node;
+   IdentityCandidateQueue(Iterable<? extends T> candidates) {
+      for (T candidate : candidates) {
+         if (candidate != null && !this.active.containsKey(candidate)) {
+            IdentityCandidateQueue.Node<T> node = new IdentityCandidateQueue.Node<>(candidate);
+            this.active.put(candidate, node);
+            if (this.tail == null) {
+               this.head = this.tail = node;
             } else {
-                tail.next = node;
-                node.previous = tail;
-                tail = node;
+               this.tail.next = node;
+               node.previous = this.tail;
+               this.tail = node;
             }
-        }
-    }
+         }
+      }
+   }
 
-    void block(T candidate) {
-        blocked.put(candidate, Boolean.TRUE);
-        var node = active.remove(candidate);
-        if (node != null) {
-            if (node.previous != null) node.previous.next = node.next;
-            else head = node.next;
-            if (node.next != null) node.next.previous = node.previous;
-            else tail = node.previous;
-            // Existing iterators use the removed node's old next link to advance once, then reject
-            // it through active membership. Do not sever the links here.
-        }
-        if (preferred == candidate) preferred = null;
-    }
+   void block(T candidate) {
+      this.blocked.put(candidate, Boolean.TRUE);
+      IdentityCandidateQueue.Node<T> node = this.active.remove(candidate);
+      if (node != null) {
+         if (node.previous != null) {
+            node.previous.next = node.next;
+         } else {
+            this.head = node.next;
+         }
 
-    void markSuccess(T candidate) {
-        if (active.containsKey(candidate)) preferred = candidate;
-    }
+         if (node.next != null) {
+            node.next.previous = node.previous;
+         } else {
+            this.tail = node.previous;
+         }
+      }
 
-    boolean isBlocked(T candidate) {
-        return blocked.containsKey(candidate);
-    }
+      if (this.preferred == candidate) {
+         this.preferred = null;
+      }
+   }
 
-    int activeCount() {
-        return active.size();
-    }
+   void markSuccess(T candidate) {
+      if (this.active.containsKey(candidate)) {
+         this.preferred = candidate;
+      }
+   }
 
-    int blockedCount() {
-        return blocked.size();
-    }
+   boolean isBlocked(T candidate) {
+      return this.blocked.containsKey(candidate);
+   }
 
-    @Override
-    public Iterator<T> iterator() {
-        return new Iterator<>() {
-            private final T preferredFirst = preferred;
-            private boolean preferredVisited;
-            private Node<T> cursor = head;
-            private T next;
+   int activeCount() {
+      return this.active.size();
+   }
 
-            @Override
-            public boolean hasNext() {
-                while (next == null) {
-                    if (!preferredVisited) {
-                        preferredVisited = true;
-                        if (preferredFirst != null && active.containsKey(preferredFirst)) {
-                            next = preferredFirst;
-                            break;
-                        }
-                    }
-                    if (cursor == null) break;
-                    var candidate = cursor.value;
-                    cursor = cursor.next;
-                    if (candidate != preferredFirst && active.containsKey(candidate)) {
-                        next = candidate;
-                    }
-                }
-                return next != null;
+   int blockedCount() {
+      return this.blocked.size();
+   }
+
+   @Override
+   public Iterator<T> iterator() {
+      return new Iterator<T>() {
+         private final T preferredFirst = IdentityCandidateQueue.this.preferred;
+         private boolean preferredVisited;
+         private IdentityCandidateQueue.Node<T> cursor = IdentityCandidateQueue.this.head;
+         private T next;
+
+         @Override
+         public boolean hasNext() {
+            while (this.next == null) {
+               if (!this.preferredVisited) {
+                  this.preferredVisited = true;
+                  if (this.preferredFirst != null && IdentityCandidateQueue.this.active.containsKey(this.preferredFirst)) {
+                     this.next = this.preferredFirst;
+                     break;
+                  }
+               }
+
+               if (this.cursor == null) {
+                  break;
+               }
+
+               T candidate = this.cursor.value;
+               this.cursor = this.cursor.next;
+               if (candidate != this.preferredFirst && IdentityCandidateQueue.this.active.containsKey(candidate)) {
+                  this.next = candidate;
+               }
             }
 
-            @Override
-            public T next() {
-                if (!hasNext()) throw new NoSuchElementException();
-                var result = next;
-                next = null;
-                return result;
+            return this.next != null;
+         }
+
+         @Override
+         public T next() {
+            if (!this.hasNext()) {
+               throw new NoSuchElementException();
+            } else {
+               T result = this.next;
+               this.next = null;
+               return result;
             }
-        };
-    }
+         }
+      };
+   }
 
-    private static final class Node<T> {
-        private final T value;
-        private Node<T> previous;
-        private Node<T> next;
+   private static final class Node<T> {
+      private final T value;
+      private IdentityCandidateQueue.Node<T> previous;
+      private IdentityCandidateQueue.Node<T> next;
 
-        private Node(T value) {
-            this.value = value;
-        }
-    }
+      private Node(T value) {
+         this.value = value;
+      }
+   }
 }

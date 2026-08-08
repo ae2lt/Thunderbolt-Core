@@ -1,33 +1,29 @@
 package com.moakiee.thunderbolt.ae2.overload.pattern;
 
 import java.util.Objects;
-
 import net.minecraft.world.item.ItemStack;
 
-/**
- * One parsed output slot from a plain pattern before overload rules are applied.
- * <p>
- * {@code primaryOutput} identifies outputs that should be treated as the main
- * result. Non-primary outputs remain first-class outputs and may represent
- * secondary or intermediate products for later CPU matching logic.
- */
 public record ParsedPatternOutput(int slotIndex, ItemStack stack, boolean primaryOutput) {
-    public ParsedPatternOutput {
-        if (slotIndex < 0) {
-            throw new IllegalArgumentException("slotIndex must be >= 0");
-        }
-        Objects.requireNonNull(stack, "stack");
-        if (stack.isEmpty()) {
+   public ParsedPatternOutput(int slotIndex, ItemStack stack, boolean primaryOutput) {
+      if (slotIndex < 0) {
+         throw new IllegalArgumentException("slotIndex must be >= 0");
+      } else {
+         Objects.requireNonNull(stack, "stack");
+         if (stack.isEmpty()) {
             throw new IllegalArgumentException("output stack must not be empty");
-        }
-    }
+         } else {
+            this.slotIndex = slotIndex;
+            this.stack = stack;
+            this.primaryOutput = primaryOutput;
+         }
+      }
+   }
 
-    @Override
-    public ItemStack stack() {
-        return stack.copy();
-    }
+   public ItemStack stack() {
+      return this.stack.copy();
+   }
 
-    public int amountPerCraft() {
-        return stack.getCount();
-    }
+   public int amountPerCraft() {
+      return this.stack.getCount();
+   }
 }

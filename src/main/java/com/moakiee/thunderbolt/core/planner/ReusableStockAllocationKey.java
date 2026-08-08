@@ -2,10 +2,11 @@ package com.moakiee.thunderbolt.core.planner;
 
 import java.util.Objects;
 
-/** Exact physical variant assigned to one logical reusable-stock route. */
 public record ReusableStockAllocationKey<K>(ReusableStockRouteKey<K> route, K actualKey) {
-    public ReusableStockAllocationKey {
-        Objects.requireNonNull(route, "route");
-        Objects.requireNonNull(actualKey, "actualKey");
-    }
+   public ReusableStockAllocationKey(ReusableStockRouteKey<K> route, K actualKey) {
+      Objects.requireNonNull(route, "route");
+      Objects.requireNonNull(actualKey, "actualKey");
+      this.route = route;
+      this.actualKey = actualKey;
+   }
 }

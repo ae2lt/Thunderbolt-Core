@@ -1,26 +1,17 @@
 package com.moakiee.thunderbolt.ae2.overload.cpu;
 
+import com.moakiee.thunderbolt.ae2.overload.pattern.SourcePatternSnapshot;
 import java.util.Objects;
 
-import com.moakiee.thunderbolt.ae2.overload.pattern.SourcePatternSnapshot;
-
-/**
- * Stable reference to one overload pattern definition as seen by the CPU-side
- * overload tracking layer.
- * <p>
- * The exact fingerprinting strategy can be refined later. For now, the manager
- * only needs a stable per-pattern identity within one crafting job plus the
- * source plain-pattern snapshot for diagnostics and future persistence.
- */
-public record OverloadPatternReference(
-        String patternIdentity,
-        SourcePatternSnapshot sourcePattern
-) {
-    public OverloadPatternReference {
-        Objects.requireNonNull(patternIdentity, "patternIdentity");
-        if (patternIdentity.isBlank()) {
-            throw new IllegalArgumentException("patternIdentity must not be blank");
-        }
-        Objects.requireNonNull(sourcePattern, "sourcePattern");
-    }
+public record OverloadPatternReference(String patternIdentity, SourcePatternSnapshot sourcePattern) {
+   public OverloadPatternReference(String patternIdentity, SourcePatternSnapshot sourcePattern) {
+      Objects.requireNonNull(patternIdentity, "patternIdentity");
+      if (patternIdentity.isBlank()) {
+         throw new IllegalArgumentException("patternIdentity must not be blank");
+      } else {
+         Objects.requireNonNull(sourcePattern, "sourcePattern");
+         this.patternIdentity = patternIdentity;
+         this.sourcePattern = sourcePattern;
+      }
+   }
 }

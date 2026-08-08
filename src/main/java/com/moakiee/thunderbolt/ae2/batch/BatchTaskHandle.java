@@ -3,9 +3,9 @@ package com.moakiee.thunderbolt.ae2.batch;
 import appeng.api.crafting.IPatternDetails;
 
 public interface BatchTaskHandle {
-    IPatternDetails details();
+   IPatternDetails details();
 
-    long getValue();
+   long getValue();
 
-    void setValue(long value);
+   void setValue(long var1);
 }

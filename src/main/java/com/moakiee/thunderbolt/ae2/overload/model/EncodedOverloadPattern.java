@@ -1,7 +1,7 @@
 package com.moakiee.thunderbolt.ae2.overload.model;
 
-import java.util.Collections;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -9,123 +9,99 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.TreeMap;
 
-/**
- * Immutable overload-specific configuration stored alongside a pattern.
- * <p>
- * The actual encoded recipe payload still belongs to AE2's pattern item. This
- * object only carries overload matching metadata for each logical input/output
- * slot and can be attached to a future item component or custom data payload.
- */
 public final class EncodedOverloadPattern {
-    private static final EncodedOverloadPattern EMPTY = new EncodedOverloadPattern(List.of(), List.of());
+   private static final EncodedOverloadPattern EMPTY = new EncodedOverloadPattern(List.of(), List.of());
+   private final Map<Integer, OverloadPatternSlot> inputSlots;
+   private final Map<Integer, OverloadPatternSlot> outputSlots;
 
-    private final Map<Integer, OverloadPatternSlot> inputSlots;
-    private final Map<Integer, OverloadPatternSlot> outputSlots;
+   public EncodedOverloadPattern(Collection<OverloadPatternSlot> inputSlots, Collection<OverloadPatternSlot> outputSlots) {
+      this.inputSlots = freezeByIndex(inputSlots, OverloadPatternSlot.Side.INPUT);
+      this.outputSlots = freezeByIndex(outputSlots, OverloadPatternSlot.Side.OUTPUT);
+   }
 
-    public EncodedOverloadPattern(
-            Collection<OverloadPatternSlot> inputSlots,
-            Collection<OverloadPatternSlot> outputSlots
-    ) {
-        this.inputSlots = freezeByIndex(inputSlots, OverloadPatternSlot.Side.INPUT);
-        this.outputSlots = freezeByIndex(outputSlots, OverloadPatternSlot.Side.OUTPUT);
-    }
+   public static EncodedOverloadPattern empty() {
+      return EMPTY;
+   }
 
-    public static EncodedOverloadPattern empty() {
-        return EMPTY;
-    }
+   public static EncodedOverloadPattern.Builder builder() {
+      return new EncodedOverloadPattern.Builder();
+   }
 
-    public static Builder builder() {
-        return new Builder();
-    }
+   public Collection<OverloadPatternSlot> inputSlots() {
+      return this.inputSlots.values();
+   }
 
-    public Collection<OverloadPatternSlot> inputSlots() {
-        return inputSlots.values();
-    }
+   public Collection<OverloadPatternSlot> outputSlots() {
+      return this.outputSlots.values();
+   }
 
-    public Collection<OverloadPatternSlot> outputSlots() {
-        return outputSlots.values();
-    }
+   public Optional<OverloadPatternSlot> inputSlot(int slotIndex) {
+      return Optional.ofNullable(this.inputSlots.get(slotIndex));
+   }
 
-    public Optional<OverloadPatternSlot> inputSlot(int slotIndex) {
-        return Optional.ofNullable(inputSlots.get(slotIndex));
-    }
+   public Optional<OverloadPatternSlot> outputSlot(int slotIndex) {
+      return Optional.ofNullable(this.outputSlots.get(slotIndex));
+   }
 
-    public Optional<OverloadPatternSlot> outputSlot(int slotIndex) {
-        return Optional.ofNullable(outputSlots.get(slotIndex));
-    }
+   public MatchMode inputModeOrDefault(int slotIndex) {
+      return this.inputSlot(slotIndex).map(OverloadPatternSlot::matchMode).orElse(MatchMode.STRICT);
+   }
 
-    /**
-     * Unspecified slots default to STRICT to keep overload behavior opt-in.
-     */
-    public MatchMode inputModeOrDefault(int slotIndex) {
-        return inputSlot(slotIndex)
-                .map(OverloadPatternSlot::matchMode)
-                .orElse(MatchMode.STRICT);
-    }
+   public MatchMode outputModeOrDefault(int slotIndex) {
+      return this.outputSlot(slotIndex).map(OverloadPatternSlot::matchMode).orElse(MatchMode.STRICT);
+   }
 
-    /**
-     * Unspecified slots default to STRICT to keep overload behavior opt-in.
-     */
-    public MatchMode outputModeOrDefault(int slotIndex) {
-        return outputSlot(slotIndex)
-                .map(OverloadPatternSlot::matchMode)
-                .orElse(MatchMode.STRICT);
-    }
+   public boolean isEmpty() {
+      return this.inputSlots.isEmpty() && this.outputSlots.isEmpty();
+   }
 
-    public boolean isEmpty() {
-        return inputSlots.isEmpty() && outputSlots.isEmpty();
-    }
+   private static Map<Integer, OverloadPatternSlot> freezeByIndex(Collection<OverloadPatternSlot> slots, OverloadPatternSlot.Side expectedSide) {
+      Objects.requireNonNull(slots, "slots");
+      TreeMap<Integer, OverloadPatternSlot> sorted = new TreeMap<>();
 
-    private static Map<Integer, OverloadPatternSlot> freezeByIndex(
-            Collection<OverloadPatternSlot> slots,
-            OverloadPatternSlot.Side expectedSide
-    ) {
-        Objects.requireNonNull(slots, "slots");
+      for (OverloadPatternSlot slot : slots) {
+         Objects.requireNonNull(slot, "slot");
+         if (slot.side() != expectedSide) {
+            throw new IllegalArgumentException("slot side mismatch: expected " + expectedSide);
+         }
 
-        var sorted = new TreeMap<Integer, OverloadPatternSlot>();
-        for (var slot : slots) {
-            Objects.requireNonNull(slot, "slot");
-            if (slot.side() != expectedSide) {
-                throw new IllegalArgumentException("slot side mismatch: expected " + expectedSide);
-            }
-            var previous = sorted.put(slot.slotIndex(), slot);
-            if (previous != null) {
-                throw new IllegalArgumentException("duplicate slot index: " + slot.slotIndex());
-            }
-        }
-        // Map.copyOf does not promise iteration order. Slot order is part of the stable overload
-        // identity used by pending CPU output state, so retain the TreeMap order explicitly.
-        return Collections.unmodifiableMap(new LinkedHashMap<>(sorted));
-    }
+         OverloadPatternSlot previous = sorted.put(slot.slotIndex(), slot);
+         if (previous != null) {
+            throw new IllegalArgumentException("duplicate slot index: " + slot.slotIndex());
+         }
+      }
 
-    public static final class Builder {
-        private final Map<Integer, OverloadPatternSlot> inputSlots = new TreeMap<>();
-        private final Map<Integer, OverloadPatternSlot> outputSlots = new TreeMap<>();
+      return Collections.unmodifiableMap(new LinkedHashMap<>(sorted));
+   }
 
-        private Builder() {
-        }
+   public static final class Builder {
+      private final Map<Integer, OverloadPatternSlot> inputSlots = new TreeMap<>();
+      private final Map<Integer, OverloadPatternSlot> outputSlots = new TreeMap<>();
 
-        public Builder input(int slotIndex, MatchMode matchMode) {
-            var slot = OverloadPatternSlot.input(slotIndex, matchMode);
-            putUnique(inputSlots, slot);
-            return this;
-        }
+      private Builder() {
+      }
 
-        public Builder output(int slotIndex, MatchMode matchMode) {
-            var slot = OverloadPatternSlot.output(slotIndex, matchMode);
-            putUnique(outputSlots, slot);
-            return this;
-        }
+      public EncodedOverloadPattern.Builder input(int slotIndex, MatchMode matchMode) {
+         OverloadPatternSlot slot = OverloadPatternSlot.input(slotIndex, matchMode);
+         putUnique(this.inputSlots, slot);
+         return this;
+      }
 
-        public EncodedOverloadPattern build() {
-            return new EncodedOverloadPattern(inputSlots.values(), outputSlots.values());
-        }
+      public EncodedOverloadPattern.Builder output(int slotIndex, MatchMode matchMode) {
+         OverloadPatternSlot slot = OverloadPatternSlot.output(slotIndex, matchMode);
+         putUnique(this.outputSlots, slot);
+         return this;
+      }
 
-        private static void putUnique(Map<Integer, OverloadPatternSlot> target, OverloadPatternSlot slot) {
-            var previous = target.put(slot.slotIndex(), slot);
-            if (previous != null) {
-                throw new IllegalArgumentException("duplicate slot index: " + slot.slotIndex());
-            }
-        }
-    }
+      public EncodedOverloadPattern build() {
+         return new EncodedOverloadPattern(this.inputSlots.values(), this.outputSlots.values());
+      }
+
+      private static void putUnique(Map<Integer, OverloadPatternSlot> target, OverloadPatternSlot slot) {
+         OverloadPatternSlot previous = target.put(slot.slotIndex(), slot);
+         if (previous != null) {
+            throw new IllegalArgumentException("duplicate slot index: " + slot.slotIndex());
+         }
+      }
+   }
 }

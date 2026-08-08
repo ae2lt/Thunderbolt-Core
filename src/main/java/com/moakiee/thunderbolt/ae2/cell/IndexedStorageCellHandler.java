@@ -1,27 +1,23 @@
 package com.moakiee.thunderbolt.ae2.cell;
 
-import org.jetbrains.annotations.Nullable;
-
 import appeng.api.storage.cells.ICellHandler;
 import appeng.api.storage.cells.ISaveProvider;
 import appeng.api.storage.cells.StorageCell;
 import net.minecraft.world.item.ItemStack;
+import org.jetbrains.annotations.Nullable;
 
-/** Single AE2 cell handler shared by all items implementing {@link IIndexedStorageCellItem}. */
 public final class IndexedStorageCellHandler implements ICellHandler {
-    public static final IndexedStorageCellHandler INSTANCE = new IndexedStorageCellHandler();
+   public static final IndexedStorageCellHandler INSTANCE = new IndexedStorageCellHandler();
 
-    private IndexedStorageCellHandler() {}
+   private IndexedStorageCellHandler() {
+   }
 
-    @Override
-    public boolean isCell(ItemStack stack) {
-        return stack.getItem() instanceof IIndexedStorageCellItem;
-    }
+   public boolean isCell(ItemStack stack) {
+      return stack.getItem() instanceof IIndexedStorageCellItem;
+   }
 
-    @Override
-    public @Nullable StorageCell getCellInventory(ItemStack stack, @Nullable ISaveProvider host) {
-        return stack.getItem() instanceof IIndexedStorageCellItem definition
-                ? new IndexedStorageCellInventory(stack, definition, null, host)
-                : null;
-    }
+   @Nullable
+   public StorageCell getCellInventory(ItemStack stack, @Nullable ISaveProvider host) {
+      return stack.getItem() instanceof IIndexedStorageCellItem definition ? new IndexedStorageCellInventory(stack, definition, null, host) : null;
+   }
 }

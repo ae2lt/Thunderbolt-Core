@@ -1,21 +1,19 @@
 package com.moakiee.thunderbolt.core.craft;
 
-import java.util.List;
-
 import appeng.api.crafting.IPatternDetails;
 import appeng.api.stacks.AEKey;
 import appeng.api.stacks.KeyCounter;
+import java.util.List;
 
 public interface CopyAssembler {
-    AssembledCopy assembleOneCopy(IPatternDetails details, KeyCounter[] oneCopyInputs);
+   CopyAssembler.AssembledCopy assembleOneCopy(IPatternDetails var1, KeyCounter[] var2);
 
-    record AssembledCopy(AEKey output, long outputCount, List<Stack> remainders,
-                         List<Stack> sharedRemainders) {
-        public AssembledCopy(AEKey output, long outputCount, List<Stack> remainders) {
-            this(output, outputCount, remainders, List.of());
-        }
-    }
+   public static record AssembledCopy(AEKey output, long outputCount, List<CopyAssembler.Stack> remainders, List<CopyAssembler.Stack> sharedRemainders) {
+      public AssembledCopy(AEKey output, long outputCount, List<CopyAssembler.Stack> remainders) {
+         this(output, outputCount, remainders, List.of());
+      }
+   }
 
-    record Stack(AEKey key, long count) {
-    }
+   public static record Stack(AEKey key, long count) {
+   }
 }

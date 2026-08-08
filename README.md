@@ -1,46 +1,46 @@
-# Thunderbolt Core
+# Thunderbolt Core - Unofficial Forge 1.20.1 Port
 
-[简体中文](README_zh_CN.md)
+This project ports the supplied `thunderbolt-1.0.3.jar` to Minecraft 1.20.1
+Forge. Thunderbolt is the shared AE2 infrastructure layer for high-throughput
+crafting, batch dispatch, indexed storage, channel helpers, and optional
+compatibility with Advanced AE and Neo ECO AE Extension.
 
-Thunderbolt Core is the shared AE2 optimization and infrastructure layer for
-AE2 Lightning Tech. It can also be installed as a standalone AE2 crafting
-accelerator.
+## Target
 
-## Requirements
+- Minecraft 1.20.1
+- Forge 47.4.20+
+- Java 17
+- Applied Energistics 2 15.4.x
+- Optional Advanced AE integration
 
-- Minecraft `1.21.1`
-- NeoForge `21.1.x` (development baseline: `21.1.219`)
-- Applied Energistics 2 `19.2.17`–`19.2.x`
+The supplied upstream artifact is NeoForge 1.21.1 and cannot be copied directly
+into a Forge 1.20.1 instance. The source was separately decompiled for porting,
+then adapted to Forge registries, lifecycle hooks, capabilities, and Java 17
+Mixin configuration.
 
-Place Thunderbolt Core and AE2 in the `mods` directory on both the client and
-server.
-
-## Features
-
-- fast AE2 autocrafting planning and batch dispatch
-- crafting extension APIs for compatible addons
-- overloaded-channel and matrix-crafting infrastructure for AE2LT
-- optional compatibility hooks for Advanced AE, NeoECO, AE2 Crafting Tree,
-  and ExtendedAE Plus
-
-## Runtime Options
-
-- `-Dthunderbolt.watchdogMs=<ms>`: first slow-planning warning delay
-- `-Dthunderbolt.watchdogRepeatMs=<ms>`: repeated warning interval
-- `-Dthunderbolt.maxCraftSearchWork=<count>`: planner search-work budget
-- `-Dthunderbolt.maxCraftDepth=<count>`: planner depth limit
-
-## Development
+## Build
 
 ```powershell
-.\gradlew.bat build
+.\gradlew.bat build --no-daemon
 ```
 
-```powershell
-.\gradlew.bat publishToMavenLocal
+The distribution artifact is:
+
+```text
+build/libs/thunderbolt-1.0.3-forge-1.20.1-r1.jar
 ```
 
-Maven coordinate: `com.moakiee.thunderbolt:thunderbolt:1.0.3`.
+The `-slim.jar` file is the development artifact and should not be distributed.
 
-Issues: [GitHub Issues](https://github.com/ae2lt/Thunderbolt-Core/issues) ·
-License: [GNU LGPL 3.0](LICENSE)
+## Scope
+
+The port keeps the upstream package/API names under
+`com.moakiee.thunderbolt`. It includes the planner, batch executor, indexed
+storage, channel helpers, overload pattern support, time-wheel CPU support,
+and optional-mod mixin selectors. NeoForge-only metadata is replaced by Forge
+metadata; the upstream NeoForge JAR is not bundled.
+
+## License
+
+GNU LGPL 3.0. This is an unofficial port and is not endorsed by Applied
+Energistics 2 or the original upstream project authors.

@@ -2,18 +2,14 @@ package com.moakiee.thunderbolt.core.craft;
 
 import appeng.api.stacks.AEKey;
 
-/**
- * World/grid access the {@link CraftingCore} needs to deliver assembled outputs. Capacity and
- * energy are deliberately absent: those are decided by the rate limiter above the core.
- */
 public interface CraftingCoreHost {
-    long getGameTime();
+   long getGameTime();
 
-    boolean isRemoved();
+   boolean isRemoved();
 
-    boolean isConnected();
+   boolean isConnected();
 
-    long insertToNetwork(AEKey key, long amount);
+   long insertToNetwork(AEKey var1, long var2);
 
-    void spawnToWorld(AEKey key, long amount);
+   void spawnToWorld(AEKey var1, long var2);
 }

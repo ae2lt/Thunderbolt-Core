@@ -1,83 +1,79 @@
 package com.moakiee.thunderbolt.ae2.batch;
 
-import java.util.Iterator;
-import java.util.Map;
-import java.util.UUID;
-
 import appeng.api.crafting.IPatternDetails;
 import appeng.api.stacks.AEKeyType;
+import appeng.crafting.execution.ElapsedTimeTracker;
 import appeng.crafting.execution.ExecutingCraftingJob;
 import appeng.crafting.inv.ListCraftingInventory;
-
 import com.moakiee.thunderbolt.ae2.mixin.ElapsedTimeTrackerAccessor;
 import com.moakiee.thunderbolt.ae2.mixin.ExecutingCraftingJobAccessor;
 import com.moakiee.thunderbolt.ae2.mixin.TaskProgressAccessor;
-import com.moakiee.thunderbolt.ae2.batch.BatchJobView;
-import com.moakiee.thunderbolt.ae2.batch.BatchTaskHandle;
+import java.util.Iterator;
+import java.util.Map;
+import java.util.UUID;
+import java.util.Map.Entry;
 
 public final class VanillaBatchJobView implements BatchJobView, BatchTaskHandle, Iterator<BatchTaskHandle> {
-    private final ExecutingCraftingJob job;
-    private Iterator<? extends Map.Entry<IPatternDetails, ?>> rawIter;
-    private Map.Entry<IPatternDetails, ?> currentEntry;
+   private final ExecutingCraftingJob job;
+   private Iterator<? extends Entry<IPatternDetails, ?>> rawIter;
+   private Entry<IPatternDetails, ?> currentEntry;
 
-    public VanillaBatchJobView(ExecutingCraftingJob job) {
-        this.job = job;
-    }
+   public VanillaBatchJobView(ExecutingCraftingJob job) {
+      this.job = job;
+   }
 
-    @SuppressWarnings("unchecked")
-    @Override
-    public Iterator<BatchTaskHandle> taskIterator() {
-        Map<IPatternDetails, ?> tasks = ((ExecutingCraftingJobAccessor) job).getTasks();
-        rawIter = (Iterator<? extends Map.Entry<IPatternDetails, ?>>) tasks.entrySet().iterator();
-        currentEntry = null;
-        return this;
-    }
+   @Override
+   public Iterator<BatchTaskHandle> taskIterator() {
+      Map<IPatternDetails, ?> tasks = ((ExecutingCraftingJobAccessor)this.job).getTasks();
+      this.rawIter = tasks.entrySet().iterator();
+      this.currentEntry = null;
+      return this;
+   }
 
-    @Override
-    public boolean hasNext() {
-        return rawIter.hasNext();
-    }
+   @Override
+   public boolean hasNext() {
+      return this.rawIter.hasNext();
+   }
 
-    @Override
-    public BatchTaskHandle next() {
-        currentEntry = rawIter.next();
-        return this;
-    }
+   public BatchTaskHandle next() {
+      this.currentEntry = (Entry<IPatternDetails, ?>)this.rawIter.next();
+      return this;
+   }
 
-    @Override
-    public void remove() {
-        rawIter.remove();
-        currentEntry = null;
-    }
+   @Override
+   public void remove() {
+      this.rawIter.remove();
+      this.currentEntry = null;
+   }
 
-    @Override
-    public IPatternDetails details() {
-        return currentEntry.getKey();
-    }
+   @Override
+   public IPatternDetails details() {
+      return this.currentEntry.getKey();
+   }
 
-    @Override
-    public long getValue() {
-        return ((TaskProgressAccessor) currentEntry.getValue()).getValue();
-    }
+   @Override
+   public long getValue() {
+      return ((TaskProgressAccessor)this.currentEntry.getValue()).getValue();
+   }
 
-    @Override
-    public void setValue(long value) {
-        ((TaskProgressAccessor) currentEntry.getValue()).setValue(value);
-    }
+   @Override
+   public void setValue(long value) {
+      ((TaskProgressAccessor)this.currentEntry.getValue()).setValue(value);
+   }
 
-    @Override
-    public ListCraftingInventory waitingFor() {
-        return ((ExecutingCraftingJobAccessor) job).getWaitingFor();
-    }
+   @Override
+   public ListCraftingInventory waitingFor() {
+      return ((ExecutingCraftingJobAccessor)this.job).getWaitingFor();
+   }
 
-    @Override
-    public UUID craftingId() {
-        return ((ExecutingCraftingJobAccessor) job).getLink().getCraftingID();
-    }
+   @Override
+   public UUID craftingId() {
+      return ((ExecutingCraftingJobAccessor)this.job).getLink().getCraftingID();
+   }
 
-    @Override
-    public void addContainerMaxItems(long count, AEKeyType type) {
-        var timeTracker = ((ExecutingCraftingJobAccessor) job).getTimeTracker();
-        ((ElapsedTimeTrackerAccessor) timeTracker).invokeAddMaxItems(count, type);
-    }
+   @Override
+   public void addContainerMaxItems(long count, AEKeyType type) {
+      ElapsedTimeTracker timeTracker = ((ExecutingCraftingJobAccessor)this.job).getTimeTracker();
+      ((ElapsedTimeTrackerAccessor)timeTracker).invokeAddMaxItems(count, type);
+   }
 }

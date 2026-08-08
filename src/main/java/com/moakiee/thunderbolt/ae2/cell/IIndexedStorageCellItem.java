@@ -2,37 +2,29 @@ package com.moakiee.thunderbolt.ae2.cell;
 
 import appeng.api.networking.security.IActionSource;
 import appeng.api.stacks.AEKey;
+import com.moakiee.thunderbolt.core.cell.ByteTracker;
 import net.minecraft.resources.ResourceLocation;
 import net.minecraft.world.item.ItemStack;
 
-import com.moakiee.thunderbolt.core.cell.ByteTracker;
-
-/**
- * Item-side definition consumed by Thunderbolt's shared indexed-cell handler.
- * Implementations own presentation, filtering and accounting policy; Thunderbolt owns storage.
- */
 public interface IIndexedStorageCellItem {
-    /** Stable namespace inside Thunderbolt's world SavedData. Never derive this from display data. */
-    ResourceLocation storageType(ItemStack stack);
+   ResourceLocation storageType(ItemStack var1);
 
-    /** Stable UUID tag retained on the ItemStack. Existing mods should keep their legacy tag here. */
-    default String cellIdTag(ItemStack stack) {
-        return "thunderbolt:indexed_cell_id";
-    }
+   default String cellIdTag(ItemStack stack) {
+      return "thunderbolt:indexed_cell_id";
+   }
 
-    /** Returns a configured tracker whose total-type supplier points at the provided storage. */
-    ByteTracker createByteTracker(ItemStack stack, IndexedStorage storage);
+   ByteTracker createByteTracker(ItemStack var1, IndexedStorage var2);
 
-    double idleDrain(ItemStack stack);
+   double idleDrain(ItemStack var1);
 
-    default boolean accepts(ItemStack stack, AEKey key, IActionSource source) {
-        return true;
-    }
+   default boolean accepts(ItemStack stack, AEKey key, IActionSource source) {
+      return true;
+   }
 
-    default boolean isPreferred(
-            ItemStack stack, AEKey key, IndexedStorage storage, IActionSource source) {
-        return storage.containsKey(key);
-    }
+   default boolean isPreferred(ItemStack stack, AEKey key, IndexedStorage storage, IActionSource source) {
+      return storage.containsKey(key);
+   }
 
-    default void writeSummary(ItemStack stack, IndexedCellSummary summary) {}
+   default void writeSummary(ItemStack stack, IndexedCellSummary summary) {
+   }
 }

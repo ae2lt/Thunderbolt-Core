@@ -1,18 +1,18 @@
 package com.moakiee.thunderbolt.ae2.overload.cpu;
 
+import com.moakiee.thunderbolt.ae2.overload.model.MatchMode;
 import java.util.Objects;
 
-import com.moakiee.thunderbolt.ae2.overload.model.MatchMode;
-
 final class OutputRouteDecision {
-    private OutputRouteDecision() {
-    }
+   private OutputRouteDecision() {
+   }
 
-    static boolean routesToRequester(MatchMode matchMode, boolean exactMatchesFinal, boolean identityMatchesFinal) {
-        Objects.requireNonNull(matchMode, "matchMode");
-        return switch (matchMode) {
-            case STRICT -> exactMatchesFinal;
-            case ID_ONLY -> identityMatchesFinal;
-        };
-    }
+   static boolean routesToRequester(MatchMode matchMode, boolean exactMatchesFinal, boolean identityMatchesFinal) {
+      Objects.requireNonNull(matchMode, "matchMode");
+
+      return switch (matchMode) {
+         case STRICT -> exactMatchesFinal;
+         case ID_ONLY -> identityMatchesFinal;
+      };
+   }
 }

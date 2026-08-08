@@ -1,16 +1,5 @@
 package com.moakiee.thunderbolt.ae2.timewheel;
 
-import java.util.List;
-
-import org.jetbrains.annotations.Nullable;
-
-import net.minecraft.core.BlockPos;
-import net.minecraft.core.HolderLookup;
-import net.minecraft.nbt.CompoundTag;
-import net.minecraft.network.chat.Component;
-import net.minecraft.world.item.ItemStack;
-import net.minecraft.world.level.Level;
-
 import appeng.api.config.CpuSelectionMode;
 import appeng.api.networking.IGrid;
 import appeng.api.networking.crafting.CraftingJobStatus;
@@ -20,184 +9,177 @@ import appeng.api.networking.crafting.ICraftingRequester;
 import appeng.api.networking.crafting.ICraftingSubmitResult;
 import appeng.api.networking.security.IActionSource;
 import appeng.api.stacks.GenericStack;
+import appeng.crafting.execution.ElapsedTimeTracker;
+import java.util.List;
+import net.minecraft.core.BlockPos;
+import net.minecraft.core.HolderLookup.Provider;
+import net.minecraft.nbt.CompoundTag;
+import net.minecraft.network.chat.Component;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.level.Level;
+import org.jetbrains.annotations.Nullable;
 
 public final class TimeWheelCraftingCPU implements ICraftingCPU {
-    private static final long PROGRESS_SCALE = Integer.MAX_VALUE;
+   private static final long PROGRESS_SCALE = 2147483647L;
+   private final TimeWheelCraftingCpuHost host;
+   private final long storageBytes;
+   private final int coProcessors;
+   private final long maxCopiesPerTick;
+   private final boolean unboundedBatch;
+   private final Ae2LtTimeWheelCraftingCpuLogic craftingLogic = new Ae2LtTimeWheelCraftingCpuLogic(this);
+   private GenericStack finalOutput;
 
-    private final TimeWheelCraftingCpuHost host;
-    private final long storageBytes;
-    private final int coProcessors;
-    private final long maxCopiesPerTick;
-    private final boolean unboundedBatch;
-    private final Ae2LtTimeWheelCraftingCpuLogic craftingLogic = new Ae2LtTimeWheelCraftingCpuLogic(this);
+   public TimeWheelCraftingCPU(TimeWheelCraftingCpuHost host, long storageBytes, int coProcessors, long maxCopiesPerTick, boolean unboundedBatch) {
+      this.host = host;
+      this.storageBytes = storageBytes;
+      this.coProcessors = coProcessors;
+      this.maxCopiesPerTick = Math.max(1L, maxCopiesPerTick);
+      this.unboundedBatch = unboundedBatch;
+   }
 
-    private GenericStack finalOutput;
+   public Ae2LtTimeWheelCraftingCpuLogic getCraftingLogic() {
+      return this.craftingLogic;
+   }
 
-    public TimeWheelCraftingCPU(TimeWheelCraftingCpuHost host,
-                                long storageBytes,
-                                int coProcessors,
-                                long maxCopiesPerTick,
-                                boolean unboundedBatch) {
-        this.host = host;
-        this.storageBytes = storageBytes;
-        this.coProcessors = coProcessors;
-        this.maxCopiesPerTick = Math.max(1L, maxCopiesPerTick);
-        this.unboundedBatch = unboundedBatch;
-    }
+   public TimeWheelCraftingCpuHost getHost() {
+      return this.host;
+   }
 
-    public Ae2LtTimeWheelCraftingCpuLogic getCraftingLogic() {
-        return craftingLogic;
-    }
+   public boolean isBusy() {
+      return this.craftingLogic.hasPersistentState();
+   }
 
-    public TimeWheelCraftingCpuHost getHost() {
-        return host;
-    }
+   @Nullable
+   public CraftingJobStatus getJobStatus() {
+      GenericStack output = this.craftingLogic.getFinalJobOutput();
+      if (output == null) {
+         return null;
+      } else {
+         ElapsedTimeTracker elapsedTimeTracker = this.craftingLogic.getElapsedTimeTracker();
+         long remaining = remainingProgressUnits(elapsedTimeTracker.getProgress());
+         long progress = Math.max(0L, 2147483647L - remaining);
+         return new CraftingJobStatus(output, 2147483647L, progress, elapsedTimeTracker.getElapsedTime());
+      }
+   }
 
-    @Override
-    public boolean isBusy() {
-        return craftingLogic.hasPersistentState();
-    }
+   private static long remainingProgressUnits(float progress) {
+      return (long)(2.147483647E9 - (double)progress * 2.147483647E9);
+   }
 
-    @Nullable
-    @Override
-    public CraftingJobStatus getJobStatus() {
-        var output = craftingLogic.getFinalJobOutput();
-        if (output == null) {
-            return null;
-        }
+   public void cancelJob() {
+      this.craftingLogic.cancel();
+   }
 
-        var elapsedTimeTracker = craftingLogic.getElapsedTimeTracker();
-        long remaining = remainingProgressUnits(elapsedTimeTracker.getProgress());
-        long progress = Math.max(0, PROGRESS_SCALE - remaining);
-        return new CraftingJobStatus(
-                output,
-                PROGRESS_SCALE,
-                progress,
-                elapsedTimeTracker.getElapsedTime());
-    }
+   public long getAvailableStorage() {
+      return this.storageBytes;
+   }
 
-    private static long remainingProgressUnits(float progress) {
-        // Preserve AE2's legacy status scale while using its replacement progress API.
-        return (long) (PROGRESS_SCALE - (double) progress * PROGRESS_SCALE);
-    }
+   public int getCoProcessors() {
+      return this.coProcessors;
+   }
 
-    @Override
-    public void cancelJob() {
-        craftingLogic.cancel();
-    }
+   public int getSuccessfulDispatchesPerTick() {
+      return this.coProcessors >= 2147483646 ? Integer.MAX_VALUE : this.coProcessors + 1;
+   }
 
-    @Override
-    public long getAvailableStorage() {
-        return storageBytes;
-    }
+   public long getMaxCopiesPerTick() {
+      return this.maxCopiesPerTick;
+   }
 
-    @Override
-    public int getCoProcessors() {
-        return coProcessors;
-    }
+   public boolean hasUnboundedBatch() {
+      return this.unboundedBatch;
+   }
 
-    public int getSuccessfulDispatchesPerTick() {
-        return coProcessors >= Integer.MAX_VALUE - 1 ? Integer.MAX_VALUE : coProcessors + 1;
-    }
+   @Nullable
+   public Component getName() {
+      return this.host.getDisplayName();
+   }
 
-    public long getMaxCopiesPerTick() {
-        return maxCopiesPerTick;
-    }
+   public CpuSelectionMode getSelectionMode() {
+      return this.host.getSelectionMode();
+   }
 
-    public boolean hasUnboundedBatch() {
-        return unboundedBatch;
-    }
+   public boolean isActive() {
+      return this.host.isCpuActive();
+   }
 
-    @Nullable
-    @Override
-    public Component getName() {
-        return host.getDisplayName();
-    }
+   @Nullable
+   public IGrid getGrid() {
+      return this.host.getGrid();
+   }
 
-    @Override
-    public CpuSelectionMode getSelectionMode() {
-        return host.getSelectionMode();
-    }
+   public IActionSource getSrc() {
+      return this.host.getActionSource();
+   }
 
-    public boolean isActive() {
-        return host.isCpuActive();
-    }
+   public Level getLevel() {
+      return this.host.getLevel();
+   }
 
-    @Nullable
-    public IGrid getGrid() {
-        return host.getGrid();
-    }
+   public boolean canBeAutoSelectedFor(IActionSource source) {
+      return switch (this.getSelectionMode()) {
+         case ANY -> true;
+         case PLAYER_ONLY -> source.player().isPresent();
+         case MACHINE_ONLY -> source.player().isEmpty();
+         default -> throw new IllegalStateException("Unsupported CPU selection mode: " + this.getSelectionMode());
+      };
+   }
 
-    public IActionSource getSrc() {
-        return host.getActionSource();
-    }
+   public boolean isPreferredFor(IActionSource source) {
+      return switch (this.getSelectionMode()) {
+         case ANY -> false;
+         case PLAYER_ONLY -> source.player().isPresent();
+         case MACHINE_ONLY -> source.player().isEmpty();
+         default -> throw new IllegalStateException("Unsupported CPU selection mode: " + this.getSelectionMode());
+      };
+   }
 
-    public Level getLevel() {
-        return host.getLevel();
-    }
+   public ICraftingSubmitResult submitJob(IGrid grid, ICraftingPlan plan, IActionSource src, @Nullable ICraftingRequester requester) {
+      return this.craftingLogic.trySubmitJob(grid, plan, src, requester);
+   }
 
-    public boolean canBeAutoSelectedFor(IActionSource source) {
-        return switch (getSelectionMode()) {
-            case ANY -> true;
-            case PLAYER_ONLY -> source.player().isPresent();
-            case MACHINE_ONLY -> source.player().isEmpty();
-        };
-    }
+   public void updateOutput(@Nullable GenericStack stack) {
+      if (stack != null && stack.amount() <= 0L) {
+         stack = null;
+      }
 
-    public boolean isPreferredFor(IActionSource source) {
-        return switch (getSelectionMode()) {
-            case ANY -> false;
-            case PLAYER_ONLY -> source.player().isPresent();
-            case MACHINE_ONLY -> source.player().isEmpty();
-        };
-    }
+      this.finalOutput = stack;
+   }
 
-    public ICraftingSubmitResult submitJob(IGrid grid, ICraftingPlan plan, IActionSource src,
-                                           @Nullable ICraftingRequester requester) {
-        return craftingLogic.trySubmitJob(grid, plan, src, requester);
-    }
+   @Nullable
+   public GenericStack getDisplayedOutput() {
+      return this.finalOutput;
+   }
 
-    public void updateOutput(@Nullable GenericStack stack) {
-        if (stack != null && stack.amount() <= 0) {
-            stack = null;
-        }
-        this.finalOutput = stack;
-    }
+   public void markDirty() {
+      this.host.markCpuDirty();
+   }
 
-    @Nullable
-    public GenericStack getDisplayedOutput() {
-        return finalOutput;
-    }
+   public void writeToNBT(CompoundTag tag, Provider registries) {
+      this.craftingLogic.writeToNBT(tag, registries);
+   }
 
-    public void markDirty() {
-        host.markCpuDirty();
-    }
+   public boolean hasPersistentState() {
+      return this.craftingLogic.hasPersistentState();
+   }
 
-    public void writeToNBT(CompoundTag tag, HolderLookup.Provider registries) {
-        craftingLogic.writeToNBT(tag, registries);
-    }
+   public void readFromNBT(CompoundTag tag, Provider registries) {
+      this.craftingLogic.readFromNBT(tag, registries);
+   }
 
-    public boolean hasPersistentState() {
-        return craftingLogic.hasPersistentState();
-    }
+   public void resolvePendingLoad() {
+      this.craftingLogic.resolvePendingLoad();
+   }
 
-    public void readFromNBT(CompoundTag tag, HolderLookup.Provider registries) {
-        craftingLogic.readFromNBT(tag, registries);
-    }
+   public void addRemovalDrops(Level level, BlockPos pos, List<ItemStack> drops) {
+      this.craftingLogic.addStoredDrops(level, pos, drops);
+   }
 
-    public void resolvePendingLoad() {
-        craftingLogic.resolvePendingLoad();
-    }
+   public void clearRemovedContent() {
+      this.craftingLogic.clearRemovedContent();
+   }
 
-    public void addRemovalDrops(Level level, BlockPos pos, List<ItemStack> drops) {
-        craftingLogic.addStoredDrops(level, pos, drops);
-    }
-
-    public void clearRemovedContent() {
-        craftingLogic.clearRemovedContent();
-    }
-
-    void tryReleaseContents() {
-        craftingLogic.tryReleaseContents();
-    }
+   void tryReleaseContents() {
+      this.craftingLogic.tryReleaseContents();
+   }
 }

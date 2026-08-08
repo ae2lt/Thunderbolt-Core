@@ -1,131 +1,160 @@
-plugins {
-    id 'java-library'
-    id 'maven-publish'
-    id 'net.neoforged.moddev' version '2.0.140'
+buildscript {
+    repositories {
+        maven { url = 'https://repo.spongepowered.org/repository/maven-public/' }
+        mavenCentral()
+    }
+    dependencies {
+        classpath 'org.spongepowered:mixingradle:0.7-SNAPSHOT'
+    }
 }
 
-version = mod_version
+plugins {
+    id 'eclipse'
+    id 'idea'
+    id 'net.minecraftforge.gradle' version '[6.0.16,6.2)'
+}
+
+apply plugin: 'org.spongepowered.mixin'
+
 group = mod_group_id
+version = mod_version
 
 base {
-    archivesName = project.findProperty("artifact_name") ?: mod_id
+    archivesName = mod_id
 }
 
-java.toolchain.languageVersion = JavaLanguageVersion.of(21)
+java {
+    toolchain.languageVersion = JavaLanguageVersion.of(17)
+}
 
-neoForge {
-    version = project.neo_version
+minecraft {
+    mappings channel: mapping_channel, version: mapping_version
+    copyIdeResources = true
 
-    // Mixins on NeoForge 1.20.2+ need no refmap (runtime uses official mappings).
     runs {
-        client {
-            client()
-            systemProperty 'neoforge.enabledGameTestNamespaces', project.mod_id
-        }
-        server {
-            server()
-            programArgument '--nogui'
-            systemProperty 'neoforge.enabledGameTestNamespaces', project.mod_id
-        }
         configureEach {
-            systemProperty 'forge.logging.markers', 'REGISTRIES'
-            logLevel = org.slf4j.event.Level.DEBUG
-        }
-    }
+            workingDirectory project.file('run')
+            property 'forge.logging.markers', 'REGISTRIES'
+            property 'forge.logging.console.level', 'debug'
+            args "-mixin.config=${mod_id}.mixins.json"
 
-    mods {
-        "${mod_id}" {
-            sourceSet(sourceSets.main)
+            mods {
+                "${mod_id}" {
+                    source sourceSets.main
+                }
+            }
+        }
+
+        client {
+            property 'forge.enabledGameTestNamespaces', mod_id
+        }
+
+        server {
+            property 'forge.enabledGameTestNamespaces', mod_id
+            args '--nogui'
         }
     }
+}
+
+mixin {
+    add sourceSets.main, "${mod_id}.refmap.json"
+    config "${mod_id}.mixins.json"
 }
 
 repositories {
     mavenLocal()
     mavenCentral()
     maven {
-        url = "https://www.cursemaven.com"
+        url = 'https://modmaven.dev/'
         content {
-            includeGroup "curse.maven"
+            includeGroup 'appeng'
+            includeGroup 'org.appliedenergistics'
         }
+    }
+    maven {
+        url = 'https://www.cursemaven.com'
+        content { includeGroup 'curse.maven' }
     }
 }
 
 dependencies {
-    // AE2 — publicly available on CurseForge maven. compileOnly: this layer patches AE2 via
-    // mixins; AE2 is provided by the modpack at runtime. The pure planner core under
-    // `crafting.core` has NO AE2 dependency and is unit-tested standalone.
-    compileOnly "curse.maven:applied-energistics-2-223794:7027323"
+    minecraft "net.minecraftforge:forge:${minecraft_version}-${forge_version}"
+    implementation fg.deobf("appeng:appliedenergistics2-forge:${ae2_version}")
 
-    // AdvancedAE (+ its compile-time companions) — the lib hosts the batch-CPU mixin/accessors that
-    // target AAE's crafting CPU. compileOnly: AAE is provided by the modpack at runtime when present;
-    // the @Pseudo mixins simply no-op if AAE is absent.
-    compileOnly "curse.maven:advancedae-1084104:7668664"
-    compileOnly "curse.maven:extendedae-892005:7727948"
-    compileOnly "curse.maven:glodium-957920:5821676"
-    compileOnly "curse.maven:applied-flux-965012:7429565"
+    // Advanced AE is optional at runtime; its accessors/mixins are selected only when loaded.
+    compileOnly fg.deobf("curse.maven:advancedae-1084104:${advanced_ae_file_id}")
 
-    // Unit tests for the pure planner core (no Minecraft/AE2 needed).
-    testImplementation platform("org.junit:junit-bom:5.10.2")
-    testImplementation "org.junit.jupiter:junit-jupiter"
-    testRuntimeOnly "org.junit.platform:junit-platform-launcher"
-    // AE2 API types exercised directly by unit tests (e.g. ByteTracker's AEKeyType);
-    // compileOnly deps are absent from the test runtime classpath otherwise.
-    testRuntimeOnly "curse.maven:applied-energistics-2-223794:7027323"
-}
-
-// Tests that exercise SavedData/codecs need the same generated Minecraft/NeoForge classes as main.
-sourceSets.test.compileClasspath += sourceSets.main.compileClasspath
-sourceSets.test.runtimeClasspath += sourceSets.main.runtimeClasspath
-
-test {
-    useJUnitPlatform()
-    testLogging {
-        events "passed", "skipped", "failed"
+    annotationProcessor 'org.spongepowered:mixin:0.8.5:processor'
+    compileOnly(annotationProcessor("io.github.llamalad7:mixinextras-common:${mixinextras_version}"))
+    implementation fg.deobf("io.github.llamalad7:mixinextras-forge:${mixinextras_version}")
+    jarJar(group: 'io.github.llamalad7', name: 'mixinextras-forge', version: "[${mixinextras_version},)") {
+        jarJar.pin(it, "${mixinextras_version}")
     }
 }
 
-var generateModMetadata = tasks.register("generateModMetadata", ProcessResources) {
+sourceSets.main.resources { srcDir 'src/generated/resources' }
+
+tasks.named('processResources', ProcessResources).configure {
     var replaceProperties = [
-        minecraft_version      : minecraft_version,
-        minecraft_version_range: minecraft_version_range,
-        neo_version            : neo_version,
-        neo_version_range      : neo_version_range,
-        loader_version_range   : loader_version_range,
-        mod_id                 : mod_id,
-        mod_name               : mod_name,
-        mod_license            : mod_license,
-        mod_version            : mod_version,
-        mod_authors            : mod_authors,
-        mod_description        : mod_description]
+            minecraft_version: minecraft_version,
+            minecraft_version_range: minecraft_version_range,
+            forge_version_range: forge_version_range,
+            loader_version_range: loader_version_range,
+            ae2_version_range: ae2_version_range,
+            mod_id: mod_id,
+            mod_name: mod_name,
+            mod_license: mod_license,
+            mod_version: mod_version,
+            mod_authors: mod_authors,
+            mod_credits: mod_credits,
+            mod_description: mod_description,
+    ]
     inputs.properties replaceProperties
-    expand replaceProperties
-    from "src/main/templates"
-    into "build/generated/sources/modMetadata"
-}
-
-sourceSets.main.resources.srcDir generateModMetadata
-neoForge.ideSyncTask generateModMetadata
-
-publishing {
-    publications {
-        register('mavenJava', MavenPublication) {
-            from components.java
-            artifactId = mod_id
-        }
-    }
-    repositories {
-        maven {
-            url = project.projectDir.toPath().resolve("repo").toUri()
-        }
+    filesMatching(['META-INF/mods.toml', 'pack.mcmeta']) {
+        expand replaceProperties + [project: project]
     }
 }
 
-if (plugins.hasPlugin('idea')) {
-    idea {
-        module {
-            downloadSources = true
-            downloadJavadoc = true
-        }
+tasks.named('jar', Jar).configure {
+    archiveClassifier = 'slim'
+    manifest {
+        attributes([
+                'Specification-Title'   : mod_name,
+                'Specification-Vendor'  : mod_authors,
+                'Specification-Version' : '1',
+                'Implementation-Title'  : mod_name,
+                'Implementation-Version': project.jar.archiveVersion,
+                'Implementation-Vendor' : mod_authors,
+                'Implementation-License': mod_license,
+                'MixinConfigs'          : "${mod_id}.mixins.json"
+        ])
     }
+    finalizedBy 'reobfJar'
+}
+
+tasks.named('jarJar', Jar).configure {
+    archiveClassifier = ''
+    finalizedBy 'reobfJarJar'
+}
+
+tasks.withType(Jar).configureEach {
+    from('LICENSE') {
+        into 'META-INF'
+        rename { 'LICENSE_thunderbolt.txt' }
+    }
+    from('README.md') {
+        into 'META-INF'
+        rename { 'README_thunderbolt.md' }
+    }
+}
+
+afterEvaluate {
+    tasks.findByName('reobfJarJar')?.configure {
+        mustRunAfter 'reobfJar'
+    }
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
+    options.compilerArgs.addAll(['-Xmaxerrs', '1000'])
 }

@@ -6,17 +6,16 @@ import net.minecraft.nbt.CompoundTag;
 import net.minecraft.resources.ResourceKey;
 import net.minecraft.world.level.Level;
 
-/** Minimal persistent endpoint contract used by Thunderbolt's one-to-many connection utilities. */
 public interface WirelessConnectionRef {
-    ResourceKey<Level> dimension();
+   ResourceKey<Level> dimension();
 
-    BlockPos pos();
+   BlockPos pos();
 
-    Direction boundFace();
+   Direction boundFace();
 
-    CompoundTag toTag();
+   CompoundTag toTag();
 
-    default boolean sameTarget(ResourceKey<Level> otherDimension, BlockPos otherPos) {
-        return dimension().equals(otherDimension) && pos().equals(otherPos);
-    }
+   default boolean sameTarget(ResourceKey<Level> otherDimension, BlockPos otherPos) {
+      return this.dimension().equals(otherDimension) && this.pos().equals(otherPos);
+   }
 }

@@ -1,134 +1,118 @@
 package com.moakiee.thunderbolt.core.planner;
 
 import java.util.ArrayList;
-import java.util.LinkedHashSet;
 import java.util.HashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 
-/**
- * Immutable snapshot the planner runs against: patterns indexed by their output item, plus a
- * read-only inventory snapshot. The AE2 adapter builds this from {@code ICraftingService} +
- * the network storage snapshot; tests build it directly with {@code String} keys.
- *
- * @param <K> item key type
- */
 public final class CraftGraph<K> {
+   private final Map<K, List<CraftPattern<K>>> patternsByOutput;
+   private final Map<K, Long> stock;
+   private final Map<ReusableStockKey<K>, Long> reusableStock;
+   private final Map<ReusableStockRouteKey<K>, List<K>> reusableStockRoutes;
 
-    private final Map<K, List<CraftPattern<K>>> patternsByOutput;
-    private final Map<K, Long> stock;
-    private final Map<ReusableStockKey<K>, Long> reusableStock;
-    private final Map<ReusableStockRouteKey<K>, List<K>> reusableStockRoutes;
+   private CraftGraph(
+      Map<K, List<CraftPattern<K>>> patternsByOutput,
+      Map<K, Long> stock,
+      Map<ReusableStockKey<K>, Long> reusableStock,
+      Map<ReusableStockRouteKey<K>, List<K>> reusableStockRoutes
+   ) {
+      this.patternsByOutput = patternsByOutput;
+      this.stock = stock;
+      this.reusableStock = reusableStock;
+      this.reusableStockRoutes = reusableStockRoutes;
+   }
 
-    private CraftGraph(Map<K, List<CraftPattern<K>>> patternsByOutput, Map<K, Long> stock,
-                       Map<ReusableStockKey<K>, Long> reusableStock,
-                       Map<ReusableStockRouteKey<K>, List<K>> reusableStockRoutes) {
-        this.patternsByOutput = patternsByOutput;
-        this.stock = stock;
-        this.reusableStock = reusableStock;
-        this.reusableStockRoutes = reusableStockRoutes;
-    }
+   public List<CraftPattern<K>> patternsFor(K key) {
+      return this.patternsByOutput.getOrDefault(key, List.of());
+   }
 
-    /** Patterns whose primary output is {@code key}, in caller-defined preference order. */
-    public List<CraftPattern<K>> patternsFor(K key) {
-        return patternsByOutput.getOrDefault(key, List.of());
-    }
+   public long stock(K key) {
+      Long v = this.stock.get(key);
+      return v == null ? 0L : Math.max(0L, v);
+   }
 
-    /** Available amount of {@code key} in the snapshot (0 if none). */
-    public long stock(K key) {
-        Long v = stock.get(key);
-        return v == null ? 0L : Math.max(0L, v);
-    }
+   public long reusableStock(Object scope, K key) {
+      Long value = this.reusableStock.get(new ReusableStockKey(scope, key));
+      return value == null ? 0L : Math.max(0L, value);
+   }
 
-    /** Host-private stock is invisible to ordinary demands and is addressed by reusable inputs only. */
-    public long reusableStock(Object scope, K key) {
-        Long value = reusableStock.get(new ReusableStockKey<>(scope, key));
-        return value == null ? 0L : Math.max(0L, value);
-    }
+   public long reusableStock(ReusableStockSource source, K plannedKey) {
+      long total = 0L;
 
-    /** Total physical stock accepted by this exact pattern route (capacity estimate only). */
-    public long reusableStock(ReusableStockSource source, K plannedKey) {
-        long total = 0L;
-        for (var actual : reusableStockCandidates(source, plannedKey)) {
-            total = Sat.add(total, reusableStock(source.storageScope(), actual));
-        }
-        return total;
-    }
+      for (K actual : this.reusableStockCandidates(source, plannedKey)) {
+         total = Sat.add(total, this.reusableStock(source.storageScope(), actual));
+      }
 
-    public List<K> reusableStockCandidates(ReusableStockSource source, K plannedKey) {
-        var route = new ReusableStockRouteKey<>(source, plannedKey);
-        var candidates = reusableStockRoutes.get(route);
-        return candidates != null ? candidates : List.of(plannedKey);
-    }
+      return total;
+   }
 
-    Map<ReusableStockKey<K>, Long> reusableStock() {
-        return reusableStock;
-    }
+   public List<K> reusableStockCandidates(ReusableStockSource source, K plannedKey) {
+      ReusableStockRouteKey<K> route = new ReusableStockRouteKey<>(source, plannedKey);
+      List<K> candidates = this.reusableStockRoutes.get(route);
+      return candidates != null ? candidates : List.of(plannedKey);
+   }
 
-    public static <K> Builder<K> builder() {
-        return new Builder<>();
-    }
+   Map<ReusableStockKey<K>, Long> reusableStock() {
+      return this.reusableStock;
+   }
 
-    public static final class Builder<K> {
-        private final Map<K, List<CraftPattern<K>>> patterns = new HashMap<>();
-        private final Map<K, Long> stock = new HashMap<>();
-        private final Map<ReusableStockKey<K>, Long> reusableStock = new HashMap<>();
-        private final Map<ReusableStockRouteKey<K>, LinkedHashSet<K>> reusableStockRoutes =
-                new HashMap<>();
+   public static <K> CraftGraph.Builder<K> builder() {
+      return new CraftGraph.Builder<>();
+   }
 
-        /** Adds a pattern; patterns for the same output keep insertion order (= preference order). */
-        public Builder<K> pattern(CraftPattern<K> pattern) {
-            patterns.computeIfAbsent(pattern.output(), k -> new ArrayList<>()).add(pattern);
-            return this;
-        }
+   public static final class Builder<K> {
+      private final Map<K, List<CraftPattern<K>>> patterns = new HashMap<>();
+      private final Map<K, Long> stock = new HashMap<>();
+      private final Map<ReusableStockKey<K>, Long> reusableStock = new HashMap<>();
+      private final Map<ReusableStockRouteKey<K>, LinkedHashSet<K>> reusableStockRoutes = new HashMap<>();
 
-        public Builder<K> pattern(K output, long outAmount, List<CraftInput<K>> inputs) {
-            return pattern(new CraftPattern<>(output, outAmount, inputs, null));
-        }
+      public CraftGraph.Builder<K> pattern(CraftPattern<K> pattern) {
+         this.patterns.computeIfAbsent(pattern.output(), k -> new ArrayList<>()).add(pattern);
+         return this;
+      }
 
-        public Builder<K> pattern(K output, long outAmount, List<CraftInput<K>> inputs,
-                                  List<CraftOutput<K>> byproducts) {
-            return pattern(new CraftPattern<>(output, outAmount, inputs, byproducts, null));
-        }
+      public CraftGraph.Builder<K> pattern(K output, long outAmount, List<CraftInput<K>> inputs) {
+         return this.pattern(new CraftPattern<>(output, outAmount, inputs, null));
+      }
 
-        public Builder<K> stock(K key, long amount) {
-            // Saturating: a durability carrier's aggregate uses can already sit at the saturation
-            // cap; a plain Long::sum could overflow negative and stock() would clamp it to zero,
-            // turning a huge supply into a false shortfall.
-            stock.merge(key, amount, Sat::add);
-            return this;
-        }
+      public CraftGraph.Builder<K> pattern(K output, long outAmount, List<CraftInput<K>> inputs, List<CraftOutput<K>> byproducts) {
+         return this.pattern(new CraftPattern<>(output, outAmount, inputs, byproducts, null));
+      }
 
-        /**
-         * Publishes one snapshot of a physical host inventory. Repeated patterns from the same host
-         * report the same inventory, so snapshots merge by maximum rather than being double-counted.
-         */
-        public Builder<K> reusableStock(Object scope, K key, long amount) {
-            if (amount > 0) {
-                reusableStock.merge(new ReusableStockKey<>(scope, key), amount, Math::max);
+      public CraftGraph.Builder<K> stock(K key, long amount) {
+         this.stock.merge(key, amount, Sat::add);
+         return this;
+      }
+
+      public CraftGraph.Builder<K> reusableStock(Object scope, K key, long amount) {
+         if (amount > 0L) {
+            this.reusableStock.merge(new ReusableStockKey<>(scope, key), amount, Math::max);
+         }
+
+         return this;
+      }
+
+      public CraftGraph.Builder<K> reusableStockRoute(ReusableStockSource source, K plannedKey, Iterable<? extends K> actualVariants) {
+         ReusableStockRouteKey<K> route = new ReusableStockRouteKey<>(source, plannedKey);
+         LinkedHashSet<K> accepted = this.reusableStockRoutes.computeIfAbsent(route, ignored -> new LinkedHashSet<>());
+
+         for (K actual : actualVariants) {
+            if (actual != null) {
+               accepted.add(actual);
             }
-            return this;
-        }
+         }
 
-        /** Registers the concrete physical variants accepted by one pattern-specific seed route. */
-        public Builder<K> reusableStockRoute(
-                ReusableStockSource source, K plannedKey, Iterable<? extends K> actualVariants) {
-            var route = new ReusableStockRouteKey<>(source, plannedKey);
-            var accepted = reusableStockRoutes.computeIfAbsent(route, ignored -> new LinkedHashSet<>());
-            for (var actual : actualVariants) {
-                if (actual != null) accepted.add(actual);
-            }
-            return this;
-        }
+         return this;
+      }
 
-        public CraftGraph<K> build() {
-            Map<K, List<CraftPattern<K>>> frozen = new HashMap<>();
-            patterns.forEach((k, v) -> frozen.put(k, List.copyOf(v)));
-            var frozenRoutes = new HashMap<ReusableStockRouteKey<K>, List<K>>();
-            reusableStockRoutes.forEach((route, variants) ->
-                    frozenRoutes.put(route, List.copyOf(variants)));
-            return new CraftGraph<>(frozen, Map.copyOf(stock), Map.copyOf(reusableStock),
-                    Map.copyOf(frozenRoutes));
-        }
-    }
+      public CraftGraph<K> build() {
+         Map<K, List<CraftPattern<K>>> frozen = new HashMap<>();
+         this.patterns.forEach((k, v) -> frozen.put((K)k, List.copyOf(v)));
+         HashMap<ReusableStockRouteKey<K>, List<K>> frozenRoutes = new HashMap<>();
+         this.reusableStockRoutes.forEach((route, variants) -> frozenRoutes.put((ReusableStockRouteKey<K>)route, List.copyOf(variants)));
+         return new CraftGraph<>(frozen, Map.copyOf(this.stock), Map.copyOf(this.reusableStock), Map.copyOf(frozenRoutes));
+      }
+   }
 }

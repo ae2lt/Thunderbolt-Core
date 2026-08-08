@@ -1,211 +1,173 @@
 package com.moakiee.thunderbolt.core.cell;
 
-import java.util.function.IntSupplier;
-
 import appeng.api.stacks.AEKeyType;
 import it.unimi.dsi.fastutil.objects.Object2IntOpenHashMap;
 import it.unimi.dsi.fastutil.objects.Object2LongOpenHashMap;
+import it.unimi.dsi.fastutil.objects.ObjectIterator;
+import java.util.function.IntSupplier;
 
-/**
- * Tracks byte-level capacity consumption for the infinite cell using
- * remainder-delta incremental updates keyed on {@link AEKeyType}.
- * <p>
- * Formula: {@code usedBytes = uniqueKeys × bytesPerType + Σ_per_type ceil(typeTotal / apb)}
- * <p>
- * Per-{@link AEKeyType} aggregation reduces the number of tracked remainders
- * from O(keys) to O(keyTypes) (typically 2–3). All arithmetic uses signed
- * 63-bit longs; zero {@code Long.xxxUnsigned} calls.
- */
 public final class ByteTracker {
+   private final Object2LongOpenHashMap<AEKeyType> keyTypeRemainders = new Object2LongOpenHashMap();
+   private final Object2IntOpenHashMap<AEKeyType> keyTypeCounts = new Object2IntOpenHashMap();
+   private long usedBytesLo;
+   private long usedBytesHi;
+   private long capacityLo;
+   private long capacityHi;
+   private int bytesPerType;
+   private int maxTypes;
+   private final IntSupplier totalTypesGetter;
 
-    private final Object2LongOpenHashMap<AEKeyType> keyTypeRemainders = new Object2LongOpenHashMap<>();
-    private final Object2IntOpenHashMap<AEKeyType> keyTypeCounts = new Object2IntOpenHashMap<>();
+   public ByteTracker(IntSupplier totalTypesGetter) {
+      this.totalTypesGetter = totalTypesGetter;
+   }
 
-    private long usedBytesLo;
-    private long usedBytesHi;
+   public void configure(int bytesPerType, int maxTypes, long capacityLo, long capacityHi) {
+      this.bytesPerType = bytesPerType;
+      this.maxTypes = maxTypes;
+      this.capacityLo = capacityLo;
+      this.capacityHi = capacityHi;
+   }
 
-    private long capacityLo;
-    private long capacityHi;
-    private int bytesPerType;
-    private int maxTypes;
-    private final IntSupplier totalTypesGetter;
+   public long computeMaxInsertable(AEKeyType type, boolean isNewKey) {
+      int apb = type.getAmountPerByte();
+      if (this.capacityHi == this.usedBytesHi) {
+         return this.capacityLo <= this.usedBytesLo ? 0L : this.maxFromFreeBytes(this.capacityLo - this.usedBytesLo, apb, type, isNewKey);
+      } else {
+         return this.capacityHi < this.usedBytesHi ? 0L : Long.MAX_VALUE;
+      }
+   }
 
-    public ByteTracker(IntSupplier totalTypesGetter) {
-        this.totalTypesGetter = totalTypesGetter;
-    }
+   private long maxFromFreeBytes(long freeBytes, int apb, AEKeyType type, boolean isNewKey) {
+      int totalTypes = this.totalTypesGetter.getAsInt();
+      if (isNewKey) {
+         if (totalTypes >= this.maxTypes) {
+            return 0L;
+         }
 
-    // ══════════════════════════════════════════════════════════════════════
-    //  Configuration
-    // ══════════════════════════════════════════════════════════════════════
+         if (freeBytes < (long)this.bytesPerType) {
+            return 0L;
+         }
 
-    public void configure(int bytesPerType, int maxTypes, long capacityLo, long capacityHi) {
-        this.bytesPerType = bytesPerType;
-        this.maxTypes = maxTypes;
-        this.capacityLo = capacityLo;
-        this.capacityHi = capacityHi;
-    }
+         freeBytes -= (long)this.bytesPerType;
+      }
 
-    // ══════════════════════════════════════════════════════════════════════
-    //  Hot-path: capacity check
-    // ══════════════════════════════════════════════════════════════════════
+      long r = this.keyTypeRemainders.getLong(type);
+      long freeInPartial = r > 0L ? (long)apb - r : 0L;
+      if (freeBytes > Long.MAX_VALUE / (long)apb) {
+         return Long.MAX_VALUE;
+      } else {
+         long result = freeBytes * (long)apb + freeInPartial;
+         return result < 0L ? Long.MAX_VALUE : result;
+      }
+   }
 
-    public long computeMaxInsertable(AEKeyType type, boolean isNewKey) {
-        int apb = type.getAmountPerByte();
+   public void onInsert(AEKeyType type, long amount, boolean isNewKey) {
+      int apb = type.getAmountPerByte();
+      long oldR = this.keyTypeRemainders.getLong(type);
+      long aMod = amount % (long)apb;
+      long combined = oldR + aMod;
+      long extra = combined >= (long)apb ? 1L : 0L;
+      long newR = extra > 0L ? combined - (long)apb : combined;
+      this.keyTypeRemainders.put(type, newR);
+      long byteDelta = amount / (long)apb + extra + (newR > 0L ? 1L : 0L) - (oldR > 0L ? 1L : 0L);
+      if (isNewKey) {
+         byteDelta += (long)this.bytesPerType;
+         this.keyTypeCounts.addTo(type, 1);
+      }
 
-        if (capacityHi == usedBytesHi) {
-            if (capacityLo <= usedBytesLo) return 0;
-            return maxFromFreeBytes(capacityLo - usedBytesLo, apb, type, isNewKey);
-        }
-        if (capacityHi < usedBytesHi) return 0;
-        return Long.MAX_VALUE;
-    }
+      this.usedBytesLo += byteDelta;
+      if (this.usedBytesLo < 0L) {
+         this.usedBytesLo &= Long.MAX_VALUE;
+         this.usedBytesHi++;
+      }
+   }
 
-    private long maxFromFreeBytes(long freeBytes, int apb, AEKeyType type, boolean isNewKey) {
-        int totalTypes = totalTypesGetter.getAsInt();
-        if (isNewKey) {
-            if (totalTypes >= maxTypes) return 0;
-            if (freeBytes < bytesPerType) return 0;
-            freeBytes -= bytesPerType;
-        }
-        long r = keyTypeRemainders.getLong(type);
-        long freeInPartial = (r > 0) ? (apb - r) : 0;
-        if (freeBytes > Long.MAX_VALUE / apb) return Long.MAX_VALUE;
-        long result = freeBytes * apb + freeInPartial;
-        return result < 0 ? Long.MAX_VALUE : result;
-    }
+   public void onExtract(AEKeyType type, long amount, boolean keyRemoved) {
+      int apb = type.getAmountPerByte();
+      long oldR = this.keyTypeRemainders.getLong(type);
+      long aMod = amount % (long)apb;
+      long newR;
+      long extra;
+      if (oldR >= aMod) {
+         newR = oldR - aMod;
+         extra = 0L;
+      } else {
+         newR = oldR + (long)apb - aMod;
+         extra = 1L;
+      }
 
-    // ══════════════════════════════════════════════════════════════════════
-    //  Hot-path: insert delta
-    // ══════════════════════════════════════════════════════════════════════
+      long bytesFreed = amount / (long)apb + extra + (oldR > 0L ? 1L : 0L) - (newR > 0L ? 1L : 0L);
+      if (keyRemoved) {
+         bytesFreed += (long)this.bytesPerType;
+         int countBefore = this.keyTypeCounts.addTo(type, -1);
+         if (countBefore <= 1) {
+            this.keyTypeCounts.removeInt(type);
+            this.keyTypeRemainders.removeLong(type);
+         } else {
+            this.keyTypeRemainders.put(type, newR);
+         }
+      } else {
+         this.keyTypeRemainders.put(type, newR);
+      }
 
-    public void onInsert(AEKeyType type, long amount, boolean isNewKey) {
-        int apb = type.getAmountPerByte();
+      this.usedBytesLo -= bytesFreed;
+      if (this.usedBytesLo < 0L) {
+         this.usedBytesLo &= Long.MAX_VALUE;
+         this.usedBytesHi--;
+      }
+   }
 
-        long oldR = keyTypeRemainders.getLong(type);
-        long aMod = amount % apb;
-        long combined = oldR + aMod;
-        long extra = (combined >= apb) ? 1L : 0L;
-        long newR = extra > 0 ? combined - apb : combined;
-        keyTypeRemainders.put(type, newR);
+   public long getUsedBytes() {
+      return DualLong126.cap(this.usedBytesHi, this.usedBytesLo);
+   }
 
-        long byteDelta = amount / apb + extra
-                + (newR > 0 ? 1L : 0L) - (oldR > 0 ? 1L : 0L);
+   public long getUsedBytesHi() {
+      return this.usedBytesHi;
+   }
 
-        if (isNewKey) {
-            byteDelta += bytesPerType;
-            keyTypeCounts.addTo(type, 1);
-        }
+   public long getUsedBytesLo() {
+      return this.usedBytesLo;
+   }
 
-        usedBytesLo += byteDelta;
-        if (usedBytesLo < 0) { usedBytesLo &= Long.MAX_VALUE; usedBytesHi++; }
-    }
+   public boolean isFull() {
+      return this.capacityHi == this.usedBytesHi ? this.capacityLo <= this.usedBytesLo : this.capacityHi < this.usedBytesHi;
+   }
 
-    // ══════════════════════════════════════════════════════════════════════
-    //  Hot-path: extract delta
-    // ══════════════════════════════════════════════════════════════════════
+   public boolean isTypeFull() {
+      return this.totalTypesGetter.getAsInt() >= this.maxTypes;
+   }
 
-    public void onExtract(AEKeyType type, long amount, boolean keyRemoved) {
-        int apb = type.getAmountPerByte();
+   int trackedTypeEntries() {
+      return this.keyTypeCounts.size() + this.keyTypeRemainders.size();
+   }
 
-        long oldR = keyTypeRemainders.getLong(type);
-        long aMod = amount % apb;
-        long newR, extra;
-        if (oldR >= aMod) {
-            newR = oldR - aMod;
-            extra = 0;
-        } else {
-            newR = oldR + apb - aMod;
-            extra = 1;
-        }
+   public void rebuild(Object2LongOpenHashMap<AEKeyType> ktLo, Object2LongOpenHashMap<AEKeyType> ktHi, Object2IntOpenHashMap<AEKeyType> ktCounts, int totalKeys) {
+      this.keyTypeRemainders.clear();
+      this.keyTypeCounts.clear();
+      this.usedBytesLo = 0L;
+      this.usedBytesHi = 0L;
+      this.keyTypeCounts.putAll(ktCounts);
+      long[] divBuf = new long[2];
 
-        long bytesFreed = amount / apb + extra
-                + (oldR > 0 ? 1L : 0L) - (newR > 0 ? 1L : 0L);
+      for (ObjectIterator var6 = ktLo.keySet().iterator(); var6.hasNext(); this.usedBytesHi = this.usedBytesHi + divBuf[0]) {
+         AEKeyType kt = (AEKeyType)var6.next();
+         long tLo = ktLo.getLong(kt);
+         long tHi = ktHi.getLong(kt);
+         int apb = kt.getAmountPerByte();
+         long remainder = tHi == 0L ? tLo % (long)apb : DualLong126.mod126(tHi, tLo, apb);
+         this.keyTypeRemainders.put(kt, remainder);
+         DualLong126.ceilDiv126(tHi, tLo, apb, divBuf);
+         this.usedBytesLo = this.usedBytesLo + divBuf[1];
+         if (this.usedBytesLo < 0L) {
+            this.usedBytesLo &= Long.MAX_VALUE;
+            this.usedBytesHi++;
+         }
+      }
 
-        if (keyRemoved) {
-            bytesFreed += bytesPerType;
-            // fastutil addTo returns the PREVIOUS value: the last key of a type sees 1 here.
-            int countBefore = keyTypeCounts.addTo(type, -1);
-            if (countBefore <= 1) {
-                keyTypeCounts.removeInt(type);
-                keyTypeRemainders.removeLong(type);
-            } else {
-                keyTypeRemainders.put(type, newR);
-            }
-        } else {
-            keyTypeRemainders.put(type, newR);
-        }
-
-        usedBytesLo -= bytesFreed;
-        if (usedBytesLo < 0) { usedBytesLo &= Long.MAX_VALUE; usedBytesHi--; }
-    }
-
-    // ══════════════════════════════════════════════════════════════════════
-    //  Queries
-    // ══════════════════════════════════════════════════════════════════════
-
-    public long getUsedBytes() {
-        return DualLong126.cap(usedBytesHi, usedBytesLo);
-    }
-
-    public long getUsedBytesHi() { return usedBytesHi; }
-
-    public long getUsedBytesLo() { return usedBytesLo; }
-
-    public boolean isFull() {
-        if (capacityHi == usedBytesHi) return capacityLo <= usedBytesLo;
-        return capacityHi < usedBytesHi;
-    }
-
-    public boolean isTypeFull() {
-        return totalTypesGetter.getAsInt() >= maxTypes;
-    }
-
-    /** Test-only visibility: per-type bookkeeping entries must vanish with a type's last key. */
-    int trackedTypeEntries() {
-        return keyTypeCounts.size() + keyTypeRemainders.size();
-    }
-
-    // ══════════════════════════════════════════════════════════════════════
-    //  Cold-path: full rebuild from pre-aggregated per-type data — O(keyTypes)
-    // ══════════════════════════════════════════════════════════════════════
-
-    /**
-     * Rebuild byte tracking state from per-{@link AEKeyType} aggregates
-     * already maintained by the storage engine.
-     *
-     * @param ktLo   per-type total amount (lo half, 63-bit unsigned)
-     * @param ktHi   per-type total amount (hi half, 63-bit unsigned)
-     * @param ktCounts per-type unique key count
-     * @param totalKeys total number of unique keys across all types
-     */
-    public void rebuild(Object2LongOpenHashMap<AEKeyType> ktLo,
-                        Object2LongOpenHashMap<AEKeyType> ktHi,
-                        Object2IntOpenHashMap<AEKeyType> ktCounts,
-                        int totalKeys) {
-        keyTypeRemainders.clear();
-        keyTypeCounts.clear();
-        usedBytesLo = 0;
-        usedBytesHi = 0;
-
-        keyTypeCounts.putAll(ktCounts);
-
-        long[] divBuf = new long[2];
-        for (var kt : ktLo.keySet()) {
-            long tLo = ktLo.getLong(kt);
-            long tHi = ktHi.getLong(kt);
-            int apb = kt.getAmountPerByte();
-
-            long remainder = (tHi == 0) ? tLo % apb
-                                        : DualLong126.mod126(tHi, tLo, apb);
-            keyTypeRemainders.put(kt, remainder);
-
-            DualLong126.ceilDiv126(tHi, tLo, apb, divBuf);
-            usedBytesLo += divBuf[1];
-            if (usedBytesLo < 0) { usedBytesLo &= Long.MAX_VALUE; usedBytesHi++; }
-            usedBytesHi += divBuf[0];
-        }
-
-        usedBytesLo += (long) totalKeys * bytesPerType;
-        if (usedBytesLo < 0) { usedBytesLo &= Long.MAX_VALUE; usedBytesHi++; }
-    }
+      this.usedBytesLo = this.usedBytesLo + (long)totalKeys * (long)this.bytesPerType;
+      if (this.usedBytesLo < 0L) {
+         this.usedBytesLo &= Long.MAX_VALUE;
+         this.usedBytesHi++;
+      }
+   }
 }

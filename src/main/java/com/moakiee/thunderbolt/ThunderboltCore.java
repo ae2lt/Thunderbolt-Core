@@ -1,50 +1,42 @@
 package com.moakiee.thunderbolt;
 
-import com.mojang.logging.LogUtils;
-import com.moakiee.thunderbolt.api.eject.EjectCapabilityRegistry;
+import appeng.api.storage.StorageCells;
 import com.moakiee.thunderbolt.ae2.cell.IndexedCellStorageRegistry;
 import com.moakiee.thunderbolt.ae2.cell.IndexedStorageCellHandler;
+import com.moakiee.thunderbolt.api.eject.EjectCapabilityRegistry;
 import com.moakiee.thunderbolt.registry.ThunderboltBlockEntities;
-import appeng.api.storage.StorageCells;
-import net.neoforged.bus.api.IEventBus;
-import net.neoforged.fml.event.lifecycle.FMLCommonSetupEvent;
-import net.neoforged.neoforge.common.NeoForge;
-import net.neoforged.neoforge.event.server.ServerStartingEvent;
-import net.neoforged.neoforge.event.server.ServerStoppedEvent;
-import net.neoforged.fml.common.Mod;
+import com.mojang.logging.LogUtils;
+import net.minecraftforge.eventbus.api.IEventBus;
+import net.minecraftforge.fml.common.Mod;
+import net.minecraftforge.fml.event.lifecycle.FMLCommonSetupEvent;
+import net.minecraftforge.common.MinecraftForge;
+import net.minecraftforge.event.server.ServerStartingEvent;
+import net.minecraftforge.event.server.ServerStoppedEvent;
 import org.slf4j.Logger;
 
-/**
- * Entry point for Thunderbolt Core — the AE2 core optimization and feature layer.
- *
- * <p>It hosts low-level AE2 patches: most notably a linear-time autocrafting planner installed via
- * mixin on AE2's {@code CraftingCalculation}. It depends only on AE2, not on AE2 Lightning Tech, so
- * compatible host mods can register extended crafting CPU clusters without duplicating AE2 hooks.
- */
-@Mod(ThunderboltCore.MODID)
+@Mod("thunderbolt")
 public final class ThunderboltCore {
+   public static final String MODID = "thunderbolt";
+   public static final Logger LOGGER = LogUtils.getLogger();
 
-    public static final String MODID = "thunderbolt";
-    public static final Logger LOGGER = LogUtils.getLogger();
+   public ThunderboltCore(IEventBus modEventBus) {
+      ThunderboltBlockEntities.TYPES.register(modEventBus);
+      modEventBus.addListener(this::onCommonSetup);
+      MinecraftForge.EVENT_BUS.addListener(this::onServerStarting);
+      MinecraftForge.EVENT_BUS.addListener(this::onServerStopped);
+      LOGGER.info("[Thunderbolt Core] initialized");
+   }
 
-    public ThunderboltCore(IEventBus modEventBus) {
-        ThunderboltBlockEntities.TYPES.register(modEventBus);
-        modEventBus.addListener(this::onCommonSetup);
-        NeoForge.EVENT_BUS.addListener(this::onServerStarting);
-        NeoForge.EVENT_BUS.addListener(this::onServerStopped);
-        LOGGER.info("[Thunderbolt Core] initialized");
-    }
+   private void onServerStarting(ServerStartingEvent event) {
+      EjectCapabilityRegistry.onServerStart(event.getServer());
+      IndexedCellStorageRegistry.get(event.getServer());
+   }
 
-    private void onServerStarting(ServerStartingEvent event) {
-        EjectCapabilityRegistry.onServerStart(event.getServer());
-        IndexedCellStorageRegistry.get(event.getServer());
-    }
+   private void onServerStopped(ServerStoppedEvent event) {
+      EjectCapabilityRegistry.onServerStop();
+   }
 
-    private void onServerStopped(ServerStoppedEvent event) {
-        EjectCapabilityRegistry.onServerStop();
-    }
-
-    private void onCommonSetup(FMLCommonSetupEvent event) {
-        event.enqueueWork(() -> StorageCells.addCellHandler(IndexedStorageCellHandler.INSTANCE));
-    }
+   private void onCommonSetup(FMLCommonSetupEvent event) {
+      event.enqueueWork(() -> StorageCells.addCellHandler(IndexedStorageCellHandler.INSTANCE));
+   }
 }

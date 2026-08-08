@@ -1,19 +1,15 @@
 package com.moakiee.thunderbolt.ae2.timewheel;
 
-import org.jetbrains.annotations.Nullable;
-
 import com.moakiee.thunderbolt.ae2.crafting.ExtendedCraftingCpuCluster;
 import com.moakiee.thunderbolt.ae2.crafting.ExtendedCraftingCpuClusterProvider;
+import org.jetbrains.annotations.Nullable;
 
-/**
- * Compatibility provider API for grid nodes that dynamically publish a time-wheel CPU pool.
- */
 public interface TimeWheelCraftingCpuPoolProvider extends ExtendedCraftingCpuClusterProvider {
-    @Nullable
-    TimeWheelCraftingCpuPool getTimeWheelCraftingCpuPool();
+   @Nullable
+   TimeWheelCraftingCpuPool getTimeWheelCraftingCpuPool();
 
-    @Override
-    default ExtendedCraftingCpuCluster getExtendedCraftingCpuCluster() {
-        return getTimeWheelCraftingCpuPool();
-    }
+   @Override
+   default ExtendedCraftingCpuCluster getExtendedCraftingCpuCluster() {
+      return this.getTimeWheelCraftingCpuPool();
+   }
 }

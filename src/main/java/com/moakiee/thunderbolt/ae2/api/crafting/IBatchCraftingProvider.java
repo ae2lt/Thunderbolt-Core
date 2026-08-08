@@ -4,70 +4,26 @@ import appeng.api.crafting.IPatternDetails;
 import appeng.api.networking.crafting.ICraftingProvider;
 import appeng.api.stacks.KeyCounter;
 
-/**
- * Optional crafting-provider contract for CPU-side batch dispatch.
- *
- * <p>The AE2 CPU mixin pre-extracts up to {@code maxCraft} homogeneous copies of a pattern's
- * inputs, then hands this method a SINGLE-COPY input template plus {@code maxCraft}.
- * Implementations return how many copies were not accepted; the CPU reinjects that leftover and
- * treats the accepted copy count as if that many vanilla {@link #pushPattern} calls had succeeded.
- */
 public interface IBatchCraftingProvider extends ICraftingProvider {
-    /**
-     * Controls CPU-side copy accounting for this pattern.
-     *
-     * <p>{@link BatchDispatchMode#UNBOUNDED} bypasses only legacy per-call operation-to-copy
-     * accounting and gives this provider priority within the current batch. It does not bypass a
-     * finite CPU's per-tick copy budget. Input extraction, energy payment, the provider's reported
-     * capacity and the provider's own acceptance checks still apply normally.
-     */
-    default BatchDispatchMode getBatchDispatchMode(IPatternDetails details) {
-        return BatchDispatchMode.NORMAL;
-    }
+   default BatchDispatchMode getBatchDispatchMode(IPatternDetails details) {
+      return BatchDispatchMode.NORMAL;
+   }
 
-    /**
-     * Optional hint: how many copies this provider could accept for this pattern right now.
-     *
-     * <p>This is only an advisory upper bound on how many copies the CPU pre-extracts before
-     * calling {@link #pushBatch}; it is NOT a correctness constraint. {@code pushBatch} is the
-     * real gatekeeper (it returns the leftover it could not accept), and the CPU's own op budget
-     * also limits dispatch. Returning {@code 0} means temporarily unavailable (busy / full /
-     * offline) and must agree with {@link #isBusy()}. Returning {@code 1} selects the CPU's
-     * optimized ordinary single-copy dispatch path instead of this batch interface. Values greater
-     * than {@code 1} opt into batch dispatch.
-     * The default returns {@link Long#MAX_VALUE} when not busy, i.e. "no extra cap beyond what
-     * pushBatch and the CPU budget already enforce". Override with a tighter, accurate value if
-     * you want to stop the CPU from over-extracting inputs that pushBatch would only reinject.
-     */
-    default long getBatchCapacity(IPatternDetails details) {
-        return isBusy() ? 0L : Long.MAX_VALUE;
-    }
+   default long getBatchCapacity(IPatternDetails details) {
+      return this.isBusy() ? 0L : Long.MAX_VALUE;
+   }
 
-    /** Explicit opt-in for one reusable seed being sent once for an entire batch. */
-    default boolean supportsSingleSeedBatch() {
-        return false;
-    }
+   default boolean supportsSingleSeedBatch() {
+      return false;
+   }
 
-    /**
-     * Try to consume up to {@code maxCraft} copies of {@code details}.
-     *
-     * @param details the pattern being crafted
-     * @param oneCopyTemplate single-copy input template (NOT multiplied by {@code maxCraft})
-     * @param maxCraft maximum copies the caller is willing to dispatch
-     * @return leftover copy count in {@code [0, maxCraft]}
-     */
-    long pushBatch(IPatternDetails details, KeyCounter[] oneCopyTemplate, long maxCraft);
+   long pushBatch(IPatternDetails var1, KeyCounter[] var2, long var3);
 
-    /**
-     * Context-aware variant used by the CPU dispatcher. Existing providers keep the original
-     * contract; integrations that persist work ownership may override this method.
-     */
-    default long pushBatch(BatchDispatchContext context) {
-        return pushBatch(context.details(), context.oneCopyTemplate(), context.maxCraft());
-    }
+   default long pushBatch(BatchDispatchContext context) {
+      return this.pushBatch(context.details(), context.oneCopyTemplate(), context.maxCraft());
+   }
 
-    @Override
-    default boolean pushPattern(IPatternDetails patternDetails, KeyCounter[] inputHolder) {
-        return pushBatch(patternDetails, inputHolder, 1L) == 0L;
-    }
+   default boolean pushPattern(IPatternDetails patternDetails, KeyCounter[] inputHolder) {
+      return this.pushBatch(patternDetails, inputHolder, 1L) == 0L;
+   }
 }
