@@ -17,6 +17,7 @@ Shared AE2 optimization and infrastructure layer for AE2 Lightning Tech. Provide
 [[dependencies.thunderbolt]]
     modId="forge"
     type="required"
+    mandatory=true
     versionRange="[47.4.20,48)"
     ordering="NONE"
     side="BOTH"
@@ -24,6 +25,7 @@ Shared AE2 optimization and infrastructure layer for AE2 Lightning Tech. Provide
 [[dependencies.thunderbolt]]
     modId="minecraft"
     type="required"
+    mandatory=true
     versionRange="[1.20.1,1.20.2)"
     ordering="NONE"
     side="BOTH"
@@ -31,6 +33,7 @@ Shared AE2 optimization and infrastructure layer for AE2 Lightning Tech. Provide
 [[dependencies.thunderbolt]]
     modId="ae2"
     type="required"
+    mandatory=true
     versionRange="[15.4.10,15.5.0)"
     ordering="AFTER"
     side="BOTH"
