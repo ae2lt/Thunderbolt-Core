@@ -2,9 +2,12 @@ package com.moakiee.thunderbolt.core.planner.reference;
 
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
+import java.util.SplittableRandom;
 
 import com.moakiee.thunderbolt.core.planner.CraftGraph;
 import com.moakiee.thunderbolt.core.planner.CraftInput;
@@ -15,6 +18,10 @@ import com.moakiee.thunderbolt.core.planner.ReusableStockSource;
 public final class ThunderboltReferenceScenarios {
     private static final long UNBOUNDED_STOCK = 1_000_000_000_000L;
     private static final int REFERENCE_DAG_DEPTH = 32;
+    private static final int GREEDY_TRAP_GROUPS = 32;
+    private static final long GREEDY_TRAP_HASH_SEED = 0x5EED_C0DE_6A09_E667L;
+    private static final String GREEDY_TRAP_TARGET = "greedy_trap_target";
+    private static final List<GreedyTrapGroup> GREEDY_TRAP_DATA = greedyTrapData();
 
     private ThunderboltReferenceScenarios() {
     }
@@ -87,24 +94,75 @@ public final class ThunderboltReferenceScenarios {
     }
 
     private static void addGreedyTrapMultiDag(List<ReferenceScenario> out, int amount) {
-        Map<String, Long> minimum = Map.of("R", (long) amount, "S", (long) amount);
-        Map<String, Long> starved = Map.of("R", (long) amount);
+        var minimum = new LinkedHashMap<String, Long>();
+        var starved = new LinkedHashMap<String, Long>();
+        var allRMissing = new LinkedHashMap<String, Long>();
+        var allSMissing = new LinkedHashMap<String, Long>();
+        for (var group : GREEDY_TRAP_DATA) {
+            minimum.put(group.r(), (long) amount);
+            minimum.put(group.s(), (long) amount);
+            starved.put(group.r(), (long) amount);
+            allRMissing.put(group.r(), (long) amount);
+            allSMissing.put(group.s(), (long) amount);
+        }
+        // Every group may be repaired with either R or S, so the full minimum frontier has 2^N
+        // members. Two deterministic witnesses are enough for the cost baseline; refill replay
+        // remains authoritative for every mixed report.
         List<Map<String, Long>> missing = List.of(
-                Map.of("R", (long) amount), Map.of("S", (long) amount));
+                Map.copyOf(allRMissing), Map.copyOf(allSMissing));
         addThreeModes(out, "multi-dag/greedy-trap", ReferenceCapability.MULTI_DAG, amount,
-                "Z", amount, minimum, starved, missing,
+                GREEDY_TRAP_TARGET, amount, Map.copyOf(minimum), Map.copyOf(starved), missing,
+                false,
                 ThunderboltReferenceScenarios::greedyTrapMultiDag);
     }
 
     private static CraftGraph<String> greedyTrapMultiDag(Map<String, Long> stock) {
-        var builder = CraftGraph.<String>builder()
-                .pattern("Z", 1, List.of(CraftInput.of("A", 1), CraftInput.of("B", 1)))
-                .pattern("A", 1, List.of(CraftInput.of("R", 1)))
-                // R is deliberately registered before S: consuming it for B is a local greedy trap.
-                .pattern("B", 1, List.of(CraftInput.of("R", 1)))
-                .pattern("B", 1, List.of(CraftInput.of("S", 1)));
+        var builder = CraftGraph.<String>builder();
+        var groupOutputs = new ArrayList<CraftInput<String>>(GREEDY_TRAP_DATA.size());
+        for (var group : GREEDY_TRAP_DATA) {
+            builder.pattern(group.output(), 1, List.of(
+                    CraftInput.of(group.a(), 1), CraftInput.of(group.b(), 1)));
+            builder.pattern(group.a(), 1, List.of(CraftInput.of(group.r(), 1)));
+            // R is deliberately registered before S: consuming it for B is a local greedy trap.
+            builder.pattern(group.b(), 1, List.of(CraftInput.of(group.r(), 1)));
+            builder.pattern(group.b(), 1, List.of(CraftInput.of(group.s(), 1)));
+            groupOutputs.add(CraftInput.of(group.output(), 1));
+        }
+        builder.pattern(GREEDY_TRAP_TARGET, 1, groupOutputs);
         stock.forEach(builder::stock);
         return builder.build();
+    }
+
+    /**
+     * Fixed-seed opaque material names give every trap independent String hash codes while keeping
+     * failures exactly reproducible. This avoids one JVM choosing a single A/B order for the whole
+     * benchmark merely because every batch reused the same two material keys.
+     */
+    private static List<GreedyTrapGroup> greedyTrapData() {
+        var random = new SplittableRandom(GREEDY_TRAP_HASH_SEED);
+        var used = new HashSet<String>();
+        var groups = new ArrayList<GreedyTrapGroup>(GREEDY_TRAP_GROUPS);
+        for (int index = 0; index < GREEDY_TRAP_GROUPS; index++) {
+            groups.add(new GreedyTrapGroup(
+                    randomMaterial(random, used),
+                    randomMaterial(random, used),
+                    randomMaterial(random, used),
+                    randomMaterial(random, used),
+                    randomMaterial(random, used)));
+        }
+        return List.copyOf(groups);
+    }
+
+    private static String randomMaterial(SplittableRandom random, Set<String> used) {
+        String value;
+        do {
+            value = "g_" + Long.toUnsignedString(random.nextLong(), 36)
+                    + "_" + Long.toUnsignedString(random.nextLong(), 36);
+        } while (!used.add(value));
+        return value;
+    }
+
+    private record GreedyTrapGroup(String a, String b, String r, String s, String output) {
     }
 
     private static void addFibonacciMultiDag(List<ReferenceScenario> out, int depth) {
