@@ -1,5 +1,6 @@
 package com.moakiee.thunderbolt.core.planner;
 
+import java.math.BigInteger;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Deque;
@@ -14,47 +15,80 @@ import java.util.Set;
 /**
  * Finds ordinary, non-growing feedback state machines before any aggregate planning pass runs.
  *
- * <p>The analysis deliberately proves only a narrow marked-graph shape. Every state in a component
- * has exactly one internal producer and one internal consumer, every participating pattern moves one
- * internal state to one other internal state, and firing every transition once never increases any
- * state. This covers balanced raw catalysts such as
+ * <p>The exact tier recognizes marked cycles: every state has one internal producer and consumer,
+ * while every transition moves one weighted state to the next. Arbitrary arc weights are compiled
+ * into primitive non-growing firing ratios; actual plans are decomposed into repeated weighted rounds
+ * plus a bounded residual. This covers balanced raw catalysts such as
  * {@code A -> 2B; 2B + C -> E + D; D -> A} and lossy feedback such as
  * {@code 3A -> 2B; 2B -> D + 2A}, without admitting gain loops such as {@code A -> 2A}.
- * Anything more complicated stays on the planner's existing conservative paths.
+ * More complicated locally non-growing SCCs use a bounded canonical replay that may overstate the
+ * initial marking but never reports an unexecutable firing multiset as ready.
  */
 final class ConservativeFeedbackAnalysis<K> {
 
-    /** State that must remain after ordinary net loss has already been charged. */
-    record SeedOption<K>(Map<K, Long> amounts) {
-        SeedOption {
-            amounts = Map.copyOf(amounts);
+    /** Exact per-firing replay is limited to one primitive weighted round, never the request size. */
+    private static final int MAX_PRIMITIVE_ROUND_FIRINGS = 4_096;
+    private static final int MAX_SCHEDULE_OPTIONS = 4_096;
+    private static final int MAX_FALLBACK_STARTS = 16;
+    private static final int MAX_FALLBACK_REPLAY_STEPS = 4_096;
+    private static final int MAX_FALLBACK_PATTERN_PROBES = 65_536;
+
+    /** Prefix marking and net change of one deterministic execution block. */
+    record ScheduleOption<K>(Map<K, BigInteger> required, Map<K, BigInteger> delta) {
+        ScheduleOption {
+            required = Map.copyOf(required);
+            delta = Map.copyOf(delta);
         }
     }
 
-    record Component<K>(Set<K> states, List<CraftPattern<K>> patterns,
-                        Map<K, Long> lossPerRound,
-                        boolean hasExternalProducer,
-                        List<SeedOption<K>> seedOptions) {
+    record RoundVector<K>(Map<CraftPattern<K>, Long> firings) {
+        RoundVector {
+            firings = Map.copyOf(firings);
+        }
+    }
+
+    record Component<K>(Set<K> states,
+                        List<K> stateOrder,
+                        List<CraftPattern<K>> patterns,
+                        List<Transition<K>> cycle,
+                        List<RoundVector<K>> firingVectors,
+                        boolean hasExternalProducer) {
         Component {
             states = Set.copyOf(states);
+            stateOrder = List.copyOf(stateOrder);
             patterns = List.copyOf(patterns);
-            lossPerRound = Map.copyOf(lossPerRound);
-            seedOptions = List.copyOf(seedOptions);
-        }
-
-        boolean lossy() {
-            return !lossPerRound.isEmpty();
+            cycle = List.copyOf(cycle);
+            firingVectors = List.copyOf(firingVectors);
         }
     }
 
-    private record Transition<K>(CraftPattern<K> pattern, K input, long inputAmount,
-                                 K output, long outputAmount) {
+    /** Any proven non-growing ordinary SCC that is not a strict marked cycle. */
+    record FallbackComponent<K>(Set<K> states,
+                                List<K> stateOrder,
+                                List<CraftPattern<K>> patterns) {
+        FallbackComponent {
+            states = Set.copyOf(states);
+            stateOrder = List.copyOf(stateOrder);
+            patterns = List.copyOf(patterns);
+        }
+    }
+
+    record Analysis<K>(List<Component<K>> components,
+                       List<FallbackComponent<K>> fallbacks) {
+        Analysis {
+            components = List.copyOf(components);
+            fallbacks = List.copyOf(fallbacks);
+        }
+    }
+
+    record Transition<K>(CraftPattern<K> pattern, K input, long inputAmount,
+                         K output, long outputAmount) {
     }
 
     private ConservativeFeedbackAnalysis() {
     }
 
-    static <K> List<Component<K>> analyze(
+    static <K> Analysis<K> analyzeAll(
             List<K> itemOrder,
             Map<K, List<CraftPattern<K>>> patternsByOutput) {
         List<CraftPattern<K>> patterns = stablePatterns(itemOrder, patternsByOutput);
@@ -84,6 +118,7 @@ final class ConservativeFeedbackAnalysis<K> {
         for (int i = 0; i < itemOrder.size(); i++) itemRank.putIfAbsent(itemOrder.get(i), i);
 
         List<Component<K>> result = new ArrayList<>();
+        List<FallbackComponent<K>> fallbacks = new ArrayList<>();
         for (Set<K> states : stronglyConnected) {
             PlanningCancellation.check();
             boolean selfLoop = states.size() == 1
@@ -91,9 +126,15 @@ final class ConservativeFeedbackAnalysis<K> {
                             .contains(states.iterator().next());
             if (states.size() <= 1 && !selfLoop) continue;
             Component<K> component = classify(states, patterns, itemRank);
-            if (component != null) result.add(component);
+            if (component != null) {
+                result.add(component);
+            } else {
+                FallbackComponent<K> fallback = classifyFallback(
+                        states, patterns, itemRank);
+                if (fallback != null) fallbacks.add(fallback);
+            }
         }
-        return List.copyOf(result);
+        return new Analysis<>(result, fallbacks);
     }
 
     private static <K> List<CraftPattern<K>> stablePatterns(
@@ -170,13 +211,9 @@ final class ConservativeFeedbackAnalysis<K> {
 
         Map<K, Transition<K>> consumerByState = new HashMap<>();
         Map<K, Transition<K>> producerByState = new HashMap<>();
-        Map<K, Long> consumed = new HashMap<>();
-        Map<K, Long> produced = new HashMap<>();
         for (Transition<K> transition : transitions) {
             if (consumerByState.putIfAbsent(transition.input(), transition) != null
-                    || producerByState.putIfAbsent(transition.output(), transition) != null
-                    || !mergeExact(consumed, transition.input(), transition.inputAmount())
-                    || !mergeExact(produced, transition.output(), transition.outputAmount())) {
+                    || producerByState.putIfAbsent(transition.output(), transition) != null) {
                 return null;
             }
         }
@@ -184,19 +221,9 @@ final class ConservativeFeedbackAnalysis<K> {
                 || !producerByState.keySet().equals(states)) {
             return null;
         }
-        Map<K, Long> lossPerRound = new LinkedHashMap<>();
-        for (K state : states) {
-            long consumedAmount = consumed.getOrDefault(state, 0L);
-            long producedAmount = produced.getOrDefault(state, 0L);
-            if (producedAmount > consumedAmount) return null;
-            if (producedAmount < consumedAmount) {
-                lossPerRound.put(state, consumedAmount - producedAmount);
-            }
-        }
-
         List<Transition<K>> cycle = new ArrayList<>(transitions.size());
         Set<CraftPattern<K>> visited = new HashSet<>();
-        Transition<K> current = transitions.get(0);
+        Transition<K> current = stableStart(transitions, itemRank);
         while (visited.add(current.pattern())) {
             cycle.add(current);
             current = consumerByState.get(current.output());
@@ -206,59 +233,618 @@ final class ConservativeFeedbackAnalysis<K> {
             return null;
         }
 
-        List<SeedOption<K>> options = seedOptions(cycle, producerByState);
-        if (options.isEmpty()) return null;
-        options.sort((left, right) -> {
-            int byLoss = Long.compare(
-                    seedLoss(right, lossPerRound), seedLoss(left, lossPerRound));
-            if (byLoss != 0) return byLoss;
-            int byAmount = Long.compare(seedAmount(left), seedAmount(right));
-            return byAmount != 0
-                    ? byAmount
-                    : Integer.compare(seedRank(left, itemRank), seedRank(right, itemRank));
-        });
+        List<RoundVector<K>> firingVectors = primitiveFiringVectors(cycle);
+        if (firingVectors.isEmpty()) return null; // strict gain or unrepresentable weighted round
         List<CraftPattern<K>> cyclePatterns = new ArrayList<>(cycle.size());
         for (Transition<K> transition : cycle) cyclePatterns.add(transition.pattern());
+        List<K> stateOrder = new ArrayList<>(states);
+        stateOrder.sort(java.util.Comparator.comparingInt(
+                state -> itemRank.getOrDefault(state, Integer.MAX_VALUE)));
         return new Component<>(
-                states, cyclePatterns, lossPerRound, hasExternalProducer, options);
+                states, stateOrder, cyclePatterns, cycle, firingVectors, hasExternalProducer);
     }
 
-    private static <K> long seedLoss(SeedOption<K> option, Map<K, Long> lossPerRound) {
-        long result = 0L;
-        for (K key : option.amounts().keySet()) {
-            result = Sat.add(result, lossPerRound.getOrDefault(key, 0L));
+    private static <K> Transition<K> stableStart(
+            List<Transition<K>> transitions, Map<K, Integer> itemRank) {
+        Transition<K> result = transitions.get(0);
+        int resultRank = itemRank.getOrDefault(result.input(), Integer.MAX_VALUE);
+        for (int i = 1; i < transitions.size(); i++) {
+            Transition<K> candidate = transitions.get(i);
+            int rank = itemRank.getOrDefault(candidate.input(), Integer.MAX_VALUE);
+            if (rank < resultRank) {
+                result = candidate;
+                resultRank = rank;
+            }
         }
         return result;
     }
 
-    private static <K> long seedAmount(SeedOption<K> option) {
-        long result = 0L;
-        for (long amount : option.amounts().values()) result = Sat.add(result, amount);
-        return result;
+    /**
+     * Fallback for ordinary Petri SCCs whose unit-token potential proves every internal transition
+     * locally non-growing. Local-growth transitions stay with the contracted gain-loop path or the
+     * existing decline behavior.
+     */
+    private static <K> FallbackComponent<K> classifyFallback(
+            Set<K> states,
+            List<CraftPattern<K>> patterns,
+            Map<K, Integer> itemRank) {
+        List<CraftPattern<K>> internalPatterns = new ArrayList<>();
+        for (CraftPattern<K> pattern : patterns) {
+            BigInteger internalInput = BigInteger.ZERO;
+            BigInteger internalOutput = BigInteger.ZERO;
+            for (CraftInput<K> input : pattern.inputs()) {
+                if (!states.contains(input.key())) continue;
+                if (!isOrdinary(input)) return null;
+                internalInput = internalInput.add(BigInteger.valueOf(input.amount()));
+            }
+            if (states.contains(pattern.output())) {
+                internalOutput = internalOutput.add(BigInteger.valueOf(pattern.outputAmount()));
+            }
+            for (CraftOutput<K> output : pattern.byproducts()) {
+                if (states.contains(output.key())) {
+                    internalOutput = internalOutput.add(BigInteger.valueOf(output.amount()));
+                }
+            }
+            if (internalInput.signum() == 0 || internalOutput.signum() == 0) continue;
+            if (internalOutput.compareTo(internalInput) > 0) return null;
+            internalPatterns.add(pattern);
+        }
+        if (internalPatterns.isEmpty()) return null;
+        List<K> stateOrder = new ArrayList<>(states);
+        stateOrder.sort(java.util.Comparator.comparingInt(
+                state -> itemRank.getOrDefault(state, Integer.MAX_VALUE)));
+        return new FallbackComponent<>(states, stateOrder, internalPatterns);
     }
 
-    private static <K> int seedRank(SeedOption<K> option, Map<K, Integer> itemRank) {
-        int result = Integer.MAX_VALUE;
-        for (K key : option.amounts().keySet()) {
-            result = Math.min(result, itemRank.getOrDefault(key, Integer.MAX_VALUE));
+    /**
+     * Minimal positive transition ratio for one weighted round. Every state except the stable cut is
+     * exactly balanced; the cut may lose tokens but must never gain them. This is the weighted form
+     * of the old "fire every transition once" model.
+     */
+    private static <K> List<RoundVector<K>> primitiveFiringVectors(
+            List<Transition<K>> stableCycle) {
+        List<RoundVector<K>> result = new ArrayList<>(stableCycle.size());
+        Set<Map<CraftPattern<K>, Long>> seen = new HashSet<>();
+        for (int start = 0; start < stableCycle.size(); start++) {
+            List<Transition<K>> rotated = new ArrayList<>(stableCycle.size());
+            for (int offset = 0; offset < stableCycle.size(); offset++) {
+                rotated.add(stableCycle.get((start + offset) % stableCycle.size()));
+            }
+            Map<CraftPattern<K>, Long> vector = primitiveFiringVector(rotated);
+            if (vector != null && seen.add(vector)) result.add(new RoundVector<>(vector));
+        }
+        return List.copyOf(result);
+    }
+
+    private static <K> Map<CraftPattern<K>, Long> primitiveFiringVector(
+            List<Transition<K>> cycle) {
+        int size = cycle.size();
+        BigInteger[] numerators = new BigInteger[size];
+        BigInteger[] denominators = new BigInteger[size];
+        numerators[0] = BigInteger.ONE;
+        denominators[0] = BigInteger.ONE;
+        for (int i = 1; i < size; i++) {
+            Transition<K> previous = cycle.get(i - 1);
+            Transition<K> current = cycle.get(i);
+            BigInteger numerator = numerators[i - 1]
+                    .multiply(BigInteger.valueOf(previous.outputAmount()));
+            BigInteger denominator = denominators[i - 1]
+                    .multiply(BigInteger.valueOf(current.inputAmount()));
+            BigInteger gcd = numerator.gcd(denominator);
+            numerators[i] = numerator.divide(gcd);
+            denominators[i] = denominator.divide(gcd);
+        }
+
+        BigInteger commonDenominator = BigInteger.ONE;
+        for (BigInteger denominator : denominators) {
+            commonDenominator = lcm(commonDenominator, denominator);
+            if (commonDenominator.compareTo(BigInteger.valueOf(Sat.SAT)) > 0) return null;
+        }
+        BigInteger[] firings = new BigInteger[size];
+        BigInteger commonGcd = BigInteger.ZERO;
+        for (int i = 0; i < size; i++) {
+            firings[i] = numerators[i].multiply(commonDenominator.divide(denominators[i]));
+            commonGcd = commonGcd.signum() == 0 ? firings[i] : commonGcd.gcd(firings[i]);
+        }
+        if (commonGcd.signum() <= 0) return null;
+        for (int i = 0; i < size; i++) firings[i] = firings[i].divide(commonGcd);
+
+        Transition<K> first = cycle.get(0);
+        Transition<K> last = cycle.get(size - 1);
+        BigInteger consumedAtCut = firings[0]
+                .multiply(BigInteger.valueOf(first.inputAmount()));
+        BigInteger producedAtCut = firings[size - 1]
+                .multiply(BigInteger.valueOf(last.outputAmount()));
+        if (producedAtCut.compareTo(consumedAtCut) > 0) return null;
+
+        Map<CraftPattern<K>, Long> result = new LinkedHashMap<>();
+        for (int i = 0; i < size; i++) {
+            if (firings[i].signum() <= 0
+                    || firings[i].compareTo(BigInteger.valueOf(Sat.SAT)) > 0) {
+                return null;
+            }
+            result.put(cycle.get(i).pattern(), firings[i].longValueExact());
         }
         return result;
     }
 
-    private static <K> List<SeedOption<K>> seedOptions(
-            List<Transition<K>> cycle,
-            Map<K, Transition<K>> producerByState) {
-        List<SeedOption<K>> result = new ArrayList<>(cycle.size());
-        Set<Map<K, Long>> seen = new HashSet<>();
-        // Choosing a transition as the first step leaves one predecessor output batch after a full
-        // round. Ordinary accounting already charges any per-round deficit; this retained batch is
-        // the additional physical marking that algebraic cancellation would otherwise erase.
-        for (Transition<K> transition : cycle) {
-            Transition<K> producer = producerByState.get(transition.input());
-            Map<K, Long> option = Map.of(transition.input(), producer.outputAmount());
-            if (seen.add(option)) result.add(new SeedOption<>(option));
+    /**
+     * Canonical executable prefix markings for the actual firing multiset. Requested amounts are
+     * decomposed into a primitive weighted round repeated in closed form plus one bounded residual.
+     * When a primitive vector is too wide for exact per-firing replay, grouped rotations remain a
+     * sound (possibly non-minimal) fallback.
+     */
+    static <K> List<ScheduleOption<K>> scheduleOptions(
+            Component<K> component, Map<CraftPattern<K>, Long> fired) {
+        List<Transition<K>> cycle = component.cycle();
+        int size = cycle.size();
+        long[] actual = new long[size];
+        for (int i = 0; i < size; i++) {
+            CraftPattern<K> pattern = cycle.get(i).pattern();
+            actual[i] = fired.getOrDefault(pattern, 0L);
+            if (actual[i] <= 0L) return List.of();
+        }
+
+        List<ScheduleOption<K>> result = new ArrayList<>();
+        Set<Map<K, BigInteger>> seenRequirements = new HashSet<>();
+        outer:
+        for (RoundVector<K> roundVector : component.firingVectors()) {
+            long[] vector = new long[size];
+            long rounds = Long.MAX_VALUE;
+            for (int i = 0; i < size; i++) {
+                vector[i] = roundVector.firings().getOrDefault(cycle.get(i).pattern(), 0L);
+                if (vector[i] <= 0L) continue outer;
+                rounds = Math.min(rounds, actual[i] / vector[i]);
+            }
+            if (rounds == Long.MAX_VALUE) continue;
+
+            long[] residual = new long[size];
+            for (int i = 0; i < size; i++) {
+                residual[i] = actual[i] - rounds * vector[i];
+            }
+            List<ScheduleOption<K>> roundOptions = rounds > 0L
+                    ? schedulesForCounts(cycle, vector)
+                    : List.of(zeroSchedule());
+            List<ScheduleOption<K>> residualOptions = anyPositive(residual)
+                    ? schedulesForCounts(cycle, residual)
+                    : List.of(zeroSchedule());
+            for (ScheduleOption<K> round : roundOptions) {
+                ScheduleOption<K> repeated = repeat(round, rounds, component.states());
+                if (repeated == null) continue;
+                for (ScheduleOption<K> residualSchedule : residualOptions) {
+                    ScheduleOption<K> roundsThenResidual = compose(
+                            repeated, residualSchedule, component.states());
+                    if (seenRequirements.add(roundsThenResidual.required())) {
+                        result.add(roundsThenResidual);
+                        if (result.size() >= MAX_SCHEDULE_OPTIONS) break outer;
+                    }
+                    ScheduleOption<K> residualThenRounds = compose(
+                            residualSchedule, repeated, component.states());
+                    if (seenRequirements.add(residualThenRounds.required())) {
+                        result.add(residualThenRounds);
+                        if (result.size() >= MAX_SCHEDULE_OPTIONS) break outer;
+                    }
+                }
+            }
+        }
+        return List.copyOf(result);
+    }
+
+    /**
+     * Deterministic prefix schedules for an arbitrary proven non-growing ordinary SCC. Small and
+     * normally behaving firing multisets are replayed by enabled transition batches. If replay does
+     * not converge within a fixed amount-independent work cap, the remaining firings are grouped in
+     * stable order and topped up conservatively. Every returned marking is therefore executable;
+     * only its minimality may degrade on a complicated Petri net.
+     */
+    static <K> List<ScheduleOption<K>> scheduleOptions(
+            FallbackComponent<K> component, Map<CraftPattern<K>, Long> fired) {
+        List<CraftPattern<K>> active = new ArrayList<>();
+        for (CraftPattern<K> pattern : component.patterns()) {
+            if (fired.getOrDefault(pattern, 0L) > 0L) active.add(pattern);
+        }
+        if (active.isEmpty()) return List.of();
+
+        int starts = Math.min(active.size(), MAX_FALLBACK_STARTS);
+        int replaySteps = Math.max(1, Math.min(MAX_FALLBACK_REPLAY_STEPS,
+                MAX_FALLBACK_PATTERN_PROBES / starts / active.size()));
+        List<ScheduleOption<K>> result = new ArrayList<>(starts);
+        Set<Map<K, BigInteger>> seen = new HashSet<>();
+        for (int start = 0; start < starts; start++) {
+            PlanningCancellation.check();
+            ScheduleOption<K> option = replayFallback(
+                    component.states(), active, fired, start, replaySteps);
+            if (seen.add(option.required())) result.add(option);
+        }
+        return List.copyOf(result);
+    }
+
+    private static <K> ScheduleOption<K> replayFallback(
+            Set<K> states,
+            List<CraftPattern<K>> patterns,
+            Map<CraftPattern<K>, Long> fired,
+            int start,
+            int replaySteps) {
+        long[] remaining = new long[patterns.size()];
+        for (int i = 0; i < patterns.size(); i++) {
+            remaining[i] = fired.getOrDefault(patterns.get(i), 0L);
+        }
+        Map<K, BigInteger> balance = new HashMap<>();
+        Map<K, BigInteger> required = new LinkedHashMap<>();
+        int cursor = start;
+        int steps = 0;
+        boolean seeded = false;
+        while (anyPositive(remaining) && steps++ < replaySteps) {
+            PlanningCancellation.check();
+            int selected = -1;
+            for (int offset = 0; offset < patterns.size(); offset++) {
+                int index = (cursor + offset) % patterns.size();
+                if (remaining[index] <= 0L) continue;
+                if (fallbackEnabled(patterns.get(index), states, balance)) {
+                    selected = index;
+                    break;
+                }
+            }
+            if (selected < 0) {
+                selected = seeded
+                        ? bestFallbackCut(states, patterns, remaining, balance, required, start)
+                        : nextRemaining(remaining, start);
+                topUpFallback(patterns.get(selected), states, BigInteger.ONE,
+                        balance, required, false);
+                seeded = true;
+                cursor = selected;
+                continue;
+            }
+
+            CraftPattern<K> pattern = patterns.get(selected);
+            long batch = fallbackBatch(pattern, states, balance, remaining[selected]);
+            fireFallback(pattern, states, BigInteger.valueOf(batch), balance);
+            remaining[selected] -= batch;
+            cursor = (selected + 1) % patterns.size();
+        }
+
+        // A bounded, sound degradation for very large or highly interleaved nets. Charging a whole
+        // stable block may overstate the initial marking, but it cannot claim an unexecutable plan.
+        if (anyPositive(remaining)) {
+            for (int offset = 0; offset < patterns.size(); offset++) {
+                int index = (start + offset) % patterns.size();
+                if (remaining[index] <= 0L) continue;
+                BigInteger times = BigInteger.valueOf(remaining[index]);
+                topUpFallback(patterns.get(index), states, times,
+                        balance, required, true);
+                fireFallback(patterns.get(index), states, times, balance);
+                remaining[index] = 0L;
+            }
+        }
+        return new ScheduleOption<>(required, fallbackDelta(states, patterns, fired));
+    }
+
+    /** Prefer one refill material, then the smallest one-firing top-up, with stable rotation ties. */
+    private static <K> int bestFallbackCut(
+            Set<K> states,
+            List<CraftPattern<K>> patterns,
+            long[] remaining,
+            Map<K, BigInteger> balance,
+            Map<K, BigInteger> required,
+            int start) {
+        int best = -1;
+        int bestNewKinds = Integer.MAX_VALUE;
+        int bestKinds = Integer.MAX_VALUE;
+        BigInteger bestTotal = null;
+        for (int offset = 0; offset < patterns.size(); offset++) {
+            int index = (start + offset) % patterns.size();
+            if (remaining[index] <= 0L) continue;
+            int newKinds = 0;
+            int kinds = 0;
+            BigInteger total = BigInteger.ZERO;
+            for (Map.Entry<K, BigInteger> input
+                    : fallbackInputs(patterns.get(index), states).entrySet()) {
+                BigInteger shortage = input.getValue().subtract(
+                        amount(balance, input.getKey())).max(BigInteger.ZERO);
+                if (shortage.signum() > 0) {
+                    kinds++;
+                    if (amount(required, input.getKey()).signum() == 0) newKinds++;
+                }
+                total = total.add(shortage);
+            }
+            if (best < 0 || newKinds < bestNewKinds
+                    || (newKinds == bestNewKinds && kinds < bestKinds)
+                    || (newKinds == bestNewKinds && kinds == bestKinds
+                            && total.compareTo(bestTotal) < 0)) {
+                best = index;
+                bestNewKinds = newKinds;
+                bestKinds = kinds;
+                bestTotal = total;
+            }
+        }
+        if (best < 0) throw new IllegalStateException("firing count underflow");
+        return best;
+    }
+
+    private static int nextRemaining(long[] remaining, int start) {
+        for (int offset = 0; offset < remaining.length; offset++) {
+            int index = (start + offset) % remaining.length;
+            if (remaining[index] > 0L) return index;
+        }
+        throw new IllegalStateException("firing count underflow");
+    }
+
+    private static <K> boolean fallbackEnabled(
+            CraftPattern<K> pattern, Set<K> states, Map<K, BigInteger> balance) {
+        Map<K, BigInteger> inputs = fallbackInputs(pattern, states);
+        for (Map.Entry<K, BigInteger> input : inputs.entrySet()) {
+            if (amount(balance, input.getKey()).compareTo(input.getValue()) < 0) return false;
+        }
+        return true;
+    }
+
+    /** Maximum count that can be fired sequentially without another external top-up. */
+    private static <K> long fallbackBatch(
+            CraftPattern<K> pattern,
+            Set<K> states,
+            Map<K, BigInteger> balance,
+            long remaining) {
+        BigInteger limit = BigInteger.valueOf(remaining);
+        Map<K, BigInteger> inputs = fallbackInputs(pattern, states);
+        Map<K, BigInteger> outputs = fallbackOutputs(pattern, states);
+        for (Map.Entry<K, BigInteger> input : inputs.entrySet()) {
+            BigInteger loss = input.getValue().subtract(
+                    outputs.getOrDefault(input.getKey(), BigInteger.ZERO));
+            if (loss.signum() <= 0) continue;
+            BigInteger availableAfterFirst = amount(balance, input.getKey())
+                    .subtract(input.getValue());
+            BigInteger count = BigInteger.ONE.add(availableAfterFirst.divide(loss));
+            limit = limit.min(count);
+        }
+        return Math.max(1L, limit.longValueExact());
+    }
+
+    private static <K> void topUpFallback(
+            CraftPattern<K> pattern,
+            Set<K> states,
+            BigInteger times,
+            Map<K, BigInteger> balance,
+            Map<K, BigInteger> required,
+            boolean sequentialBlock) {
+        Map<K, BigInteger> inputs = fallbackInputs(pattern, states);
+        Map<K, BigInteger> outputs = fallbackOutputs(pattern, states);
+        for (Map.Entry<K, BigInteger> input : inputs.entrySet()) {
+            BigInteger demand;
+            if (sequentialBlock) {
+                BigInteger loss = input.getValue().subtract(
+                        outputs.getOrDefault(input.getKey(), BigInteger.ZERO)).max(BigInteger.ZERO);
+                demand = input.getValue().add(loss.multiply(times.subtract(BigInteger.ONE)));
+            } else {
+                demand = input.getValue().multiply(times);
+            }
+            BigInteger shortage = demand.subtract(amount(balance, input.getKey()));
+            if (shortage.signum() <= 0) continue;
+            balance.merge(input.getKey(), shortage, BigInteger::add);
+            required.merge(input.getKey(), shortage, BigInteger::add);
+        }
+    }
+
+    private static <K> void fireFallback(
+            CraftPattern<K> pattern,
+            Set<K> states,
+            BigInteger times,
+            Map<K, BigInteger> balance) {
+        for (Map.Entry<K, BigInteger> input : fallbackInputs(pattern, states).entrySet()) {
+            balance.merge(input.getKey(), input.getValue().multiply(times).negate(), BigInteger::add);
+        }
+        for (Map.Entry<K, BigInteger> output : fallbackOutputs(pattern, states).entrySet()) {
+            balance.merge(output.getKey(), output.getValue().multiply(times), BigInteger::add);
+        }
+    }
+
+    private static <K> Map<K, BigInteger> fallbackDelta(
+            Set<K> states,
+            List<CraftPattern<K>> patterns,
+            Map<CraftPattern<K>, Long> fired) {
+        Map<K, BigInteger> result = new LinkedHashMap<>();
+        for (CraftPattern<K> pattern : patterns) {
+            BigInteger times = BigInteger.valueOf(fired.getOrDefault(pattern, 0L));
+            for (Map.Entry<K, BigInteger> input : fallbackInputs(pattern, states).entrySet()) {
+                result.merge(input.getKey(), input.getValue().multiply(times).negate(), BigInteger::add);
+            }
+            for (Map.Entry<K, BigInteger> output : fallbackOutputs(pattern, states).entrySet()) {
+                result.merge(output.getKey(), output.getValue().multiply(times), BigInteger::add);
+            }
+        }
+        result.values().removeIf(value -> value.signum() == 0);
+        return result;
+    }
+
+    private static <K> Map<K, BigInteger> fallbackInputs(
+            CraftPattern<K> pattern, Set<K> states) {
+        Map<K, BigInteger> result = new LinkedHashMap<>();
+        for (CraftInput<K> input : pattern.inputs()) {
+            if (states.contains(input.key())) {
+                result.merge(input.key(), BigInteger.valueOf(input.amount()), BigInteger::add);
+            }
         }
         return result;
+    }
+
+    private static <K> Map<K, BigInteger> fallbackOutputs(
+            CraftPattern<K> pattern, Set<K> states) {
+        Map<K, BigInteger> result = new LinkedHashMap<>();
+        if (states.contains(pattern.output())) {
+            result.merge(pattern.output(), BigInteger.valueOf(pattern.outputAmount()), BigInteger::add);
+        }
+        for (CraftOutput<K> output : pattern.byproducts()) {
+            if (states.contains(output.key())) {
+                result.merge(output.key(), BigInteger.valueOf(output.amount()), BigInteger::add);
+            }
+        }
+        return result;
+    }
+
+    private static <K> List<ScheduleOption<K>> schedulesForCounts(
+            List<Transition<K>> cycle, long[] counts) {
+        BigInteger total = BigInteger.ZERO;
+        for (long count : counts) total = total.add(BigInteger.valueOf(count));
+        boolean exact = total.compareTo(BigInteger.valueOf(MAX_PRIMITIVE_ROUND_FIRINGS)) <= 0;
+        List<ScheduleOption<K>> result = new ArrayList<>(cycle.size());
+        Set<Map<K, BigInteger>> seen = new HashSet<>();
+        for (int start = 0; start < cycle.size(); start++) {
+            PlanningCancellation.check();
+            ScheduleOption<K> option = exact
+                    ? replayUnitFirings(cycle, counts, start, total.intValueExact())
+                    : replayGroupedFirings(cycle, counts, start);
+            if (seen.add(option.required())) result.add(option);
+        }
+        return result;
+    }
+
+    private static <K> ScheduleOption<K> replayUnitFirings(
+            List<Transition<K>> cycle, long[] counts, int start, int total) {
+        long[] remaining = counts.clone();
+        Map<K, BigInteger> balance = new HashMap<>();
+        Map<K, BigInteger> required = new LinkedHashMap<>();
+        int cursor = start;
+        for (int step = 0; step < total; step++) {
+            PlanningCancellation.check();
+            int selected = -1;
+            for (int offset = 0; offset < cycle.size(); offset++) {
+                int index = (cursor + offset) % cycle.size();
+                if (remaining[index] <= 0L) continue;
+                Transition<K> transition = cycle.get(index);
+                if (amount(balance, transition.input())
+                        .compareTo(BigInteger.valueOf(transition.inputAmount())) >= 0) {
+                    selected = index;
+                    break;
+                }
+            }
+            if (selected < 0) {
+                // A rotation denotes one canonical seed state. Keep topping up that state while its
+                // transition remains; only after it is exhausted may a residual require another cut.
+                if (remaining[start] > 0L) {
+                    selected = start;
+                } else {
+                    for (int offset = 0; offset < cycle.size(); offset++) {
+                        int index = (cursor + offset) % cycle.size();
+                        if (remaining[index] > 0L) {
+                            selected = index;
+                            break;
+                        }
+                    }
+                }
+                if (selected < 0) throw new IllegalStateException("firing count underflow");
+                topUpFor(cycle.get(selected), BigInteger.ONE, balance, required);
+            }
+            fire(cycle.get(selected), BigInteger.ONE, balance);
+            remaining[selected]--;
+            cursor = (selected + 1) % cycle.size();
+        }
+        return new ScheduleOption<>(required, deltaForCounts(cycle, counts));
+    }
+
+    private static <K> ScheduleOption<K> replayGroupedFirings(
+            List<Transition<K>> cycle, long[] counts, int start) {
+        Map<K, BigInteger> balance = new HashMap<>();
+        Map<K, BigInteger> required = new LinkedHashMap<>();
+        for (int offset = 0; offset < cycle.size(); offset++) {
+            PlanningCancellation.check();
+            int index = (start + offset) % cycle.size();
+            if (counts[index] <= 0L) continue;
+            BigInteger times = BigInteger.valueOf(counts[index]);
+            topUpFor(cycle.get(index), times, balance, required);
+            fire(cycle.get(index), times, balance);
+        }
+        return new ScheduleOption<>(required, deltaForCounts(cycle, counts));
+    }
+
+    private static <K> void topUpFor(
+            Transition<K> transition,
+            BigInteger times,
+            Map<K, BigInteger> balance,
+            Map<K, BigInteger> required) {
+        BigInteger demand = BigInteger.valueOf(transition.inputAmount()).multiply(times);
+        BigInteger available = amount(balance, transition.input());
+        if (available.compareTo(demand) >= 0) return;
+        BigInteger shortage = demand.subtract(available);
+        balance.put(transition.input(), demand);
+        required.merge(transition.input(), shortage, BigInteger::add);
+    }
+
+    private static <K> void fire(
+            Transition<K> transition, BigInteger times, Map<K, BigInteger> balance) {
+        BigInteger consumed = BigInteger.valueOf(transition.inputAmount()).multiply(times);
+        BigInteger produced = BigInteger.valueOf(transition.outputAmount()).multiply(times);
+        balance.merge(transition.input(), consumed.negate(), BigInteger::add);
+        balance.merge(transition.output(), produced, BigInteger::add);
+    }
+
+    private static <K> Map<K, BigInteger> deltaForCounts(
+            List<Transition<K>> cycle, long[] counts) {
+        Map<K, BigInteger> result = new LinkedHashMap<>();
+        for (int i = 0; i < cycle.size(); i++) {
+            if (counts[i] <= 0L) continue;
+            Transition<K> transition = cycle.get(i);
+            BigInteger times = BigInteger.valueOf(counts[i]);
+            result.merge(transition.input(),
+                    BigInteger.valueOf(transition.inputAmount()).multiply(times).negate(),
+                    BigInteger::add);
+            result.merge(transition.output(),
+                    BigInteger.valueOf(transition.outputAmount()).multiply(times),
+                    BigInteger::add);
+        }
+        result.values().removeIf(value -> value.signum() == 0);
+        return result;
+    }
+
+    private static <K> ScheduleOption<K> repeat(
+            ScheduleOption<K> block, long repetitions, Set<K> states) {
+        if (repetitions <= 0L) return zeroSchedule();
+        Map<K, BigInteger> required = new LinkedHashMap<>();
+        Map<K, BigInteger> delta = new LinkedHashMap<>();
+        BigInteger repeats = BigInteger.valueOf(repetitions);
+        BigInteger previous = BigInteger.valueOf(repetitions - 1L);
+        for (K state : states) {
+            BigInteger change = amount(block.delta(), state);
+            if (change.signum() > 0) return null;
+            BigInteger need = amount(block.required(), state)
+                    .add(change.negate().multiply(previous));
+            if (need.signum() > 0) required.put(state, need);
+            BigInteger totalChange = change.multiply(repeats);
+            if (totalChange.signum() != 0) delta.put(state, totalChange);
+        }
+        return new ScheduleOption<>(required, delta);
+    }
+
+    private static <K> ScheduleOption<K> compose(
+            ScheduleOption<K> first, ScheduleOption<K> second, Set<K> states) {
+        Map<K, BigInteger> required = new LinkedHashMap<>();
+        Map<K, BigInteger> delta = new LinkedHashMap<>();
+        for (K state : states) {
+            BigInteger firstRequired = amount(first.required(), state);
+            BigInteger secondRequiredAtStart = amount(second.required(), state)
+                    .subtract(amount(first.delta(), state));
+            BigInteger need = firstRequired.max(secondRequiredAtStart).max(BigInteger.ZERO);
+            if (need.signum() > 0) required.put(state, need);
+            BigInteger change = amount(first.delta(), state).add(amount(second.delta(), state));
+            if (change.signum() != 0) delta.put(state, change);
+        }
+        return new ScheduleOption<>(required, delta);
+    }
+
+    private static <K> ScheduleOption<K> zeroSchedule() {
+        return new ScheduleOption<>(Map.of(), Map.of());
+    }
+
+    private static boolean anyPositive(long[] counts) {
+        for (long count : counts) if (count > 0L) return true;
+        return false;
+    }
+
+    private static <K> BigInteger amount(Map<K, BigInteger> values, K key) {
+        return values.getOrDefault(key, BigInteger.ZERO);
+    }
+
+    private static BigInteger lcm(BigInteger left, BigInteger right) {
+        if (left.signum() == 0 || right.signum() == 0) return BigInteger.ZERO;
+        return left.divide(left.gcd(right)).multiply(right);
     }
 
     private static <K> boolean mergeExact(Map<K, Long> values, K key, long amount) {

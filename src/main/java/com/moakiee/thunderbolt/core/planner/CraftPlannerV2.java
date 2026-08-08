@@ -1,5 +1,6 @@
 package com.moakiee.thunderbolt.core.planner;
 
+import java.math.BigInteger;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Deque;
@@ -101,7 +102,6 @@ public final class CraftPlannerV2<K> {
     private static final long MAX_BYPRODUCT_SCHEDULE_WORK = Math.max(
             1_024L,
             Long.getLong("thunderbolt.maxByproductScheduleWork", 16_384L));
-
     /**
      * Maximum number of alternate roots tried for a proven conservative conversion SCC. This is a
      * fixed bound, so cycle orientation remains linear in graph size rather than enumerating cuts.
@@ -224,6 +224,9 @@ public final class CraftPlannerV2<K> {
             new HashMap<>();
     /** Proven ordinary feedback state machines, classified before linear/integer planning. */
     private List<ConservativeFeedbackAnalysis.Component<K>> conservativeFeedbackComponents = List.of();
+    /** Proven non-growing ordinary SCCs that use bounded canonical prefix replay. */
+    private List<ConservativeFeedbackAnalysis.FallbackComponent<K>>
+            canonicalFeedbackFallbackComponents = List.of();
     /** Component members that can obtain their first state from an acyclic producer. */
     private final Set<CraftPattern<K>> craftableConservativeFeedbackPatterns =
             java.util.Collections.newSetFromMap(new IdentityHashMap<>());
@@ -748,8 +751,10 @@ public final class CraftPlannerV2<K> {
             // Include primary and byproduct material flow in SCC classification before any
             // algebraic pass can treat a returned state as supply. Only proven non-growing marked
             // graphs survive as ordinary feedback components; gain/ambiguous loops are excluded.
-            conservativeFeedbackComponents =
-                    ConservativeFeedbackAnalysis.analyze(order, patternsByOutput);
+            ConservativeFeedbackAnalysis.Analysis<K> feedbackAnalysis =
+                    ConservativeFeedbackAnalysis.analyzeAll(order, patternsByOutput);
+            conservativeFeedbackComponents = feedbackAnalysis.components();
+            canonicalFeedbackFallbackComponents = feedbackAnalysis.fallbacks();
             for (ConservativeFeedbackAnalysis.Component<K> component
                     : conservativeFeedbackComponents) {
                 if (component.hasExternalProducer()) {
@@ -800,7 +805,7 @@ public final class CraftPlannerV2<K> {
         CraftPlan<K> linear = linearPass(replayOrder, target, amount);
         diagnostics.addLinearPassNanos(System.nanoTime() - linearStarted);
         if (linear.feasible() && !requiresSeedOrderedPlanning) {
-            return enforceCycleBootstrap(linear);
+            return enforceCycleBootstrap(linear, target, amount);
         }
         if (!requiresSeedOrderedPlanning || !linear.feasible()) {
             linearDiagnosis = linear;
@@ -818,7 +823,7 @@ public final class CraftPlannerV2<K> {
             // the request is a proof of infeasibility on an ordinary DAG. Stateful startup stays on
             // exact replay because its one-time reserve is intentionally absent from this capacity.
             diagnostics.recordLowWidthCapacityProof();
-            return enforceCycleBootstrap(linearDiagnosis);
+            return enforceCycleBootstrap(linearDiagnosis, target, amount);
         }
 
         if (lowWidth != null) {
@@ -834,7 +839,7 @@ public final class CraftPlannerV2<K> {
                     if (component.infeasibilityProof() && linearDiagnosis != null) {
                         // This proves only the current cut orientation. planDetailed remains responsible
                         // for trying the other admitted conversion orientations before final failure.
-                        return enforceCycleBootstrap(linearDiagnosis);
+                        return enforceCycleBootstrap(linearDiagnosis, target, amount);
                     }
                     continue;
                 }
@@ -865,7 +870,7 @@ public final class CraftPlannerV2<K> {
                 CraftPlan<K> exactHybrid = new CraftPlan<>(
                         true, true, pinned.fired(), pinned.used(), Map.of(), Map.of(),
                         pinned.gross(), pinned.done(), false);
-                return enforceCycleBootstrap(exactHybrid);
+                return enforceCycleBootstrap(exactHybrid, target, amount);
             }
             if (pinned.fixedAllocationFailed()) {
                 // A balance-feasible byproduct vector may deliberately overproduce a primary
@@ -891,7 +896,7 @@ public final class CraftPlannerV2<K> {
             CraftPlan<K> repaired = allocationRepair(
                     replayOrder, target, amount, fixedFirings, fixedItems);
             if (repaired != null && repaired.feasible()) {
-                CraftPlan<K> bootstrapped = enforceCycleBootstrap(repaired);
+                CraftPlan<K> bootstrapped = enforceCycleBootstrap(repaired, target, amount);
                 if (bootstrapped.feasible()) {
                     return bootstrapped;
                 }
@@ -964,9 +969,9 @@ public final class CraftPlannerV2<K> {
                     linearDiagnosis.grossDemand(),
                     linearDiagnosis.itemsProcessed(),
                     true);
-            return enforceCycleBootstrap(diagnosis);
+            return enforceCycleBootstrap(diagnosis, target, amount);
         }
-        return enforceCycleBootstrap(fallback);
+        return enforceCycleBootstrap(fallback, target, amount);
     }
 
     private CraftPlan<K> snapshotRecursivePlan() {
@@ -1040,6 +1045,7 @@ public final class CraftPlannerV2<K> {
                 frozenBootstraps,
                 frozenConverters,
                 conservativeFeedbackComponents,
+                canonicalFeedbackFallbackComponents,
                 requiresSeedOrderedPlanning,
                 Set.copyOf(seedOrderedDependencyCone),
                 new HashMap<>(capacity),
@@ -1060,6 +1066,7 @@ public final class CraftPlannerV2<K> {
         feedbackSeedBootstraps.putAll(prepared.feedbackSeedBootstraps);
         feedbackSeedConverters.putAll(prepared.feedbackSeedConverters);
         conservativeFeedbackComponents = prepared.conservativeFeedbackComponents;
+        canonicalFeedbackFallbackComponents = prepared.canonicalFeedbackFallbackComponents;
         for (ConservativeFeedbackAnalysis.Component<K> component
                 : conservativeFeedbackComponents) {
             if (component.hasExternalProducer()) {
@@ -1081,7 +1088,7 @@ public final class CraftPlannerV2<K> {
      * fired consumed-returning input is refilled by another fired pattern, require one batch from
      * inventory unless some fired acyclic producer supplies either state from outside the pair.
      */
-    private CraftPlan<K> enforceCycleBootstrap(CraftPlan<K> plan) {
+    private CraftPlan<K> enforceCycleBootstrap(CraftPlan<K> plan, K target, long amount) {
         Map<K, List<CraftPattern<K>>> firedByOutput = new HashMap<>();
         for (Map.Entry<CraftPattern<K>, Long> entry : plan.firings().entrySet()) {
             if (entry.getValue() > 0) {
@@ -1132,10 +1139,10 @@ public final class CraftPlannerV2<K> {
             }
         }
 
-        Set<CraftPattern<K>> conservativeFeedbackPatterns =
-                enforceConservativeFeedbackBootstrap(plan, used, missing);
-        enforceDirectFeedbackBootstrap(
-                plan, firedByOutput, used, missing, conservativeFeedbackPatterns);
+        Set<K> preciselyScheduledStates = enforceConservativeFeedbackBootstrap(
+                plan, target, amount, used, missing);
+        enforceCanonicalFeedbackFallback(
+                plan, target, amount, used, missing, preciselyScheduledStates);
 
         return new CraftPlan<>(plan.supported(), missing.isEmpty(), plan.firings(), used,
                 plan.usedReusableStock(), missing, plan.grossDemand(), plan.itemsProcessed(),
@@ -1152,12 +1159,13 @@ public final class CraftPlannerV2<K> {
      * as can a fired acyclic producer entering the SCC from outside. Components not fully used by the
      * chosen firing vector are left to ordinary accounting and the legacy partial-return check.
      */
-    private Set<CraftPattern<K>> enforceConservativeFeedbackBootstrap(
+    private Set<K> enforceConservativeFeedbackBootstrap(
             CraftPlan<K> plan,
+            K target,
+            long targetAmount,
             Map<K, Long> used,
             Map<K, Long> missing) {
-        Set<CraftPattern<K>> handled =
-                java.util.Collections.newSetFromMap(new IdentityHashMap<>());
+        Set<K> handledStates = new HashSet<>();
         for (ConservativeFeedbackAnalysis.Component<K> component
                 : conservativeFeedbackComponents) {
             boolean active = true;
@@ -1169,276 +1177,237 @@ public final class CraftPlannerV2<K> {
             }
             if (!active) continue;
 
-            long rounds = 0L;
-            if (component.lossy()) {
-                for (CraftPattern<K> pattern : component.patterns()) {
-                    long fired = plan.firings().getOrDefault(pattern, 0L);
-                    if (rounds == 0L) rounds = fired;
-                    else if (rounds != fired) {
-                        rounds = -1L;
-                        break;
-                    }
-                }
-                // A non-uniform lossy firing vector needs a general marked-graph scheduler. Keep it
-                // out of this proof and let the older narrow fallback diagnose it conservatively.
-                if (rounds < 0L) continue;
-            }
-
-            Map<K, Long> external = externalFeedbackSupply(component, plan.firings());
-            ConservativeFeedbackAnalysis.SeedOption<K> chosen = null;
-            int chosenMissingKinds = Integer.MAX_VALUE;
-            long chosenMissingTotal = Long.MAX_VALUE;
-            long chosenStock = Long.MAX_VALUE;
-            for (ConservativeFeedbackAnalysis.SeedOption<K> option : component.seedOptions()) {
-                int missingKinds = 0;
-                long missingTotal = 0L;
-                long stockNeeded = 0L;
-                for (Map.Entry<K, Long> seed : option.amounts().entrySet()) {
-                    K key = seed.getKey();
-                    long reserved = feedbackSeedCredit(
-                            component, rounds, key, used, missing, external);
-                    long additional = Math.max(0L, seed.getValue() - reserved);
-                    long stockAvailable = Math.max(
-                            0L, graph.stock(key) - used.getOrDefault(key, 0L));
-                    long shortage = Math.max(0L, additional - stockAvailable);
-                    if (shortage > 0) missingKinds++;
-                    missingTotal = Sat.add(missingTotal, shortage);
-                    stockNeeded = Sat.add(stockNeeded, Math.min(additional, stockAvailable));
-                }
-                if (chosen == null
-                        || missingKinds < chosenMissingKinds
-                        || (missingKinds == chosenMissingKinds
-                                && missingTotal < chosenMissingTotal)
-                        || (missingKinds == chosenMissingKinds
-                                && missingTotal == chosenMissingTotal
-                                && stockNeeded < chosenStock)) {
-                    chosen = option;
-                    chosenMissingKinds = missingKinds;
-                    chosenMissingTotal = missingTotal;
-                    chosenStock = stockNeeded;
-                }
-            }
+            List<ConservativeFeedbackAnalysis.ScheduleOption<K>> options =
+                    ConservativeFeedbackAnalysis.scheduleOptions(component, plan.firings());
+            if (options.isEmpty()) continue;
+            Map<K, Long> chosen = chooseFeedbackRequirement(
+                    component.states(), component.stateOrder(), component.patterns(), options,
+                    plan.firings(), target, targetAmount);
             if (chosen == null) continue;
+            handledStates.addAll(component.states());
 
-            handled.addAll(component.patterns());
-            for (Map.Entry<K, Long> seed : chosen.amounts().entrySet()) {
-                K key = seed.getKey();
-                long reserved = feedbackSeedCredit(
-                        component, rounds, key, used, missing, external);
-                long additional = Math.max(0L, seed.getValue() - reserved);
-                if (additional <= 0) continue;
-                long stockAvailable = Math.max(
-                        0L, graph.stock(key) - used.getOrDefault(key, 0L));
-                long extracted = Math.min(additional, stockAvailable);
-                if (extracted > 0) used.merge(key, extracted, Sat::add);
-                if (extracted < additional) {
-                    missing.merge(key, additional - extracted, Sat::add);
-                }
-            }
+            // Replace the aggregate net-flow accounting for SCC states with the initial marking of
+            // the chosen concrete schedule. This removes intermediary shortages created solely by a
+            // cycle cut while retaining every real external sink demand in the formula above.
+            replaceFeedbackAccounting(component.stateOrder(), chosen, used, missing);
         }
-        return handled;
+        return handledStates;
     }
 
-    private long feedbackSeedCredit(
-            ConservativeFeedbackAnalysis.Component<K> component,
-            long rounds,
-            K key,
+    /**
+     * Bounded canonical-prefix fallback for proven non-growing ordinary Petri SCCs. The schedule is
+     * reconstructed solely from the graph and actual firing multiset; no search witness or context
+     * is carried into a later refill calculation. Complicated nets may receive a non-minimal initial
+     * marking, but a missing-free result always has a concrete executable order.
+     */
+    private void enforceCanonicalFeedbackFallback(
+            CraftPlan<K> plan,
+            K target,
+            long targetAmount,
             Map<K, Long> used,
             Map<K, Long> missing,
-            Map<K, Long> external) {
-        long accounted = Sat.add(
-                used.getOrDefault(key, 0L), missing.getOrDefault(key, 0L));
-        if (component.lossy()) {
-            long ordinaryLoss = Sat.mul(
-                    component.lossPerRound().getOrDefault(key, 0L), rounds);
-            accounted = Math.max(0L, accounted - ordinaryLoss);
+            Set<K> preciselyScheduledStates) {
+        for (ConservativeFeedbackAnalysis.FallbackComponent<K> component
+                : canonicalFeedbackFallbackComponents) {
+            if (!java.util.Collections.disjoint(component.states(), preciselyScheduledStates)) {
+                continue;
+            }
+            if (!hasActiveFeedbackCycle(component, plan.firings())) continue;
+            List<ConservativeFeedbackAnalysis.ScheduleOption<K>> options =
+                    ConservativeFeedbackAnalysis.scheduleOptions(component, plan.firings());
+            if (options.isEmpty()) continue;
+            Map<K, Long> chosen = chooseFeedbackRequirement(
+                    component.states(), component.stateOrder(), component.patterns(), options,
+                    plan.firings(), target, targetAmount);
+            if (chosen == null) continue;
+            replaceFeedbackAccounting(component.stateOrder(), chosen, used, missing);
         }
-        return Sat.add(accounted, external.getOrDefault(key, 0L));
     }
 
-    /** Supply entering a feedback SCC from a fired transition that does not consume any SCC state. */
-    private Map<K, Long> externalFeedbackSupply(
-            ConservativeFeedbackAnalysis.Component<K> component,
+    private Map<K, Long> chooseFeedbackRequirement(
+            Set<K> states,
+            List<K> stateOrder,
+            List<CraftPattern<K>> componentPatterns,
+            List<ConservativeFeedbackAnalysis.ScheduleOption<K>> options,
+            Map<CraftPattern<K>, Long> fired,
+            K target,
+            long targetAmount) {
+        Map<K, BigInteger> externalSupply = externalFeedbackSupply(
+                states, componentPatterns, fired);
+        Map<K, BigInteger> externalDemand = externalFeedbackDemand(
+                states, componentPatterns, fired, target, targetAmount);
+        FeedbackRequirement<K> best = null;
+        for (ConservativeFeedbackAnalysis.ScheduleOption<K> option : options) {
+            Map<K, Long> amounts = new LinkedHashMap<>();
+            int missingKinds = 0;
+            int firstRank = Integer.MAX_VALUE;
+            long missingTotal = 0L;
+            long stockUsed = 0L;
+            for (int rank = 0; rank < stateOrder.size(); rank++) {
+                K key = stateOrder.get(rank);
+                BigInteger supply = externalSupply.getOrDefault(key, BigInteger.ZERO);
+                BigInteger scheduleNeed = option.required()
+                        .getOrDefault(key, BigInteger.ZERO).subtract(supply);
+                BigInteger finalNeed = externalDemand.getOrDefault(key, BigInteger.ZERO)
+                        .subtract(supply)
+                        .subtract(option.delta().getOrDefault(key, BigInteger.ZERO));
+                long required = plannerAmount(scheduleNeed.max(finalNeed).max(BigInteger.ZERO));
+                if (required > 0L) {
+                    amounts.put(key, required);
+                    firstRank = Math.min(firstRank, rank);
+                }
+                long stock = graph.stock(key);
+                long shortage = Math.max(0L, required - stock);
+                if (shortage > 0L) missingKinds++;
+                missingTotal = Sat.add(missingTotal, shortage);
+                stockUsed = Sat.add(stockUsed, Math.min(required, stock));
+            }
+            FeedbackRequirement<K> candidate = new FeedbackRequirement<>(
+                    amounts, missingKinds, missingTotal, stockUsed, firstRank);
+            if (candidate.betterThan(best)) best = candidate;
+        }
+        return best == null ? null : best.amounts();
+    }
+
+    private void replaceFeedbackAccounting(
+            List<K> stateOrder,
+            Map<K, Long> requirement,
+            Map<K, Long> used,
+            Map<K, Long> missing) {
+        for (K key : stateOrder) {
+            used.remove(key);
+            missing.remove(key);
+            long required = requirement.getOrDefault(key, 0L);
+            long extracted = Math.min(required, graph.stock(key));
+            if (extracted > 0L) used.put(key, extracted);
+            if (extracted < required) missing.put(key, required - extracted);
+        }
+    }
+
+    private record FeedbackRequirement<K>(
+            Map<K, Long> amounts,
+            int missingKinds,
+            long missingTotal,
+            long stockUsed,
+            int firstRank) {
+        boolean betterThan(FeedbackRequirement<K> other) {
+            if (other == null) return true;
+            if (missingKinds != other.missingKinds) return missingKinds < other.missingKinds;
+            if (amounts.size() != other.amounts.size()) return amounts.size() < other.amounts.size();
+            if (missingTotal != other.missingTotal) return missingTotal < other.missingTotal;
+            if (stockUsed != other.stockUsed) return stockUsed > other.stockUsed;
+            return firstRank < other.firstRank;
+        }
+    }
+
+    private boolean hasActiveFeedbackCycle(
+            ConservativeFeedbackAnalysis.FallbackComponent<K> component,
             Map<CraftPattern<K>, Long> fired) {
-        Map<K, Long> result = new HashMap<>();
+        Map<K, LinkedHashSet<K>> edges = new LinkedHashMap<>();
+        Map<K, Integer> indegree = new LinkedHashMap<>();
+        for (K state : component.stateOrder()) {
+            edges.put(state, new LinkedHashSet<>());
+            indegree.put(state, 0);
+        }
+        for (CraftPattern<K> pattern : component.patterns()) {
+            if (fired.getOrDefault(pattern, 0L) <= 0L) continue;
+            List<K> outputs = new ArrayList<>();
+            if (component.states().contains(pattern.output())) outputs.add(pattern.output());
+            for (CraftOutput<K> output : pattern.byproducts()) {
+                if (component.states().contains(output.key())) outputs.add(output.key());
+            }
+            for (CraftInput<K> input : pattern.inputs()) {
+                if (!component.states().contains(input.key())) continue;
+                for (K output : outputs) {
+                    if (edges.get(input.key()).add(output)) {
+                        indegree.merge(output, 1, Integer::sum);
+                    }
+                }
+            }
+        }
+        Deque<K> ready = new ArrayDeque<>();
+        for (K state : component.stateOrder()) {
+            if (indegree.getOrDefault(state, 0) == 0) ready.addLast(state);
+        }
+        int removed = 0;
+        while (!ready.isEmpty()) {
+            K state = ready.removeFirst();
+            removed++;
+            for (K output : edges.getOrDefault(state, new LinkedHashSet<>())) {
+                int remaining = indegree.merge(output, -1, Integer::sum);
+                if (remaining == 0) ready.addLast(output);
+            }
+        }
+        return removed < component.states().size();
+    }
+
+    /** Supply that can be scheduled before the feedback component without consuming its state. */
+    private Map<K, BigInteger> externalFeedbackSupply(
+            Set<K> states,
+            List<CraftPattern<K>> componentPatterns,
+            Map<CraftPattern<K>, Long> fired) {
+        Map<K, BigInteger> result = new HashMap<>();
+        Set<CraftPattern<K>> internal = new HashSet<>(componentPatterns);
         for (Map.Entry<CraftPattern<K>, Long> entry : fired.entrySet()) {
             CraftPattern<K> pattern = entry.getKey();
             long times = entry.getValue();
-            if (times <= 0 || component.patterns().contains(pattern)) continue;
+            if (times <= 0 || internal.contains(pattern)) continue;
             boolean consumesState = pattern.inputs().stream()
-                    .anyMatch(input -> component.states().contains(input.key()));
+                    .anyMatch(input -> states.contains(input.key()));
             if (consumesState) continue;
 
-            if (component.states().contains(pattern.output())) {
-                result.merge(pattern.output(), Sat.mul(pattern.outputAmount(), times), Sat::add);
+            if (states.contains(pattern.output())) {
+                mergeProduct(result, pattern.output(), pattern.outputAmount(), times);
             }
             for (CraftOutput<K> output : pattern.byproducts()) {
-                if (component.states().contains(output.key())) {
-                    result.merge(output.key(), Sat.mul(output.amount(), times), Sat::add);
+                if (states.contains(output.key())) {
+                    mergeProduct(result, output.key(), output.amount(), times);
                 }
             }
             for (CraftInput<K> input : pattern.inputs()) {
-                if (input.remainder() != null && component.states().contains(input.remainder())) {
-                    result.merge(input.remainder(), Sat.mul(input.amount(), times), Sat::add);
+                if (input.remainder() != null && states.contains(input.remainder())) {
+                    mergeProduct(result, input.remainder(), input.amount(), times);
                 }
             }
         }
         return result;
     }
 
-    /**
-     * Handles a narrow, common partial-return loop such as
-     * {@code 2 A -> 2 B + C; C -> A}. The normal flow equations correctly charge the net A
-     * consumption, but an executable schedule also has to keep one returned batch in circulation:
-     * two firings consume two A net yet need three A initially. This pass adds only that reusable
-     * bootstrap reserve.
-     *
-     * <p>Classification is deliberately narrow: the consumer has one ordinary input and one byproduct,
-     * while the refill has that byproduct as its sole ordinary input. We do not search paths, subsets,
-     * or firing orders. Multi-input/output and ambiguous relations stay on ordinary accounting instead
-     * of turning this into a general Petri-net solver.
-     */
-    private void enforceDirectFeedbackBootstrap(
-            CraftPlan<K> plan,
-            Map<K, List<CraftPattern<K>>> firedByOutput,
-            Map<K, Long> used,
-            Map<K, Long> missing,
-            Set<CraftPattern<K>> conservativeFeedbackPatterns) {
-        Map<K, SeedRequirement<K>> seedRequirements = new HashMap<>();
-
-        for (Map.Entry<CraftPattern<K>, Long> consumerEntry : plan.firings().entrySet()) {
-            CraftPattern<K> consumer = consumerEntry.getKey();
-            long consumerFirings = consumerEntry.getValue();
-            if (consumerFirings <= 0
-                    || conservativeFeedbackPatterns.contains(consumer)
-                    || consumer.byproducts().size() != 1
-                    || ordinaryInputCount(consumer) != 1) {
-                continue;
-            }
-
-            for (CraftInput<K> consumed : consumer.inputs()) {
-                // Different-state container remainders are handled by the explicit bootstrap pass
-                // above; returned/finite-use inputs already have their own closed-form seed semantics.
-                if (consumed.returned() || consumed.remainder() != null) continue;
-
-                for (CraftOutput<K> returnedState : consumer.byproducts()) {
-                    DirectRefill<K> refill = uniqueDirectRefill(
-                            consumed.key(), returnedState.key(), firedByOutput, plan.firings());
-                    if (refill == null) continue;
-                    // Keep this a byproduct-only classification. If the returned state has its own
-                    // primary producer, the graph is no longer the narrow half-loop handled here.
-                    if (!graph.patternsFor(returnedState.key()).isEmpty()) {
-                        continue;
-                    }
-
-                    long gcd = gcd(returnedState.amount(), refill.input().amount());
-                    long consumerBatch = refill.input().amount() / gcd;
-                    long refillBatch = returnedState.amount() / gcd;
-                    long consumedPerCycle = Sat.mul(consumed.amount(), consumerBatch);
-                    long recoveredPerCycle = Sat.mul(refill.pattern().outputAmount(), refillBatch);
-                    // Strict gain belongs to the contracted closed-loop planner. Its feedback output
-                    // is suppressed from the ordinary shared pool before planning, so do not add the
-                    // reusable-bootstrap accounting used by lossy and balanced ordinary paths.
-                    if (recoveredPerCycle > consumedPerCycle) continue;
-                    long totalConsumed = Sat.mul(consumed.amount(), consumerFirings);
-                    long reusableSeed = Math.min(
-                            totalConsumed, Math.min(consumedPerCycle, recoveredPerCycle));
-                    if (reusableSeed <= 0) continue;
-
-                    long returnedUnits = Sat.mul(returnedState.amount(), consumerFirings);
-                    long maxRefillFirings = returnedUnits / refill.input().amount();
-                    long maximumRecovery = Sat.mul(refill.pattern().outputAmount(), maxRefillFirings);
-                    long inherentNet = Math.max(0L, totalConsumed - Math.min(totalConsumed, maximumRecovery));
-
-                    long actualRecovery = Sat.mul(
-                            refill.pattern().outputAmount(),
-                            plan.firings().getOrDefault(refill.pattern(), 0L));
-                    long actualNet = Math.max(0L, totalConsumed - Math.min(totalConsumed, actualRecovery));
-                    // If the chosen flow already leaves one recovery batch unused, its extra net input
-                    // is the seed (balanced bucket loops commonly land here). Otherwise reserve it now.
-                    long embeddedSeed = Math.max(0L, actualNet - inherentNet);
-                    long extraSeed = Math.max(0L, reusableSeed - embeddedSeed);
-                    if (extraSeed > 0) {
-                        // The seed may be stored in the returned state instead. Record the alternative
-                        // now and reserve it once after all consumers have been scanned; the same seed
-                        // can bootstrap several patterns sequentially and must not be double-charged.
-                        long seedRefillFirings = Sat.ceilDiv(
-                                extraSeed, refill.pattern().outputAmount());
-                        long returnedStateSeed = Sat.mul(
-                                refill.input().amount(), seedRefillFirings);
-                        SeedRequirement<K> candidate = new SeedRequirement<>(
-                                extraSeed, returnedState.key(), returnedStateSeed);
-                        seedRequirements.merge(consumed.key(), candidate,
-                                CraftPlannerV2::largerSeedRequirement);
-                    }
-                }
+    /** Demand scheduled after the feedback component, including the top-level requested state. */
+    private Map<K, BigInteger> externalFeedbackDemand(
+            Set<K> states,
+            List<CraftPattern<K>> componentPatterns,
+            Map<CraftPattern<K>, Long> fired,
+            K target,
+            long targetAmount) {
+        Map<K, BigInteger> result = new HashMap<>();
+        Set<CraftPattern<K>> internal = new HashSet<>(componentPatterns);
+        if (states.contains(target) && targetAmount > 0L) {
+            result.put(target, BigInteger.valueOf(targetAmount));
+        }
+        for (Map.Entry<CraftPattern<K>, Long> entry : fired.entrySet()) {
+            CraftPattern<K> pattern = entry.getKey();
+            long times = entry.getValue();
+            if (times <= 0L || internal.contains(pattern)) continue;
+            for (CraftInput<K> input : pattern.inputs()) {
+                if (!states.contains(input.key())) continue;
+                result.merge(input.key(), BigInteger.valueOf(input.unitsFor(times)), BigInteger::add);
             }
         }
-
-        for (Map.Entry<K, SeedRequirement<K>> seed : seedRequirements.entrySet()) {
-            K key = seed.getKey();
-            SeedRequirement<K> requirement = seed.getValue();
-            long returnedAlreadyUsed = used.getOrDefault(requirement.returnedState(), 0L);
-            long returnedNeeded = Math.max(0L, requirement.returnedAmount() - returnedAlreadyUsed);
-            long returnedAvailable = Math.max(
-                    0L, graph.stock(requirement.returnedState()) - returnedAlreadyUsed);
-            if (returnedNeeded <= returnedAvailable) {
-                if (returnedNeeded > 0) {
-                    used.merge(requirement.returnedState(), returnedNeeded, Sat::add);
-                }
-                continue;
-            }
-
-            long alreadyUsed = used.getOrDefault(key, 0L);
-            long available = Math.max(0L, graph.stock(key) - alreadyUsed);
-            long extracted = Math.min(requirement.consumedAmount(), available);
-            if (extracted > 0) used.merge(key, extracted, Sat::add);
-            if (extracted < requirement.consumedAmount()) {
-                missing.merge(key, requirement.consumedAmount() - extracted, Sat::add);
-            }
-        }
+        return result;
     }
 
-    private record SeedRequirement<K>(long consumedAmount, K returnedState, long returnedAmount) {
+    private static <K> void mergeProduct(
+            Map<K, BigInteger> values, K key, long amount, long times) {
+        values.merge(key,
+                BigInteger.valueOf(amount).multiply(BigInteger.valueOf(times)),
+                BigInteger::add);
     }
 
-    private static <K> SeedRequirement<K> largerSeedRequirement(
-            SeedRequirement<K> left, SeedRequirement<K> right) {
-        if (right.consumedAmount() > left.consumedAmount()) return right;
-        if (right.consumedAmount() < left.consumedAmount()) return left;
-        return right.returnedAmount() < left.returnedAmount() ? right : left;
-    }
-
-    private record DirectRefill<K>(CraftPattern<K> pattern, CraftInput<K> input) {
-    }
-
-    /** Returns the sole fired direct {@code returnedState -> consumedState} refill, or null if ambiguous. */
-    private DirectRefill<K> uniqueDirectRefill(
-            K consumedState,
-            K returnedState,
-            Map<K, List<CraftPattern<K>>> firedByOutput,
-            Map<CraftPattern<K>, Long> fired) {
-        DirectRefill<K> found = null;
-        for (CraftPattern<K> producer : firedByOutput.getOrDefault(consumedState, List.of())) {
-            if (fired.getOrDefault(producer, 0L) <= 0 || ordinaryInputCount(producer) != 1) continue;
-            for (CraftInput<K> input : producer.inputs()) {
-                if (input.returned() || input.remainder() != null
-                        || !returnedState.equals(input.key())) {
-                    continue;
-                }
-                if (found != null && found.pattern() != producer) return null;
-                found = new DirectRefill<>(producer, input);
-            }
-        }
-        return found;
-    }
-
-    private static <K> int ordinaryInputCount(CraftPattern<K> pattern) {
-        int count = 0;
-        for (CraftInput<K> input : pattern.inputs()) {
-            if (!input.returned() && input.remainder() == null) count++;
-        }
-        return count;
+    private static long plannerAmount(BigInteger amount) {
+        return amount.compareTo(BigInteger.valueOf(Sat.SAT)) >= 0
+                ? Sat.SAT
+                : amount.longValueExact();
     }
 
     private static long gcd(long a, long b) {
@@ -5014,6 +4983,8 @@ public final class CraftPlannerV2<K> {
         private final Map<CraftPattern<K>, List<FeedbackSeedBootstrap<K>>> feedbackSeedBootstraps;
         private final Map<CraftPattern<K>, List<FeedbackSeedBootstrap<K>>> feedbackSeedConverters;
         private final List<ConservativeFeedbackAnalysis.Component<K>> conservativeFeedbackComponents;
+        private final List<ConservativeFeedbackAnalysis.FallbackComponent<K>>
+                canonicalFeedbackFallbackComponents;
         private final boolean seedOrdered;
         private final Set<K> seedOrderedDependencyCone;
         private final Map<K, Long> capacity;
@@ -5036,6 +5007,8 @@ public final class CraftPlannerV2<K> {
                 Map<CraftPattern<K>, List<FeedbackSeedBootstrap<K>>> feedbackSeedBootstraps,
                 Map<CraftPattern<K>, List<FeedbackSeedBootstrap<K>>> feedbackSeedConverters,
                 List<ConservativeFeedbackAnalysis.Component<K>> conservativeFeedbackComponents,
+                List<ConservativeFeedbackAnalysis.FallbackComponent<K>>
+                        canonicalFeedbackFallbackComponents,
                 boolean seedOrdered,
                 Set<K> seedOrderedDependencyCone,
                 Map<K, Long> capacity,
@@ -5056,6 +5029,8 @@ public final class CraftPlannerV2<K> {
             this.feedbackSeedBootstraps = feedbackSeedBootstraps;
             this.feedbackSeedConverters = feedbackSeedConverters;
             this.conservativeFeedbackComponents = List.copyOf(conservativeFeedbackComponents);
+            this.canonicalFeedbackFallbackComponents =
+                    List.copyOf(canonicalFeedbackFallbackComponents);
             this.seedOrdered = seedOrdered;
             this.seedOrderedDependencyCone = seedOrderedDependencyCone;
             this.capacity = capacity;
