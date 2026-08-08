@@ -1,7 +1,5 @@
 package com.moakiee.thunderbolt.core.crafting.planner.reference;
 
-import com.moakiee.thunderbolt.core.crafting.pattern.ReusableStockSource;
-
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.Map;
@@ -175,6 +173,6 @@ final class ReferencePlanReplay {
     }
 
     private record ReusableRequirement(
-            ReusableStockSource source, String key) {
+            com.moakiee.thunderbolt.core.crafting.pattern.ReusableStockSource source, String key) {
     }
 }
