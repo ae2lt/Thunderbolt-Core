@@ -1,0 +1,46 @@
+{
+  "required": true,
+  "minVersion": "0.8.5",
+  "package": "com.moakiee.thunderbolt.ae2.mixin",
+  "plugin": "com.moakiee.thunderbolt.ae2.mixin.ThunderboltMixinConfigPlugin",
+  "compatibilityLevel": "JAVA_17",
+  "mixins": [
+    "Ae2CraftingTreeCompatibilityMixin",
+    "CraftingCalculationMixin",
+    "CraftingLinkNexusMixin",
+    "CraftingServiceAccessor",
+    "EjectCapabilityMixin",
+    "EjectGhostBlockEntityMixin",
+    "GridConnectionMaxChannelsMixin",
+    "GridGetMachineNodesMixin",
+    "GridNodeMaxChannelsMixin",
+    "PathingCalculationCapMixin",
+    "CraftingCpuLogicBatchMixin",
+    "AdvCraftingCpuLogicBatchMixin",
+    "ECOCraftingCpuLogicBatchMixin",
+    "CraftingCpuLogicMixin",
+    "CraftingCpuLogicAccessor",
+    "AdvCraftingCpuLogicMixin",
+    "AdvCraftingCpuAccessor",
+    "ECOCraftingCpuLogicMixin",
+    "ECOCraftingCpuAccessor",
+    "NeoEcoPatternBusBatchMixin",
+    "ExecutingCraftingJobAccessor",
+    "ElapsedTimeTrackerAccessor",
+    "TaskProgressAccessor",
+    "AaeExecutingCraftingJobAccessor",
+    "AaeElapsedTimeTrackerAccessor",
+    "AaeTaskProgressAccessor",
+    "ExtendedAePlusVirtualCompletionSuppressionMixin",
+    "ExtendedCraftingCpuServiceMixin",
+    "TimeWheelCraftingCPUMenuMixin"
+  ],
+  "client": [
+    "client.CPUSelectionListStorageMixin",
+    "client.CraftConfirmScreenCpuStatusMixin",
+    "client.TooltipsByteAmountMixin"
+  ],
+  "injectors": {
+    "defaultRequire": 1
+  }
+}

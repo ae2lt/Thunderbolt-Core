@@ -1,0 +1,9 @@
+.gradle/
+build/
+out/
+.idea/
+*.iml
+*.jar
+hs_err_pid*.log
+crash-reports/
+

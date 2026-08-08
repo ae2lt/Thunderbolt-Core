@@ -1,0 +1,259 @@
+package com.moakiee.thunderbolt.api.eject;
+
+import com.moakiee.thunderbolt.internal.eject.EjectRegistrationSavedData;
+import com.moakiee.thunderbolt.internal.eject.ThunderboltGhostOutputBlockEntity;
+import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
+import it.unimi.dsi.fastutil.objects.ObjectIterator;
+import java.lang.ref.WeakReference;
+import java.util.ArrayList;
+import java.util.EnumMap;
+import java.util.IdentityHashMap;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
+import net.minecraft.core.BlockPos;
+import net.minecraft.core.Direction;
+import net.minecraft.resources.ResourceKey;
+import net.minecraft.server.MinecraftServer;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.world.level.Level;
+import net.minecraft.world.level.block.entity.BlockEntity;
+import org.jetbrains.annotations.Nullable;
+
+public final class EjectCapabilityRegistry {
+   private static final Map<ResourceKey<Level>, Long2ObjectOpenHashMap<EnumMap<Direction, List<EjectCapabilityRegistry.Entry>>>> REGISTRATIONS = new IdentityHashMap<>();
+   private static final ThreadLocal<int[]> BYPASS_DEPTH = ThreadLocal.withInitial(() -> new int[1]);
+   @Nullable
+   private static EjectRegistrationSavedData savedData;
+
+   private EjectCapabilityRegistry() {
+   }
+
+   public static void setBypass(boolean bypass) {
+      int[] depth = BYPASS_DEPTH.get();
+      if (bypass) {
+         depth[0]++;
+      } else if (depth[0] > 0) {
+         depth[0]--;
+      }
+   }
+
+   public static boolean isBypassed() {
+      return BYPASS_DEPTH.get()[0] > 0;
+   }
+
+   public static boolean isEmpty() {
+      return REGISTRATIONS.isEmpty();
+   }
+
+   public static void onServerStart(MinecraftServer server) {
+      savedData = EjectRegistrationSavedData.get(server);
+      savedData.migrateLegacyIfNeeded(server);
+      REGISTRATIONS.clear();
+      BYPASS_DEPTH.remove();
+
+      for (EjectRegistrationSavedData.PersistentRegistration registration : savedData.getAll()) {
+         ServerLevel targetLevel = server.getLevel(registration.interceptDimension());
+         ThunderboltGhostOutputBlockEntity ghost = new ThunderboltGhostOutputBlockEntity(registration.interceptPos());
+         if (targetLevel != null) {
+            ghost.setLevel(targetLevel);
+         }
+
+         addToMap(
+            registration.interceptDimension(),
+            registration.interceptPos().asLong(),
+            registration.interceptFace(),
+            new EjectCapabilityRegistry.Entry(null, ghost, registration.hostDimension(), registration.hostPos())
+         );
+      }
+   }
+
+   public static void onServerStop() {
+      savedData = null;
+      REGISTRATIONS.clear();
+      BYPASS_DEPTH.remove();
+   }
+
+   public static EjectCapabilityRegistry.Entry createEntry(BlockEntity host, Level interceptLevel, BlockPos interceptPos) {
+      Level hostLevel = host.getLevel();
+      if (hostLevel == null) {
+         throw new IllegalStateException("Cannot register an eject host before it has a level");
+      } else {
+         ThunderboltGhostOutputBlockEntity ghost = new ThunderboltGhostOutputBlockEntity(interceptPos.immutable());
+         ghost.setLevel(interceptLevel);
+         return new EjectCapabilityRegistry.Entry(new WeakReference<>(host), ghost, hostLevel.dimension(), host.getBlockPos().immutable());
+      }
+   }
+
+   public static void register(ResourceKey<Level> dimension, long pos, Direction face, EjectCapabilityRegistry.Entry entry) {
+      addToMap(dimension, pos, face, entry);
+      if (savedData != null) {
+         savedData.add(new EjectRegistrationSavedData.PersistentRegistration(dimension, BlockPos.of(pos), face, entry.hostDimension(), entry.hostPos()));
+      }
+   }
+
+   public static void unregister(ResourceKey<Level> dimension, long pos, Direction face) {
+      Long2ObjectOpenHashMap<EnumMap<Direction, List<EjectCapabilityRegistry.Entry>>> dimensionMap = REGISTRATIONS.get(dimension);
+      if (dimensionMap != null) {
+         EnumMap<Direction, List<EjectCapabilityRegistry.Entry>> faceMap = (EnumMap<Direction, List<EjectCapabilityRegistry.Entry>>)dimensionMap.get(pos);
+         if (faceMap != null) {
+            faceMap.remove(face);
+            if (faceMap.isEmpty()) {
+               dimensionMap.remove(pos);
+               if (dimensionMap.isEmpty()) {
+                  REGISTRATIONS.remove(dimension);
+               }
+            }
+
+            if (savedData != null) {
+               savedData.removeByIntercept(dimension, BlockPos.of(pos), face);
+            }
+         }
+      }
+   }
+
+   @Nullable
+   public static EjectCapabilityRegistry.Entry lookupByFace(ResourceKey<Level> dimension, long pos, Direction face) {
+      Long2ObjectOpenHashMap<EnumMap<Direction, List<EjectCapabilityRegistry.Entry>>> dimensionMap = REGISTRATIONS.get(dimension);
+      if (dimensionMap == null) {
+         return null;
+      } else {
+         EnumMap<Direction, List<EjectCapabilityRegistry.Entry>> faceMap = (EnumMap<Direction, List<EjectCapabilityRegistry.Entry>>)dimensionMap.get(pos);
+         return faceMap == null ? null : preferLoadedHost(faceMap.get(face));
+      }
+   }
+
+   @Nullable
+   public static EjectCapabilityRegistry.Entry lookupAny(ResourceKey<Level> dimension, long pos) {
+      Long2ObjectOpenHashMap<EnumMap<Direction, List<EjectCapabilityRegistry.Entry>>> dimensionMap = REGISTRATIONS.get(dimension);
+      if (dimensionMap == null) {
+         return null;
+      } else {
+         EnumMap<Direction, List<EjectCapabilityRegistry.Entry>> faceMap = (EnumMap<Direction, List<EjectCapabilityRegistry.Entry>>)dimensionMap.get(pos);
+         if (faceMap == null) {
+            return null;
+         } else {
+            EjectCapabilityRegistry.Entry fallback = null;
+
+            for (List<EjectCapabilityRegistry.Entry> entries : faceMap.values()) {
+               EjectCapabilityRegistry.Entry candidate = preferLoadedHost(entries);
+               if (candidate != null && candidate.getHost() != null) {
+                  return candidate;
+               }
+
+               if (fallback == null) {
+                  fallback = candidate;
+               }
+            }
+
+            return fallback;
+         }
+      }
+   }
+
+   public static List<EjectCapabilityRegistry.DimensionPos> unregisterAll(BlockEntity host, boolean persist) {
+      Level hostLevel = host.getLevel();
+      if (hostLevel != null && hostLevel.isClientSide()) {
+         return List.of();
+      } else {
+         ResourceKey<Level> hostDimension = hostLevel != null ? hostLevel.dimension() : null;
+         BlockPos hostPos = host.getBlockPos();
+         ArrayList<EjectCapabilityRegistry.DimensionPos> removed = new ArrayList<>();
+         Iterator<Map.Entry<ResourceKey<Level>, Long2ObjectOpenHashMap<EnumMap<Direction, List<EjectCapabilityRegistry.Entry>>>>> dimensionIterator = REGISTRATIONS.entrySet()
+            .iterator();
+
+         while (dimensionIterator.hasNext()) {
+            Map.Entry<ResourceKey<Level>, Long2ObjectOpenHashMap<EnumMap<Direction, List<EjectCapabilityRegistry.Entry>>>> dimensionEntry = dimensionIterator.next();
+            ObjectIterator<it.unimi.dsi.fastutil.longs.Long2ObjectMap.Entry<EnumMap<Direction, List<EjectCapabilityRegistry.Entry>>>> positionIterator = dimensionEntry.getValue()
+               .long2ObjectEntrySet()
+               .iterator();
+
+            while (positionIterator.hasNext()) {
+               it.unimi.dsi.fastutil.longs.Long2ObjectMap.Entry<EnumMap<Direction, List<EjectCapabilityRegistry.Entry>>> positionEntry = (it.unimi.dsi.fastutil.longs.Long2ObjectMap.Entry<EnumMap<Direction, List<EjectCapabilityRegistry.Entry>>>)positionIterator.next();
+               EnumMap<Direction, List<EjectCapabilityRegistry.Entry>> faceMap = (EnumMap<Direction, List<EjectCapabilityRegistry.Entry>>)positionEntry.getValue();
+               boolean changed = false;
+               Iterator<Map.Entry<Direction, List<EjectCapabilityRegistry.Entry>>> faceIterator = faceMap.entrySet().iterator();
+
+               while (faceIterator.hasNext()) {
+                  List<EjectCapabilityRegistry.Entry> entries = faceIterator.next().getValue();
+                  if (entries.removeIf(entry -> matchesHost(entry, host, hostDimension, hostPos))) {
+                     changed = true;
+                  }
+
+                  if (entries.isEmpty()) {
+                     faceIterator.remove();
+                  }
+               }
+
+               if (changed) {
+                  removed.add(new EjectCapabilityRegistry.DimensionPos(dimensionEntry.getKey(), BlockPos.of(positionEntry.getLongKey())));
+               }
+
+               if (faceMap.isEmpty()) {
+                  positionIterator.remove();
+               }
+            }
+
+            if (dimensionEntry.getValue().isEmpty()) {
+               dimensionIterator.remove();
+            }
+         }
+
+         if (persist && savedData != null && hostDimension != null) {
+            savedData.removeByHost(hostDimension, hostPos);
+         }
+
+         return removed;
+      }
+   }
+
+   private static void addToMap(ResourceKey<Level> dimension, long pos, Direction face, EjectCapabilityRegistry.Entry entry) {
+      Long2ObjectOpenHashMap<EnumMap<Direction, List<EjectCapabilityRegistry.Entry>>> byPosition = REGISTRATIONS.computeIfAbsent(
+         dimension, ignored -> new Long2ObjectOpenHashMap<>()
+      );
+      EnumMap<Direction, List<EjectCapabilityRegistry.Entry>> byFace = byPosition.computeIfAbsent(pos, ignored -> new EnumMap<>(Direction.class));
+      byFace.computeIfAbsent(face, ignored -> new ArrayList<>()).add(entry);
+   }
+
+   @Nullable
+   private static EjectCapabilityRegistry.Entry preferLoadedHost(@Nullable List<EjectCapabilityRegistry.Entry> entries) {
+      if (entries == null) {
+         return null;
+      } else {
+         EjectCapabilityRegistry.Entry fallback = null;
+
+         for (EjectCapabilityRegistry.Entry entry : entries) {
+            if (entry.getHost() != null) {
+               return entry;
+            }
+
+            if (fallback == null) {
+               fallback = entry;
+            }
+         }
+
+         return fallback;
+      }
+   }
+
+   private static boolean matchesHost(EjectCapabilityRegistry.Entry entry, BlockEntity host, @Nullable ResourceKey<Level> hostDimension, BlockPos hostPos) {
+      BlockEntity referencedHost = entry.getHost();
+      if (referencedHost == host) {
+         return true;
+      } else {
+         return hostDimension == null ? false : entry.hostDimension().equals(hostDimension) && entry.hostPos().equals(hostPos);
+      }
+   }
+
+   public static record DimensionPos(ResourceKey<Level> dimension, BlockPos pos) {
+   }
+
+   public static record Entry(
+      @Nullable WeakReference<? extends BlockEntity> hostRef, BlockEntity ghostBlockEntity, ResourceKey<Level> hostDimension, BlockPos hostPos
+   ) {
+      @Nullable
+      public BlockEntity getHost() {
+         return this.hostRef != null ? this.hostRef.get() : null;
+      }
+   }
+}

@@ -1,0 +1,36 @@
+modLoader="javafml"
+loaderVersion="[47,)"
+license="LGPL-3.0-only"
+[[mods]]
+    modId="thunderbolt"
+    version="${mod_version}"
+    displayName="${mod_name}"
+    logoFile="thunderbolt.png"
+    description='''
+Shared AE2 optimization and infrastructure layer for AE2 Lightning Tech. Provides the Thunderbolt fast autocrafting planner and low-level AE2 hooks used by AE2LT and compatible addons.
+'''
+    authors="${mod_authors}"
+
+[[mixins]]
+    config="thunderbolt.mixins.json"
+
+[[dependencies.thunderbolt]]
+    modId="forge"
+    type="required"
+    versionRange="[47.4.20,48)"
+    ordering="NONE"
+    side="BOTH"
+
+[[dependencies.thunderbolt]]
+    modId="minecraft"
+    type="required"
+    versionRange="[1.20.1,1.20.2)"
+    ordering="NONE"
+    side="BOTH"
+
+[[dependencies.thunderbolt]]
+    modId="ae2"
+    type="required"
+    versionRange="[15.4.10,15.5.0)"
+    ordering="AFTER"
+    side="BOTH"
