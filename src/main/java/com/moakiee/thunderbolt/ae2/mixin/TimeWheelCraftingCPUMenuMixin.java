@@ -95,14 +95,17 @@ public abstract class TimeWheelCraftingCPUMenuMixin extends AEBaseMenu {
         }
     }
 
-    @Inject(method = "removed", at = @At("TAIL"))
+    @Inject(
+            method = "removed(Lnet/minecraft/world/entity/player/Player;)V",
+            at = @At("TAIL"),
+            remap = true)
     private void thunderbolt$removed(Player player, CallbackInfo ci) {
         if (this.thunderbolt$timeWheelCpu != null) {
             this.thunderbolt$timeWheelCpu.getCraftingLogic().removeListener(cpuChangeListener);
         }
     }
 
-    @Inject(method = "broadcastChanges", at = @At("HEAD"))
+    @Inject(method = "broadcastChanges()V", at = @At("HEAD"), remap = true)
     private void thunderbolt$broadcastTimeWheelStatus(CallbackInfo ci) {
         if (!isServerSide() || this.thunderbolt$timeWheelCpu == null) {
             return;
