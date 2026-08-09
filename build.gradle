@@ -55,15 +55,12 @@ repositories {
         name = 'MinecraftForge'
         url = 'https://maven.minecraftforge.net/'
     }
-    // 本地镜像仓库：maven.modrinth.com TLS 握手被网络阻断，AE2 15.4.10 已从
-    // Modrinth CDN 下载并放置到 repo/ 目录（见 repo/maven/modrinth/ae2/15.4.10/）。
     maven {
-        name = 'LocalMirror'
-        url = uri("${projectDir}/repo")
-    }
-    maven {
-        name = 'Modrinth'
-        url = 'https://maven.modrinth.com'
+        name = 'ModMaven'
+        url = 'https://modmaven.dev/'
+        content {
+            includeGroup 'appeng'
+        }
     }
     maven {
         name = 'CurseMaven'
@@ -95,10 +92,9 @@ dependencies {
     // Mixin annotation processor — generates thunderbolt.refmap.json.
     annotationProcessor 'org.spongepowered:mixin:0.8.5:processor'
 
-    // AE2 — Modrinth Maven (15.4.10 is not on Maven Central). compileOnly: this layer patches AE2 via
-    // mixins; AE2 is provided by the modpack at runtime. The pure planner core under
-    // `crafting.core` has NO AE2 dependency and is unit-tested standalone.
-    compileOnly "maven.modrinth:ae2:15.4.10"
+    // AE2 is provided by the modpack at runtime. The pure planner core under `crafting.core`
+    // has no AE2 dependency and is unit-tested standalone.
+    compileOnly "appeng:appliedenergistics2-forge:${ae2_version}"
 
     // Applied Flux — CurseForge 1.20.1 file.
     compileOnly "curse.maven:applied-flux-965012:7651647"
@@ -109,7 +105,7 @@ dependencies {
     testRuntimeOnly "org.junit.platform:junit-platform-launcher"
     // AE2 API types exercised directly by unit tests (e.g. ByteTracker's AEKeyType);
     // compileOnly deps are absent from the test runtime classpath otherwise.
-    testRuntimeOnly "maven.modrinth:ae2:15.4.10"
+    testRuntimeOnly "appeng:appliedenergistics2-forge:${ae2_version}"
 }
 
 // Tests that exercise SavedData/codecs need the same generated Minecraft/Forge classes as main.
