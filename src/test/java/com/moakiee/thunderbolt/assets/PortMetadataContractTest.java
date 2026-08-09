@@ -12,6 +12,8 @@ import org.junit.jupiter.api.Test;
 
 class PortMetadataContractTest {
     private static final Path PROPERTIES_FILE = Path.of("gradle.properties");
+    private static final Path GENERATED_REFMAP =
+            Path.of("build", "tmp", "compileJava", "thunderbolt.refmap.json");
 
     @Test
     void requiredDependenciesMatchTheVerifiedForgeBaseline() throws IOException {
@@ -32,5 +34,18 @@ class PortMetadataContractTest {
         assertTrue(buildScript.contains("from('LICENSE')"));
         assertTrue(buildScript.contains("into 'META-INF'"));
         assertTrue(buildScript.contains("tasks.named('jarJar', Jar)"));
+    }
+
+    @Test
+    void productionRefmapIncludesInheritedMenuLifecycleMethods() throws IOException {
+        String refmap = Files.readString(GENERATED_REFMAP);
+
+        assertTrue(refmap.contains(
+                "\"broadcastChanges()V\": "
+                        + "\"Lappeng/menu/me/crafting/CraftingCPUMenu;m_38946_()V\""));
+        assertTrue(refmap.contains(
+                "\"removed(Lnet/minecraft/world/entity/player/Player;)V\": "
+                        + "\"Lappeng/menu/me/crafting/CraftingCPUMenu;"
+                        + "m_6877_(Lnet/minecraft/world/entity/player/Player;)V\""));
     }
 }
