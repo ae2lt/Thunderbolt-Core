@@ -69,6 +69,21 @@ repositories {
             includeGroup "curse.maven"
         }
     }
+    maven {
+        name = 'Modrinth'
+        url = 'https://api.modrinth.com/maven'
+        content {
+            includeGroup 'maven.modrinth'
+        }
+    }
+}
+
+configurations {
+    optionalModShapeArtifacts {
+        canBeConsumed = false
+        canBeResolved = true
+        transitive = false
+    }
 }
 
 dependencies {
@@ -106,6 +121,11 @@ dependencies {
     // AE2 API types exercised directly by unit tests (e.g. ByteTracker's AEKeyType);
     // compileOnly deps are absent from the test runtime classpath otherwise.
     testRuntimeOnly "appeng:appliedenergistics2-forge:${ae2_version}"
+
+    optionalModShapeArtifacts "maven.modrinth:advancedae:${advancedae_version}"
+    optionalModShapeArtifacts "maven.modrinth:neoecoae:${neoecoae_version}"
+    optionalModShapeArtifacts "maven.modrinth:ae2-crafting-tree-refreshed:${ae2_crafting_tree_version}"
+    optionalModShapeArtifacts "maven.modrinth:extendedae-plus:${extendedae_plus_version}"
 }
 
 // Tests that exercise SavedData/codecs need the same generated Minecraft/Forge classes as main.
@@ -114,9 +134,17 @@ sourceSets.test.runtimeClasspath += sourceSets.main.runtimeClasspath
 
 test {
     useJUnitPlatform()
+    dependsOn 'prepareOptionalModShapeArtifacts'
+    systemProperty 'thunderbolt.optionalModShapeDir',
+            layout.buildDirectory.dir('optional-mod-shapes').get().asFile.absolutePath
     testLogging {
         events "passed", "skipped", "failed"
     }
+}
+
+tasks.register('prepareOptionalModShapeArtifacts', Sync) {
+    from configurations.optionalModShapeArtifacts
+    into layout.buildDirectory.dir('optional-mod-shapes')
 }
 
 processResources {

@@ -23,17 +23,35 @@ import org.objectweb.asm.FieldVisitor;
 import org.objectweb.asm.MethodVisitor;
 import org.objectweb.asm.Opcodes;
 
-/** Optional binary-shape checks against the real supported NeoECO artifacts. */
+/** Binary-shape checks against the real supported NeoECO artifacts. */
 class NeoEcoBinaryShapeTest {
     private static final String LOGIC_CLASS =
             "cn/dancingsnow/neoecoae/api/me/ECOCraftingCPULogic.class";
-    private static final String EXECUTE_CRAFTING =
+    private static final String LEGACY_EXECUTE_CRAFTING =
             "executeCrafting(ILappeng/me/service/CraftingService;"
                     + "Lappeng/api/networking/energy/IEnergyService;"
                     + "Lnet/minecraft/world/level/Level;)I";
+    private static final String FORGE_1201_EXECUTE_CRAFTING =
+            "executeCrafting(IILappeng/me/service/CraftingService;"
+                    + "Lappeng/api/networking/energy/IEnergyService;"
+                    + "Lnet/minecraft/world/level/Level;"
+                    + "Lcn/dancingsnow/neoecoae/api/me/"
+                    + "ECOCraftingCPULogic$FastPathBatchBudget;)I";
     private static final String COLLECT_AVAILABLE_PROVIDERS =
             "collectAvailableProviders(Lappeng/me/service/CraftingService;"
                     + "Lappeng/api/crafting/IPatternDetails;)Ljava/util/List;";
+    private static final String COLLECT_PROVIDERS =
+            "collectProviders(Lappeng/me/service/CraftingService;"
+                    + "Lappeng/api/crafting/IPatternDetails;)"
+                    + "Lcn/dancingsnow/neoecoae/api/me/ECOCraftingCPULogic$ProviderSelection;";
+    private static final String TRY_PUSH_SLOW_PATTERN =
+            "tryPushSlowPattern(Lappeng/api/crafting/IPatternDetails;"
+                    + "Lcn/dancingsnow/neoecoae/api/me/ExecutingCraftingJob$TaskProgress;"
+                    + "Lcn/dancingsnow/neoecoae/api/me/ECOCraftingCPULogic$ProviderSelection;"
+                    + "Lcn/dancingsnow/neoecoae/api/me/ECOCraftingCPULogic$ExtractedPatternAttempt;"
+                    + "Lcn/dancingsnow/neoecoae/api/me/ECOCraftingCPULogic$CraftingExecutionProgress;"
+                    + "Lappeng/api/networking/energy/IEnergyService;)"
+                    + "Lcn/dancingsnow/neoecoae/api/me/ECOCraftingCPULogic$PushResult;";
     private static final String INSERT =
             "insert(Lappeng/api/stacks/AEKey;JLappeng/api/config/Actionable;)J";
 
@@ -43,7 +61,7 @@ class NeoEcoBinaryShapeTest {
             var logic = assertCommonShape(jar);
 
             assertFalse(logic.methods.contains(COLLECT_AVAILABLE_PROVIDERS));
-            assertProviderLookupCount(logic, EXECUTE_CRAFTING, 1);
+            assertProviderLookupCount(logic, LEGACY_EXECUTE_CRAFTING, 1);
             assertProviderLookupCount(logic, COLLECT_AVAILABLE_PROVIDERS, 0);
             assertWaitingForExtractCount(logic, 2);
         }
@@ -55,30 +73,11 @@ class NeoEcoBinaryShapeTest {
             var logic = assertCommonShape(jar);
 
             assertTrue(logic.methods.contains(COLLECT_AVAILABLE_PROVIDERS));
-            assertProviderLookupCount(logic, EXECUTE_CRAFTING, 0);
+            assertProviderLookupCount(logic, LEGACY_EXECUTE_CRAFTING, 0);
             assertProviderLookupCount(logic, COLLECT_AVAILABLE_PROVIDERS, 1);
             assertWaitingForExtractCount(logic, 3);
 
-            var bus = shape(jar,
-                    "cn/dancingsnow/neoecoae/blocks/entity/crafting/"
-                            + "ECOCraftingPatternBusBlockEntity.class");
-            assertTrue(bus.methods.contains("getAvailableThreadSlots()I"));
-            assertTrue(bus.methods.contains(
-                    "findBatchFastPathOffer("
-                            + "Lcn/dancingsnow/neoecoae/impl/crafting/fastpath/"
-                            + "ECOExtractedPatternExecution;I)"
-                            + "Lcn/dancingsnow/neoecoae/blocks/entity/crafting/"
-                            + "ECOCraftingPatternBusBlockEntity$BatchFastPathOffer;"));
-            assertTrue(bus.methods.contains(
-                    "pushPattern("
-                            + "Lcn/dancingsnow/neoecoae/impl/crafting/fastpath/"
-                            + "ECOExtractedPatternExecution;Ljava/util/UUID;)Z"));
-            assertTrue(bus.methods.contains(
-                    "pushBatch("
-                            + "Lcn/dancingsnow/neoecoae/impl/crafting/fastpath/"
-                            + "ECOBatchCraftingRequest;"
-                            + "Lcn/dancingsnow/neoecoae/blocks/entity/crafting/"
-                            + "ECOCraftingPatternBusBlockEntity$BatchFastPathOffer;)Z"));
+            assertFastPathBusShape(jar);
 
             var execution = shape(jar,
                     "cn/dancingsnow/neoecoae/impl/crafting/fastpath/"
@@ -97,6 +96,87 @@ class NeoEcoBinaryShapeTest {
         }
     }
 
+    @Test
+    void real2030Forge1201JarMatchesInjectionAndBridgeTargets() throws IOException {
+        try (var jar = preparedJar("neoecoae-20.3.0.jar")) {
+            var logic = shape(jar, LOGIC_CLASS);
+            assertCoreStateShape(jar, logic);
+            assertTrue(logic.methods.contains(FORGE_1201_EXECUTE_CRAFTING));
+            assertTrue(logic.methods.contains(COLLECT_PROVIDERS));
+            assertTrue(logic.methods.contains(TRY_PUSH_SLOW_PATTERN));
+
+            assertInvocationCount(
+                    logic,
+                    "tickCraftingLogic(Lappeng/api/networking/energy/IEnergyService;"
+                            + "Lappeng/me/service/CraftingService;)V",
+                    Opcodes.INVOKEVIRTUAL,
+                    "cn/dancingsnow/neoecoae/api/me/ECOCraftingCPULogic",
+                    "executeCrafting",
+                    "(IILappeng/me/service/CraftingService;"
+                            + "Lappeng/api/networking/energy/IEnergyService;"
+                            + "Lnet/minecraft/world/level/Level;"
+                            + "Lcn/dancingsnow/neoecoae/api/me/"
+                            + "ECOCraftingCPULogic$FastPathBatchBudget;)I",
+                    false,
+                    1);
+            assertProviderLookupCount(logic, COLLECT_PROVIDERS, 1);
+            assertInvocationCount(
+                    logic,
+                    TRY_PUSH_SLOW_PATTERN,
+                    Opcodes.INVOKEINTERFACE,
+                    "appeng/api/networking/crafting/ICraftingProvider",
+                    "pushPattern",
+                    "(Lappeng/api/crafting/IPatternDetails;[Lappeng/api/stacks/KeyCounter;)Z",
+                    true,
+                    1);
+            assertWaitingForExtractCount(logic, 3);
+            assertFastPathBusShape(jar);
+
+            var execution = shape(jar,
+                    "cn/dancingsnow/neoecoae/impl/crafting/fastpath/"
+                            + "ECOExtractedPatternExecution.class");
+            assertTrue(execution.methods.contains(
+                    "create(Lappeng/api/crafting/IPatternDetails;"
+                            + "Lcn/dancingsnow/neoecoae/impl/crafting/fastpath/"
+                            + "ECOCompiledFastPathPattern;"
+                            + "Lcn/dancingsnow/neoecoae/impl/crafting/fastpath/"
+                            + "ECOFastPathPatternMetadata;"
+                            + "[Lappeng/api/stacks/KeyCounter;Ljava/util/List;Z"
+                            + "Lnet/minecraft/world/level/Level;)"
+                            + "Lcn/dancingsnow/neoecoae/impl/crafting/fastpath/"
+                            + "ECOExtractedPatternExecution;"));
+            assertTrue(execution.methods.contains("fastPathEligible()Z"));
+            assertTrue(execution.methods.contains(
+                    "key()Lcn/dancingsnow/neoecoae/impl/crafting/fastpath/ECOFastPathKey;"));
+            assertTrue(execution.methods.contains("inputItems()Ljava/util/List;"));
+            assertTrue(execution.methods.contains("expectedOutputs()Ljava/util/List;"));
+            assertTrue(execution.methods.contains("expectedContainerItems()Ljava/util/List;"));
+
+            var compiled = shape(jar,
+                    "cn/dancingsnow/neoecoae/impl/crafting/fastpath/"
+                            + "ECOCompiledFastPathPattern.class");
+            assertTrue(compiled.methods.contains(
+                    "compile(Lappeng/api/crafting/IPatternDetails;)"
+                            + "Lcn/dancingsnow/neoecoae/impl/crafting/fastpath/"
+                            + "ECOCompiledFastPathPattern;"));
+            assertTrue(compiled.methods.contains("canBuildFastPath(Ljava/util/List;)Z"));
+
+            var metadata = shape(jar,
+                    "cn/dancingsnow/neoecoae/impl/crafting/fastpath/"
+                            + "ECOFastPathPatternMetadata.class");
+            assertTrue(metadata.methods.contains(
+                    "create(Lcn/dancingsnow/neoecoae/impl/crafting/fastpath/"
+                            + "ECOCompiledFastPathPattern;[Lappeng/api/stacks/KeyCounter;"
+                            + "Lnet/minecraft/world/level/Level;)"
+                            + "Lcn/dancingsnow/neoecoae/impl/crafting/fastpath/"
+                            + "ECOFastPathPatternMetadata;"));
+
+            var eligibility = shape(jar,
+                    "cn/dancingsnow/neoecoae/api/me/ECOFastPathEligibility.class");
+            assertTrue(eligibility.methods.contains("isGloballyEnabled()Z"));
+        }
+    }
+
     private static JarFile configuredJar(String environmentVariable) throws IOException {
         String configured = System.getenv(environmentVariable);
         Path path = configured != null ? Path.of(configured) : null;
@@ -106,22 +186,19 @@ class NeoEcoBinaryShapeTest {
         return new JarFile(path.toFile());
     }
 
+    private static JarFile preparedJar(String fileName) throws IOException {
+        String directory = System.getProperty("thunderbolt.optionalModShapeDir");
+        assertTrue(directory != null && !directory.isBlank(),
+                "thunderbolt.optionalModShapeDir must identify the prepared optional-mod artifacts");
+        Path path = Path.of(directory).resolve(fileName);
+        assertTrue(Files.isRegularFile(path), "missing prepared optional-mod artifact: " + path);
+        return new JarFile(path.toFile());
+    }
+
     private static Shape assertCommonShape(JarFile jar) throws IOException {
         var logic = shape(jar, LOGIC_CLASS);
-        assertTrue(logic.fields.contains("job:Lcn/dancingsnow/neoecoae/api/me/ExecutingCraftingJob;"));
-        assertTrue(logic.fields.contains("inventory:Lappeng/crafting/inv/ListCraftingInventory;"));
-        assertTrue(logic.fields.contains("cpu:Lcn/dancingsnow/neoecoae/api/me/ECOCraftingCPU;"));
-        assertTrue(logic.methods.contains(INSERT));
-        assertTrue(logic.methods.contains(EXECUTE_CRAFTING));
-        assertTrue(logic.methods.contains(
-                "tickCraftingLogic(Lappeng/api/networking/energy/IEnergyService;"
-                        + "Lappeng/me/service/CraftingService;)V"));
-        assertTrue(logic.methods.contains("finishJob(Z)V"));
-        assertTrue(logic.methods.contains("postChange(Lappeng/api/stacks/AEKey;)V"));
-        assertTrue(logic.methods.contains("readFromNBT(Lnet/minecraft/nbt/CompoundTag;"
-                + "Lnet/minecraft/core/HolderLookup$Provider;)V"));
-        assertTrue(logic.methods.contains("writeToNBT(Lnet/minecraft/nbt/CompoundTag;"
-                + "Lnet/minecraft/core/HolderLookup$Provider;)V"));
+        assertCoreStateShape(jar, logic);
+        assertTrue(logic.methods.contains(LEGACY_EXECUTE_CRAFTING));
 
         assertInvocationCount(
                 logic,
@@ -137,13 +214,30 @@ class NeoEcoBinaryShapeTest {
                 1);
         assertInvocationCount(
                 logic,
-                EXECUTE_CRAFTING,
+                LEGACY_EXECUTE_CRAFTING,
                 Opcodes.INVOKEINTERFACE,
                 "appeng/api/networking/crafting/ICraftingProvider",
                 "pushPattern",
                 "(Lappeng/api/crafting/IPatternDetails;[Lappeng/api/stacks/KeyCounter;)Z",
                 true,
                 1);
+        return logic;
+    }
+
+    private static void assertCoreStateShape(JarFile jar, Shape logic) throws IOException {
+        assertTrue(logic.fields.contains("job:Lcn/dancingsnow/neoecoae/api/me/ExecutingCraftingJob;"));
+        assertTrue(logic.fields.contains("inventory:Lappeng/crafting/inv/ListCraftingInventory;"));
+        assertTrue(logic.fields.contains("cpu:Lcn/dancingsnow/neoecoae/api/me/ECOCraftingCPU;"));
+        assertTrue(logic.methods.contains(INSERT));
+        assertTrue(logic.methods.contains(
+                "tickCraftingLogic(Lappeng/api/networking/energy/IEnergyService;"
+                        + "Lappeng/me/service/CraftingService;)V"));
+        assertTrue(logic.methods.contains("finishJob(Z)V"));
+        assertTrue(logic.methods.contains("postChange(Lappeng/api/stacks/AEKey;)V"));
+        assertTrue(logic.methods.contains("readFromNBT(Lnet/minecraft/nbt/CompoundTag;"
+                + "Lnet/minecraft/core/HolderLookup$Provider;)V"));
+        assertTrue(logic.methods.contains("writeToNBT(Lnet/minecraft/nbt/CompoundTag;"
+                + "Lnet/minecraft/core/HolderLookup$Provider;)V"));
 
         var job = shape(jar, "cn/dancingsnow/neoecoae/api/me/ExecutingCraftingJob.class");
         assertTrue(job.fields.contains("link:Lappeng/crafting/CraftingLink;"));
@@ -163,7 +257,29 @@ class NeoEcoBinaryShapeTest {
 
         var cpu = shape(jar, "cn/dancingsnow/neoecoae/api/me/ECOCraftingCPU.class");
         assertTrue(cpu.methods.contains("markDirty()V"));
-        return logic;
+    }
+
+    private static void assertFastPathBusShape(JarFile jar) throws IOException {
+        var bus = shape(jar,
+                "cn/dancingsnow/neoecoae/blocks/entity/crafting/"
+                        + "ECOCraftingPatternBusBlockEntity.class");
+        assertTrue(bus.methods.contains("getAvailableThreadSlots()I"));
+        assertTrue(bus.methods.contains(
+                "findBatchFastPathOffer("
+                        + "Lcn/dancingsnow/neoecoae/impl/crafting/fastpath/"
+                        + "ECOExtractedPatternExecution;I)"
+                        + "Lcn/dancingsnow/neoecoae/blocks/entity/crafting/"
+                        + "ECOCraftingPatternBusBlockEntity$BatchFastPathOffer;"));
+        assertTrue(bus.methods.contains(
+                "pushPattern("
+                        + "Lcn/dancingsnow/neoecoae/impl/crafting/fastpath/"
+                        + "ECOExtractedPatternExecution;Ljava/util/UUID;)Z"));
+        assertTrue(bus.methods.contains(
+                "pushBatch("
+                        + "Lcn/dancingsnow/neoecoae/impl/crafting/fastpath/"
+                        + "ECOBatchCraftingRequest;"
+                        + "Lcn/dancingsnow/neoecoae/blocks/entity/crafting/"
+                        + "ECOCraftingPatternBusBlockEntity$BatchFastPathOffer;)Z"));
     }
 
     private static void assertProviderLookupCount(Shape logic, String containingMethod, long expectedCount) {
