@@ -86,8 +86,7 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
     private static final int MAX_TASK_PROBES_PER_TICK = 262_144;
     private static final int RETRY_DELAY_TICKS = 4;
     private static final int PARKED_TASK_SAFETY_DELAY_TICKS = 32;
-    /** Shared read-only tracker returned when no job is active; avoids per-call allocation. */
-    private static final ElapsedTimeTracker EMPTY_TIME_TRACKER = new ElapsedTimeTracker();
+    /** Shared read-only tracker returned when no job is active; initialized only if queried. */
     private static final String TAG_INVENTORY = "inventory";
     private static final String TAG_JOB = "job";
     private static final String TAG_OVERLOAD_STATE = "ae2ltOverloadState";
@@ -2094,7 +2093,11 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
     }
 
     public ElapsedTimeTracker getElapsedTimeTracker() {
-        return this.job != null ? this.job.timeTracker : EMPTY_TIME_TRACKER;
+        return this.job != null ? this.job.timeTracker : EmptyTimeTrackerHolder.INSTANCE;
+    }
+
+    private static final class EmptyTimeTrackerHolder {
+        private static final ElapsedTimeTracker INSTANCE = new ElapsedTimeTracker();
     }
 
     public void addListener(Consumer<AEKey> listener) {

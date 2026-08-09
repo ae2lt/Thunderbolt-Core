@@ -41,9 +41,10 @@ Thunderbolt Core 是 AE2 Lightning Tech 使用的 AE2 优化与底层基础设�
 .\gradlew.bat publishToMavenLocal
 ```
 
-Maven 坐标：`com.moakiee.thunderbolt:thunderbolt:1.0.2`。
+Maven 坐标：`com.moakiee.thunderbolt:thunderbolt:1.0.7`。
 
-说明：本地构建默认使用 Gradle wrapper；如果 wrapper 不可用，也可以使用 `E:\gradle-8.14` 的独立 Gradle 8.14 安装。
+本地构建得到的可分发文件是 `build/libs/thunderbolt-1.0.7-all.jar`。
+不带分类后缀的 JAR 不含运行时必需的 MixinExtras 内嵌依赖，只作为开发过程的中间产物。
 
 问题反馈：[GitHub Issues](https://github.com/ae2lt/Thunderbolt-Core/issues) ·
 许可证：[GNU LGPL 3.0](LICENSE)

@@ -33,12 +33,8 @@ import com.moakiee.thunderbolt.ae2.util.MixinReflectionSupport;
 /**
  * Makes NeoECO CPUs dispatch compatible patterns through Thunderbolt batch providers.
  * <p>
- * Supports the NeoECO published artifacts 1.3.4 and 2.1.10 dual binary shapes: the
- * {@code method = {"executeCrafting", "collectAvailableProviders"}} aggregation resolves to
- * exactly one injection per shape (1.3.4 keeps {@code getProviders} inside
- * {@code executeCrafting}, 2.1.10 inside {@code collectAvailableProviders}); see
- * {@code NeoEcoBinaryShapeTest}. The upstream 1.20.1 branch HEAD has drifted to a new
- * shape (6-arg {@code executeCrafting}, {@code collectProviders}) which is not supported yet.
+ * Supports both the legacy four-argument dispatch method and the Forge 1.20.1 20.x
+ * six-argument dispatch method. Binary targets are locked by {@code NeoEcoBinaryShapeTest}.
  */
 @Pseudo
 @Mixin(targets = "cn.dancingsnow.neoecoae.api.me.ECOCraftingCPULogic", remap = false)
@@ -70,7 +66,8 @@ public abstract class ECOCraftingCpuLogicBatchMixin {
                     value = "INVOKE",
                     target = "Lcn/dancingsnow/neoecoae/api/me/ECOCraftingCPULogic;executeCrafting"
                             + "(ILappeng/me/service/CraftingService;Lappeng/api/networking/energy/IEnergyService;"
-                            + "Lnet/minecraft/world/level/Level;)I"))
+                            + "Lnet/minecraft/world/level/Level;)I"),
+            require = 0)
     private int ae2lt$wrapEcoExecuteCrafting(
             @Coerce Object self,
             int remainingOps,
@@ -78,6 +75,54 @@ public abstract class ECOCraftingCpuLogicBatchMixin {
             IEnergyService energyService,
             Level level,
             Operation<Integer> original) {
+        int batchResult = ae2lt$dispatchEcoBatch(
+                remainingOps, craftingService, energyService, level);
+        if (batchResult < 0) {
+            return original.call(self, remainingOps, craftingService, energyService, level);
+        }
+        return batchResult;
+    }
+
+    @WrapOperation(
+            method = "tickCraftingLogic",
+            at = @At(
+                    value = "INVOKE",
+                    target = "Lcn/dancingsnow/neoecoae/api/me/ECOCraftingCPULogic;executeCrafting"
+                            + "(IILappeng/me/service/CraftingService;Lappeng/api/networking/energy/IEnergyService;"
+                            + "Lnet/minecraft/world/level/Level;"
+                            + "Lcn/dancingsnow/neoecoae/api/me/ECOCraftingCPULogic$FastPathBatchBudget;)I"),
+            require = 0)
+    private int ae2lt$wrapEco20ExecuteCrafting(
+            @Coerce Object self,
+            int slowPatternBudget,
+            int totalPatternBudget,
+            CraftingService craftingService,
+            IEnergyService energyService,
+            Level level,
+            @Coerce Object fastPathBatchBudget,
+            Operation<Integer> original) {
+        int batchResult = ae2lt$dispatchEcoBatch(
+                totalPatternBudget, craftingService, energyService, level);
+        if (batchResult < 0) {
+            return original.call(
+                    self,
+                    slowPatternBudget,
+                    totalPatternBudget,
+                    craftingService,
+                    energyService,
+                    level,
+                    fastPathBatchBudget);
+        }
+        return batchResult;
+    }
+
+    /** Returns a non-negative consumed-operation count, or {@code -1} to run NeoECO normally. */
+    @Unique
+    private int ae2lt$dispatchEcoBatch(
+            int operationBudget,
+            CraftingService craftingService,
+            IEnergyService energyService,
+            Level level) {
         long now = TickHandler.instance().getCurrentTick();
         var batchedByTask = ae2lt$getEcoBatchedByTask();
         if (now != ae2lt$ecoBatchTick) {
@@ -91,12 +136,12 @@ public abstract class ECOCraftingCpuLogicBatchMixin {
         if (ae2lt$ecoBatchExhaustedThisTick
                 || !NeoEcoBatchJobView.acceptsJob(job)
                 || !(rawInventory instanceof ListCraftingInventory inventory)) {
-            return original.call(self, remainingOps, craftingService, energyService, level);
+            return -1;
         }
 
         Object cpu = MixinReflectionSupport.getFieldValueSafe(AE2LT_ECO_CPU_FIELD, this);
         var batchResult = BatchExecutor.runBatchOnly(
-                remainingOps,
+                operationBudget,
                 BatchCpuAccounting.Mode.LINEAR,
                 craftingService,
                 energyService,
@@ -110,15 +155,16 @@ public abstract class ECOCraftingCpuLogicBatchMixin {
             return batchResult.consumedCpuOps();
         }
 
-        // NeoECO's original call retains its own pattern-bus fast path and ordinary per-copy path.
+        // NeoECO's original call retains its own verified fast path and ordinary per-copy path.
         ae2lt$ecoBatchExhaustedThisTick = true;
-        return original.call(self, remainingOps, craftingService, energyService, level);
+        return -1;
     }
 
     @WrapOperation(
             method = {
                     "executeCrafting",
-                    "collectAvailableProviders"
+                    "collectAvailableProviders",
+                    "collectProviders"
             },
             at = @At(
                     value = "INVOKE",

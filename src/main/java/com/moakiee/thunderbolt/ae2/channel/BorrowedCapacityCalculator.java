@@ -357,7 +357,10 @@ public final class BorrowedCapacityCalculator {
 
     // ── Dinic's max-flow ─────────────────────────────────────────────
 
-    private static final class Dinic {
+    // Package-private so the iterative solver can be regression-tested without
+    // constructing a live AE2 grid. This is still an implementation detail of
+    // the channel package, not part of Thunderbolt's public API.
+    static final class Dinic {
         private final int size;
         private final int[] head;
         private int[] to, cap, nxt;

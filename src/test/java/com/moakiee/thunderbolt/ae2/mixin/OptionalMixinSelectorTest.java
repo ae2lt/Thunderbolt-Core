@@ -54,8 +54,8 @@ class OptionalMixinSelectorTest {
     }
 
     @Test
-    void skipsInsertBridgeWhenAdvancedAeOverwritesInsertIntoCpus() {
-        assertFalse(OptionalMixinSelector.shouldApply(
+    void callerSideInsertBridgeRemainsEnabledWithAdvancedAe() {
+        assertTrue(OptionalMixinSelector.shouldApply(
                 "ExtendedCraftingCpuInsertMixin", "advanced_ae"::equals));
         assertTrue(OptionalMixinSelector.shouldApply(
                 "ExtendedCraftingCpuInsertMixin", ignored -> false));

@@ -24,12 +24,22 @@ minecraft {
             workingDirectory project.file('run')
             property 'forge.logging.markers', 'REGISTRIES'
             property 'forge.logging.console.level', 'debug'
+            property 'thunderbolt.mixinAudit', 'true'
             mods { "${mod_id}" { source sourceSets.main } }
         }
         server {
             workingDirectory project.file('run')
             property 'forge.logging.markers', 'REGISTRIES'
             property 'forge.logging.console.level', 'debug'
+            property 'thunderbolt.mixinAudit', 'true'
+            mods { "${mod_id}" { source sourceSets.main } }
+        }
+        gameTestServer {
+            workingDirectory project.file('run')
+            property 'forge.logging.markers', 'REGISTRIES'
+            property 'forge.logging.console.level', 'debug'
+            property 'thunderbolt.mixinAudit', 'true'
+            property 'forge.enabledGameTestNamespaces', mod_id
             mods { "${mod_id}" { source sourceSets.main } }
         }
         data {
@@ -44,7 +54,31 @@ minecraft {
 
 mixin {
     add sourceSets.main, "${mod_id}.refmap.json"
-    config "${mod_id}.mixins.json"
+}
+
+// Forge discovers Mixin configs from the mod manifest. Registering the config through
+// MixinGradle's `config` method also adds an early `--mixin.config` launch argument; on
+// ForgeGradle 6 userdev that argument is processed before exploded mod resources join the
+// transforming classloader, so runClient/runServer cannot read the otherwise valid JSON.
+// Keep the release-jar manifest explicit, while the source manifest covers exploded runs.
+jar {
+    manifest {
+        attributes 'MixinConfigs': "${mod_id}.mixins.json"
+    }
+    from('LICENSE') {
+        into 'META-INF'
+    }
+    // The refmap is present once through processed resources (development runs) and
+    // once through MixinGradle's release-jar wiring. They are the same generated file.
+    filesMatching("${mod_id}.refmap.json") {
+        duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+    }
+}
+
+tasks.named('jarJar', Jar) {
+    from('LICENSE') {
+        into 'META-INF'
+    }
 }
 
 repositories {
@@ -55,15 +89,12 @@ repositories {
         name = 'MinecraftForge'
         url = 'https://maven.minecraftforge.net/'
     }
-    // 本地镜像仓库：maven.modrinth.com TLS 握手被网络阻断，AE2 15.4.10 已从
-    // Modrinth CDN 下载并放置到 repo/ 目录（见 repo/maven/modrinth/ae2/15.4.10/）。
     maven {
-        name = 'LocalMirror'
-        url = uri("${projectDir}/repo")
-    }
-    maven {
-        name = 'Modrinth'
-        url = 'https://maven.modrinth.com'
+        name = 'ModMaven'
+        url = 'https://modmaven.dev/'
+        content {
+            includeGroup 'appeng'
+        }
     }
     maven {
         name = 'CurseMaven'
@@ -71,6 +102,21 @@ repositories {
         content {
             includeGroup "curse.maven"
         }
+    }
+    maven {
+        name = 'Modrinth'
+        url = 'https://api.modrinth.com/maven'
+        content {
+            includeGroup 'maven.modrinth'
+        }
+    }
+}
+
+configurations {
+    optionalModShapeArtifacts {
+        canBeConsumed = false
+        canBeResolved = true
+        transitive = false
     }
 }
 
@@ -95,21 +141,31 @@ dependencies {
     // Mixin annotation processor — generates thunderbolt.refmap.json.
     annotationProcessor 'org.spongepowered:mixin:0.8.5:processor'
 
-    // AE2 — Modrinth Maven (15.4.10 is not on Maven Central). compileOnly: this layer patches AE2 via
-    // mixins; AE2 is provided by the modpack at runtime. The pure planner core under
-    // `crafting.core` has NO AE2 dependency and is unit-tested standalone.
-    compileOnly "maven.modrinth:ae2:15.4.10"
+    // AE2 is provided by the modpack in production, but ForgeGradle development runs still
+    // need it on their runtime classpath so client/server smoke tests exercise the real mod.
+    // `runtimeOnly` does not bundle AE2 into the published Thunderbolt jar.
+    compileOnly "appeng:appliedenergistics2-forge:${ae2_version}"
+    runtimeOnly fg.deobf("appeng:appliedenergistics2-forge:${ae2_version}")
+    // The ModMaven AE2 artifact has no transitive POM metadata, so its mandatory
+    // GuideME dependency must be declared explicitly for development launches.
+    runtimeOnly fg.deobf("org.appliedenergistics:guideme:${guideme_version}")
 
     // Applied Flux — CurseForge 1.20.1 file.
     compileOnly "curse.maven:applied-flux-965012:7651647"
+
+    // Compile the optional accessor descriptor against AdvancedAE's real field type. Mixin
+    // matches accessors by name and JVM descriptor, so Object would never match ElapsedTimeTracker.
+    compileOnly fg.deobf("maven.modrinth:advancedae:${advancedae_version}")
 
     // Unit tests for the pure planner core (no Minecraft/AE2 needed).
     testImplementation platform("org.junit:junit-bom:5.10.2")
     testImplementation "org.junit.jupiter:junit-jupiter"
     testRuntimeOnly "org.junit.platform:junit-platform-launcher"
-    // AE2 API types exercised directly by unit tests (e.g. ByteTracker's AEKeyType);
-    // compileOnly deps are absent from the test runtime classpath otherwise.
-    testRuntimeOnly "maven.modrinth:ae2:15.4.10"
+
+    optionalModShapeArtifacts "maven.modrinth:advancedae:${advancedae_version}"
+    optionalModShapeArtifacts "maven.modrinth:neoecoae:${neoecoae_version}"
+    optionalModShapeArtifacts "maven.modrinth:ae2-crafting-tree-refreshed:${ae2_crafting_tree_version}"
+    optionalModShapeArtifacts "maven.modrinth:extendedae-plus:${extendedae_plus_version}"
 }
 
 // Tests that exercise SavedData/codecs need the same generated Minecraft/Forge classes as main.
@@ -118,18 +174,34 @@ sourceSets.test.runtimeClasspath += sourceSets.main.runtimeClasspath
 
 test {
     useJUnitPlatform()
+    dependsOn 'prepareOptionalModShapeArtifacts'
+    systemProperty 'thunderbolt.optionalModShapeDir',
+            layout.buildDirectory.dir('optional-mod-shapes').get().asFile.absolutePath
     testLogging {
         events "passed", "skipped", "failed"
     }
 }
 
+tasks.register('prepareOptionalModShapeArtifacts', Sync) {
+    from configurations.optionalModShapeArtifacts
+    into layout.buildDirectory.dir('optional-mod-shapes')
+}
+
 processResources {
+    // MixinGradle puts the annotation-processor refmap under build/tmp and wires it
+    // into jars, but ForgeGradle's exploded development mod only exposes classes and
+    // processed resources. Copy it as a generated resource so dev runs remap vanilla
+    // targets exactly like the published jar.
+    dependsOn compileJava
+    from(layout.buildDirectory.file("tmp/compileJava/${mod_id}.refmap.json"))
+
     var replaceProperties = [
         minecraft_version      : minecraft_version,
         minecraft_version_range: minecraft_version_range,
         forge_version          : forge_version,
         forge_version_range    : forge_version_range,
         loader_version_range   : loader_version_range,
+        ae2_version_range      : ae2_version_range,
         mod_id                 : mod_id,
         mod_name               : mod_name,
         mod_license            : mod_license,
@@ -145,8 +217,13 @@ processResources {
 publishing {
     publications {
         register('mavenJava', MavenPublication) {
-            from components.java
             artifactId = mod_id
+            // Publish the actual distributable: Forge-remapped and with MixinExtras jar-in-jar.
+            // Publishing components.java leaks ForgeGradle's synthetic `_mapped_official`
+            // dependencies and selects the non-jarJar artifact.
+            artifact(tasks.named('jarJar')) {
+                classifier = null
+            }
         }
     }
     repositories {
@@ -154,6 +231,16 @@ publishing {
             url = project.projectDir.toPath().resolve("repo").toUri()
         }
     }
+}
+
+// The artifact-only publication intentionally has no Gradle module metadata: consumers already
+// provide Minecraft, Forge and AE2, and must not inherit this workspace's mapped dev coordinates.
+tasks.withType(GenerateModuleMetadata).configureEach {
+    enabled = false
+}
+
+tasks.withType(PublishToMavenLocal).configureEach {
+    dependsOn tasks.named('reobfJarJar')
 }
 
 if (plugins.hasPlugin('idea')) {

@@ -30,7 +30,7 @@ public final class ThunderboltMixinConfigPlugin implements IMixinConfigPlugin {
     public boolean shouldApplyMixin(String targetClassName, String mixinClassName) {
         boolean apply = OptionalMixinSelector.shouldApply(
                 mixinClassName, ThunderboltMixinConfigPlugin::isModLoaded);
-        LOGGER.info("Mixin select: {} -> {} : {}", mixinClassName, targetClassName, apply);
+        LOGGER.debug("Mixin select: {} -> {} : {}", mixinClassName, targetClassName, apply);
         return apply;
     }
 

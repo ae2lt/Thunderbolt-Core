@@ -129,9 +129,9 @@ public final class SourcePatternSnapshot {
     public static SourcePatternSnapshot fromTag(CompoundTag tag) {
         ResourceLocation itemId;
         if (tag.contains(TAG_ITEM, Tag.TAG_STRING)) {
-            itemId = new ResourceLocation(tag.getString(TAG_ITEM));
+            itemId = parseRequiredItemId(tag.getString(TAG_ITEM));
         } else if (tag.contains(TAG_STACK, Tag.TAG_COMPOUND)) {
-            itemId = new ResourceLocation(tag.getCompound(TAG_STACK).getString("id"));
+            itemId = parseRequiredItemId(tag.getCompound(TAG_STACK).getString("id"));
         } else {
             throw new IllegalArgumentException("source pattern snapshot is missing an item id");
         }
@@ -146,6 +146,14 @@ public final class SourcePatternSnapshot {
             customData = tag.getCompound(TAG_CUSTOM_DATA).copy();
         }
         return new SourcePatternSnapshot(itemId, serializedStack, customData);
+    }
+
+    private static ResourceLocation parseRequiredItemId(String value) {
+        var itemId = ResourceLocation.tryParse(value);
+        if (itemId == null) {
+            throw new IllegalArgumentException("source pattern snapshot has an invalid item id: " + value);
+        }
+        return itemId;
     }
 
     private static Tag canonicalCopy(Tag source) {

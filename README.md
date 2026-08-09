@@ -50,11 +50,11 @@ server.
 .\gradlew.bat publishToMavenLocal
 ```
 
-Maven coordinate: `com.moakiee.thunderbolt:thunderbolt:1.0.2`.
+Maven coordinate: `com.moakiee.thunderbolt:thunderbolt:1.0.7`.
 
-Note: the local build uses the Gradle wrapper; an explicit Gradle 8.14
-installation at `E:\gradle-8.14` can be used instead if the wrapper is not
-available.
+The distributable local build is `build/libs/thunderbolt-1.0.7-all.jar`.
+The unclassified JAR does not contain the required MixinExtras jar-in-jar
+dependency and is intended only as an intermediate development artifact.
 
 Issues: [GitHub Issues](https://github.com/ae2lt/Thunderbolt-Core/issues) ·
 License: [GNU LGPL 3.0](LICENSE)
