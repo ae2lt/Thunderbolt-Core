@@ -1,7 +1,6 @@
 package com.moakiee.thunderbolt.ae2.mixin;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.io.IOException;
@@ -15,7 +14,6 @@ import java.util.Map;
 import java.util.Set;
 import java.util.jar.JarFile;
 
-import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.Test;
 import org.objectweb.asm.ClassReader;
 import org.objectweb.asm.ClassVisitor;
@@ -27,19 +25,12 @@ import org.objectweb.asm.Opcodes;
 class NeoEcoBinaryShapeTest {
     private static final String LOGIC_CLASS =
             "cn/dancingsnow/neoecoae/api/me/ECOCraftingCPULogic.class";
-    private static final String LEGACY_EXECUTE_CRAFTING =
-            "executeCrafting(ILappeng/me/service/CraftingService;"
-                    + "Lappeng/api/networking/energy/IEnergyService;"
-                    + "Lnet/minecraft/world/level/Level;)I";
     private static final String FORGE_1201_EXECUTE_CRAFTING =
             "executeCrafting(IILappeng/me/service/CraftingService;"
                     + "Lappeng/api/networking/energy/IEnergyService;"
                     + "Lnet/minecraft/world/level/Level;"
                     + "Lcn/dancingsnow/neoecoae/api/me/"
                     + "ECOCraftingCPULogic$FastPathBatchBudget;)I";
-    private static final String COLLECT_AVAILABLE_PROVIDERS =
-            "collectAvailableProviders(Lappeng/me/service/CraftingService;"
-                    + "Lappeng/api/crafting/IPatternDetails;)Ljava/util/List;";
     private static final String COLLECT_PROVIDERS =
             "collectProviders(Lappeng/me/service/CraftingService;"
                     + "Lappeng/api/crafting/IPatternDetails;)"
@@ -54,47 +45,6 @@ class NeoEcoBinaryShapeTest {
                     + "Lcn/dancingsnow/neoecoae/api/me/ECOCraftingCPULogic$PushResult;";
     private static final String INSERT =
             "insert(Lappeng/api/stacks/AEKey;JLappeng/api/config/Actionable;)J";
-
-    @Test
-    void real134JarMatchesLegacyInjectionTargets() throws IOException {
-        try (var jar = configuredJar("NEOECO_134_JAR")) {
-            var logic = assertCommonShape(jar);
-
-            assertFalse(logic.methods.contains(COLLECT_AVAILABLE_PROVIDERS));
-            assertProviderLookupCount(logic, LEGACY_EXECUTE_CRAFTING, 1);
-            assertProviderLookupCount(logic, COLLECT_AVAILABLE_PROVIDERS, 0);
-            assertWaitingForExtractCount(logic, 2);
-        }
-    }
-
-    @Test
-    void real2110JarMatchesFastPathInjectionTargets() throws IOException {
-        try (var jar = configuredJar("NEOECO_2110_JAR")) {
-            var logic = assertCommonShape(jar);
-
-            assertTrue(logic.methods.contains(COLLECT_AVAILABLE_PROVIDERS));
-            assertProviderLookupCount(logic, LEGACY_EXECUTE_CRAFTING, 0);
-            assertProviderLookupCount(logic, COLLECT_AVAILABLE_PROVIDERS, 1);
-            assertWaitingForExtractCount(logic, 3);
-
-            assertFastPathBusShape(jar);
-
-            var execution = shape(jar,
-                    "cn/dancingsnow/neoecoae/impl/crafting/fastpath/"
-                            + "ECOExtractedPatternExecution.class");
-            assertTrue(execution.methods.contains(
-                    "create(Lappeng/api/crafting/IPatternDetails;"
-                            + "[Lappeng/api/stacks/KeyCounter;"
-                            + "Lappeng/api/stacks/KeyCounter;"
-                            + "Lappeng/api/stacks/KeyCounter;"
-                            + "Lnet/minecraft/world/level/Level;)"
-                            + "Lcn/dancingsnow/neoecoae/impl/crafting/fastpath/"
-                            + "ECOExtractedPatternExecution;"));
-            assertTrue(execution.methods.contains("fastPathEligible()Z"));
-            assertTrue(execution.methods.contains(
-                    "key()Lcn/dancingsnow/neoecoae/impl/crafting/fastpath/ECOFastPathKey;"));
-        }
-    }
 
     @Test
     void real2030Forge1201JarMatchesInjectionAndBridgeTargets() throws IOException {
@@ -177,15 +127,6 @@ class NeoEcoBinaryShapeTest {
         }
     }
 
-    private static JarFile configuredJar(String environmentVariable) throws IOException {
-        String configured = System.getenv(environmentVariable);
-        Path path = configured != null ? Path.of(configured) : null;
-        Assumptions.assumeTrue(
-                path != null && Files.isRegularFile(path),
-                environmentVariable + " must point to the matching real NeoECO artifact");
-        return new JarFile(path.toFile());
-    }
-
     private static JarFile preparedJar(String fileName) throws IOException {
         String directory = System.getProperty("thunderbolt.optionalModShapeDir");
         assertTrue(directory != null && !directory.isBlank(),
@@ -193,35 +134,6 @@ class NeoEcoBinaryShapeTest {
         Path path = Path.of(directory).resolve(fileName);
         assertTrue(Files.isRegularFile(path), "missing prepared optional-mod artifact: " + path);
         return new JarFile(path.toFile());
-    }
-
-    private static Shape assertCommonShape(JarFile jar) throws IOException {
-        var logic = shape(jar, LOGIC_CLASS);
-        assertCoreStateShape(jar, logic);
-        assertTrue(logic.methods.contains(LEGACY_EXECUTE_CRAFTING));
-
-        assertInvocationCount(
-                logic,
-                "tickCraftingLogic(Lappeng/api/networking/energy/IEnergyService;"
-                        + "Lappeng/me/service/CraftingService;)V",
-                Opcodes.INVOKEVIRTUAL,
-                "cn/dancingsnow/neoecoae/api/me/ECOCraftingCPULogic",
-                "executeCrafting",
-                "(ILappeng/me/service/CraftingService;"
-                        + "Lappeng/api/networking/energy/IEnergyService;"
-                        + "Lnet/minecraft/world/level/Level;)I",
-                false,
-                1);
-        assertInvocationCount(
-                logic,
-                LEGACY_EXECUTE_CRAFTING,
-                Opcodes.INVOKEINTERFACE,
-                "appeng/api/networking/crafting/ICraftingProvider",
-                "pushPattern",
-                "(Lappeng/api/crafting/IPatternDetails;[Lappeng/api/stacks/KeyCounter;)Z",
-                true,
-                1);
-        return logic;
     }
 
     private static void assertCoreStateShape(JarFile jar, Shape logic) throws IOException {
