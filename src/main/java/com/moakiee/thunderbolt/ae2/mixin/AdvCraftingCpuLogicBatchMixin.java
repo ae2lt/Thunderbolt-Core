@@ -1,6 +1,7 @@
 package com.moakiee.thunderbolt.ae2.mixin;
 
 import java.lang.reflect.Field;
+import java.lang.reflect.Method;
 import java.util.HashMap;
 import java.util.IdentityHashMap;
 import java.util.Map;
@@ -47,6 +48,14 @@ public abstract class AdvCraftingCpuLogicBatchMixin {
     @Unique
     private static final @Nullable Field AE2LT_ADV_BATCH_CPU_FIELD =
             MixinReflectionSupport.findDeclaredFieldSafe(AE2LT_ADV_BATCH_LOGIC_CLASS, "cpu");
+
+    @Unique
+    private static final @Nullable Class<?> AE2LT_ADV_BATCH_CPU_CLASS =
+            MixinReflectionSupport.findClassSafe("net.pedroksl.advanced_ae.common.cluster.AdvCraftingCPU");
+
+    @Unique
+    private static final @Nullable Method AE2LT_ADV_BATCH_MARK_DIRTY_METHOD =
+            MixinReflectionSupport.findDeclaredMethodSafe(AE2LT_ADV_BATCH_CPU_CLASS, "markDirty");
 
     @Shadow
     @Final
@@ -135,13 +144,12 @@ public abstract class AdvCraftingCpuLogicBatchMixin {
 
     @Unique
     private void ae2lt$markCpuDirty() {
-        // AdvancedAE 为可选依赖；先反射读取 cpu 字段，再反射调用其 markDirty。
         Object cpu = MixinReflectionSupport.getFieldValueSafe(AE2LT_ADV_BATCH_CPU_FIELD, this);
         if (cpu == null) return;
-        try {
-            var method = cpu.getClass().getMethod("markDirty");
-            method.invoke(cpu);
-        } catch (ReflectiveOperationException ignored) {}
+        MixinReflectionSupport.invokeMethodSafe(
+                AE2LT_ADV_BATCH_MARK_DIRTY_METHOD,
+                cpu,
+                "mark AdvancedAE crafting CPU dirty");
     }
 
     @Unique
