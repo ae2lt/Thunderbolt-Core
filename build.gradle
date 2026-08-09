@@ -136,6 +136,10 @@ dependencies {
     // Applied Flux — CurseForge 1.20.1 file.
     compileOnly "curse.maven:applied-flux-965012:7651647"
 
+    // Compile the optional accessor descriptor against AdvancedAE's real field type. Mixin
+    // matches accessors by name and JVM descriptor, so Object would never match ElapsedTimeTracker.
+    compileOnly fg.deobf("maven.modrinth:advancedae:${advancedae_version}")
+
     // Unit tests for the pure planner core (no Minecraft/AE2 needed).
     testImplementation platform("org.junit:junit-bom:5.10.2")
     testImplementation "org.junit.jupiter:junit-jupiter"

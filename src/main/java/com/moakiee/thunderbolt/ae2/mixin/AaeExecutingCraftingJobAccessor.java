@@ -9,6 +9,7 @@ import org.spongepowered.asm.mixin.gen.Accessor;
 import appeng.api.crafting.IPatternDetails;
 import appeng.crafting.CraftingLink;
 import appeng.crafting.inv.ListCraftingInventory;
+import net.pedroksl.advanced_ae.common.logic.ElapsedTimeTracker;
 
 @Pseudo
 @Mixin(targets = "net.pedroksl.advanced_ae.common.logic.ExecutingCraftingJob", remap = false)
@@ -23,6 +24,5 @@ public interface AaeExecutingCraftingJobAccessor {
     ListCraftingInventory getWaitingFor();
 
     @Accessor("timeTracker")
-    // AAE is not on the compile classpath; callers cast the result to AaeElapsedTimeTrackerAccessor.
-    Object getTimeTracker();
+    ElapsedTimeTracker getTimeTracker();
 }
