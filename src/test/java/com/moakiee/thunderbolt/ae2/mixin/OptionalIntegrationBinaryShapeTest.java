@@ -20,6 +20,7 @@ import org.objectweb.asm.ClassVisitor;
 import org.objectweb.asm.FieldVisitor;
 import org.objectweb.asm.MethodVisitor;
 import org.objectweb.asm.Opcodes;
+import org.objectweb.asm.AnnotationVisitor;
 
 /** Locks Thunderbolt's optional mixins to the published Forge 1.20.1 addon binaries. */
 class OptionalIntegrationBinaryShapeTest {
@@ -147,23 +148,28 @@ class OptionalIntegrationBinaryShapeTest {
 
     @Test
     void extendedAePlus155ExposesTheVirtualCompletionBridgeUsedBySuppression() throws IOException {
-        try (var jar = preparedJar("extendedae-plus-1.5.5.jar")) {
+        try (var jar = preparedJar("extendedae-plus-pN9pMjiW.jar")) {
             var compat = shape(jar,
                     "com/extendedae_plus/mixin/ae2/compat/PatternProviderLogicCompatMixin.class");
             assertTrue(compat.methods.contains("eap$compatIsVirtualCraftingEnabled()Z"));
+            assertTrue(compat.methods.contains(
+                    "eap$compatTryVirtualCompletion(Lappeng/api/crafting/IPatternDetails;)V"));
+            assertTrue(compat.methods.contains(
+                    "eap$compatOnPushPattern(Lappeng/api/crafting/IPatternDetails;"
+                            + "[Lappeng/api/stacks/KeyCounter;"
+                            + "Lorg/spongepowered/asm/mixin/injection/callback/"
+                            + "CallbackInfoReturnable;)V"));
+            assertEquals(500, compat.mixinPriority);
 
-            assertVirtualCompletionCallback(jar,
-                    "com/extendedae_plus/mixin/ae2/compat/"
-                            + "PatternProviderLogicVirtualCompletionMixin.class",
-                    "eap$ae2VirtualCompletion");
             assertVirtualCompletionCallback(jar,
                     "com/extendedae_plus/mixin/advancedae/compat/"
                             + "PatternProviderLogicVirtualCompletionMixin.class",
                     "eap$advancedaeVirtualCompletion");
-            assertVirtualCompletionCallback(jar,
-                    "com/extendedae_plus/mixin/neoecoae/compat/"
-                            + "PatternProviderLogicVirtualCompletionMixin.class",
-                    "eap$neoecoaeVirtualCompletion");
+
+            var advanced = shape(jar,
+                    "com/extendedae_plus/mixin/advancedae/compat/"
+                            + "PatternProviderLogicVirtualCompletionMixin.class");
+            assertEquals(450, advanced.mixinPriority);
         }
     }
 
@@ -200,6 +206,21 @@ class OptionalIntegrationBinaryShapeTest {
         var result = new Shape();
         try (var input = jar.getInputStream(entry)) {
             new ClassReader(input).accept(new ClassVisitor(Opcodes.ASM9) {
+                @Override
+                public AnnotationVisitor visitAnnotation(String descriptor, boolean visible) {
+                    if (!"Lorg/spongepowered/asm/mixin/Mixin;".equals(descriptor)) {
+                        return null;
+                    }
+                    return new AnnotationVisitor(Opcodes.ASM9) {
+                        @Override
+                        public void visit(String name, Object value) {
+                            if ("priority".equals(name)) {
+                                result.mixinPriority = (Integer) value;
+                            }
+                        }
+                    };
+                }
+
                 @Override
                 public FieldVisitor visitField(
                         int access, String name, String descriptor, String signature, Object value) {
@@ -256,6 +277,7 @@ class OptionalIntegrationBinaryShapeTest {
     }
 
     private static final class Shape {
+        private int mixinPriority = 1000;
         private final Set<String> fields = new HashSet<>();
         private final Set<String> methods = new HashSet<>();
         private final Map<String, List<MethodCall>> callsByMethod = new HashMap<>();

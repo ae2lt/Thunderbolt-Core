@@ -1,6 +1,5 @@
 package com.moakiee.thunderbolt.ae2.mixin;
 
-import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.nio.file.Files;
@@ -14,10 +13,10 @@ final class ExtendedAePlusMixinPriorityContractTest {
                 "src/main/java/com/moakiee/thunderbolt/ae2/mixin/"
                         + "ExtendedAePlusVirtualCompletionSuppressionMixin.java"));
 
-        // EAEP 1.5.5 adds the bridge method from a priority-900 mixin. Mixin applies higher
-        // priorities first, so Thunderbolt must use a lower priority to resolve the merged method.
-        assertTrue(source.contains("@Mixin(value = PatternProviderLogic.class, priority = 800, remap = false)"));
-        assertFalse(source.contains("method = \"eap$compatTryVirtualCompletion\""));
+        // Forge 1.20.1 EAEP 1.5.5 adds its methods at priorities 500 and 450. Mixin applies
+        // higher priorities first, so Thunderbolt must run below both synthetic target owners.
+        assertTrue(source.contains("@Mixin(value = PatternProviderLogic.class, priority = 400, remap = false)"));
+        assertTrue(source.contains("method = \"eap$compatTryVirtualCompletion\""));
         assertTrue(source.contains("method = \"eap$compatIsVirtualCraftingEnabled\""));
     }
 }
