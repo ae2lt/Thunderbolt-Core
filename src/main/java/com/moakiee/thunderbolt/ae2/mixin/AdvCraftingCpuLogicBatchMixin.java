@@ -25,6 +25,7 @@ import appeng.api.networking.energy.IEnergyService;
 import appeng.crafting.inv.ListCraftingInventory;
 import appeng.hooks.ticking.TickHandler;
 import appeng.me.service.CraftingService;
+import net.pedroksl.advanced_ae.common.logic.AdvCraftingCPULogic;
 
 import com.moakiee.thunderbolt.ae2.batch.AaeBatchJobView;
 import com.moakiee.thunderbolt.ae2.batch.BatchCpuAccounting;
@@ -80,7 +81,7 @@ public abstract class AdvCraftingCpuLogicBatchMixin {
                             + "Lnet/minecraft/world/level/Level;)I"
             )
     )
-    private int ae2lt$wrapExecuteCrafting(Object self,
+    private int ae2lt$wrapExecuteCrafting(AdvCraftingCPULogic self,
                                           int remainingOps,
                                           CraftingService craftingService,
                                           IEnergyService energyService,
