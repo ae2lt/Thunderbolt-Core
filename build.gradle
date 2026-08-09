@@ -65,10 +65,19 @@ jar {
     manifest {
         attributes 'MixinConfigs': "${mod_id}.mixins.json"
     }
+    from('LICENSE') {
+        into 'META-INF'
+    }
     // The refmap is present once through processed resources (development runs) and
     // once through MixinGradle's release-jar wiring. They are the same generated file.
     filesMatching("${mod_id}.refmap.json") {
         duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+    }
+}
+
+tasks.named('jarJar', Jar) {
+    from('LICENSE') {
+        into 'META-INF'
     }
 }
 
@@ -192,6 +201,7 @@ processResources {
         forge_version          : forge_version,
         forge_version_range    : forge_version_range,
         loader_version_range   : loader_version_range,
+        ae2_version_range      : ae2_version_range,
         mod_id                 : mod_id,
         mod_name               : mod_name,
         mod_license            : mod_license,
