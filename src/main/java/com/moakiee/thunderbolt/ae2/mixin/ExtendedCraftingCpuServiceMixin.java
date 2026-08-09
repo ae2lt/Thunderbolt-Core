@@ -45,11 +45,12 @@ import com.moakiee.thunderbolt.ae2.crafting.CraftingCpuSelectionOrder;
 import com.moakiee.thunderbolt.ae2.crafting.DynamicCraftingCpuClusterIndex;
 import com.moakiee.thunderbolt.ae2.crafting.ExtendedCraftingCpuCluster;
 import com.moakiee.thunderbolt.ae2.crafting.ExtendedCraftingCpuClusterProvider;
+import com.moakiee.thunderbolt.ae2.crafting.ExtendedCraftingCpuInsertBridge;
 import com.moakiee.thunderbolt.ae2.crafting.FastCraftingControl;
 import com.moakiee.thunderbolt.ae2.crafting.LoopCraftingPlan;
 
 @Mixin(value = CraftingService.class, remap = false)
-public abstract class ExtendedCraftingCpuServiceMixin {
+public abstract class ExtendedCraftingCpuServiceMixin implements ExtendedCraftingCpuInsertBridge {
     @Unique
     @Nullable
     private DynamicCraftingCpuClusterIndex<IGridNode, ExtendedCraftingCpuCluster>
@@ -167,6 +168,20 @@ public abstract class ExtendedCraftingCpuServiceMixin {
         }
         thunderbolt$getExtendedCpuClusterIndex().replaceProviders(providerNodes);
         thunderbolt$refreshExtendedCpuClusters();
+    }
+
+    @Override
+    public long thunderbolt$insertIntoExtendedCpus(AEKey what, long amount, Actionable mode) {
+        long boundedAmount = Math.max(0L, amount);
+        long inserted = 0L;
+        for (var cluster : thunderbolt$getExtendedCpuClusters()) {
+            if (inserted >= boundedAmount) break;
+            long accepted = cluster.insert(what, boundedAmount - inserted, mode);
+            if (accepted > 0L) {
+                inserted += Math.min(accepted, boundedAmount - inserted);
+            }
+        }
+        return inserted;
     }
 
     @Inject(method = "submitJob", at = @At("HEAD"), cancellable = true)

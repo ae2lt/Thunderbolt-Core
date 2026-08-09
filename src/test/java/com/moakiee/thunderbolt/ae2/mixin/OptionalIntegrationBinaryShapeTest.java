@@ -109,6 +109,14 @@ class OptionalIntegrationBinaryShapeTest {
                     "net/pedroksl/advanced_ae/common/cluster/AdvCraftingCPU.class");
             assertTrue(cpu.methods.contains("markDirty()V"));
             assertTrue(cpu.methods.contains("updateOutput(Lappeng/api/stacks/GenericStack;)V"));
+
+            // This is the exact overwrite that prevents an injector from targeting
+            // CraftingService.insertIntoCpus. Thunderbolt's bridge must remain caller-side.
+            var serviceMixin = shape(jar,
+                    "net/pedroksl/advanced_ae/mixins/cpu/MixinCraftingService.class");
+            assertTrue(serviceMixin.methods.contains(
+                    "insertIntoCpus(Lappeng/api/stacks/AEKey;"
+                            + "JLappeng/api/config/Actionable;)J"));
         }
     }
 
