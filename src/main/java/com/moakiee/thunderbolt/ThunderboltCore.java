@@ -27,8 +27,8 @@ public final class ThunderboltCore {
     public static final String MODID = "thunderbolt";
     public static final Logger LOGGER = LogUtils.getLogger();
 
-    public ThunderboltCore() {
-        var modEventBus = FMLJavaModLoadingContext.get().getModEventBus();
+    public ThunderboltCore(FMLJavaModLoadingContext loadingContext) {
+        var modEventBus = loadingContext.getModEventBus();
         ThunderboltBlockEntities.TYPES.register(modEventBus);
         modEventBus.addListener(this::onCommonSetup);
         MinecraftForge.EVENT_BUS.addListener(this::onServerStarting);

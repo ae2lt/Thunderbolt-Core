@@ -46,7 +46,13 @@ public final class IndexedCellStorageSavedData extends SavedData {
         if (cached != null) return cached;
         var storage = new IndexedStorage();
         var encoded = cells.get(key);
-        if (encoded != null) storage.load(encoded, registries);
+        if (encoded != null) {
+            storage.load(encoded, registries);
+            if (storage.needsPersist()) {
+                // The loader repaired malformed/duplicate entries and scheduled a full rewrite.
+                setDirty();
+            }
+        }
         storageCache.put(key, storage);
         return storage;
     }
@@ -122,15 +128,13 @@ public final class IndexedCellStorageSavedData extends SavedData {
         return result;
     }
 
-    private static IndexedCellStorageSavedData load(CompoundTag tag) {
+    static IndexedCellStorageSavedData load(CompoundTag tag) {
         var data = new IndexedCellStorageSavedData();
         data.legacyMigrationComplete = tag.getBoolean(TAG_LEGACY_MIGRATION_COMPLETE);
         var storesTag = tag.getCompound(TAG_STORES);
         for (var typeString : storesTag.getAllKeys()) {
-            ResourceLocation type;
-            try {
-                type = ResourceLocation.tryParse(typeString);
-            } catch (RuntimeException ignored) {
+            var type = ResourceLocation.tryParse(typeString);
+            if (type == null) {
                 continue;
             }
             var typeTag = storesTag.getCompound(typeString);
@@ -138,7 +142,7 @@ public final class IndexedCellStorageSavedData extends SavedData {
                 try {
                     data.cells.put(
                             new StorageKey(type, UUID.fromString(idString)),
-                            typeTag.getCompound(idString));
+                            typeTag.getCompound(idString).copy());
                 } catch (IllegalArgumentException ignored) {}
             }
         }
