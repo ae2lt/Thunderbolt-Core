@@ -77,8 +77,10 @@ public final class EjectRegistrationSavedData extends SavedData {
     }
 
     public void add(PersistentRegistration registration) {
-        entries.add(registration);
-        setDirty();
+        if (!entries.contains(registration)) {
+            entries.add(registration);
+            setDirty();
+        }
     }
 
     public void removeByIntercept(ResourceKey<Level> dimension, BlockPos pos, Direction face) {
@@ -119,29 +121,59 @@ public final class EjectRegistrationSavedData extends SavedData {
         data.legacyMigrationComplete = tag.getBoolean(TAG_LEGACY_MIGRATION_COMPLETE);
         if (!tag.contains(TAG_ENTRIES, Tag.TAG_LIST)) return data;
         var list = tag.getList(TAG_ENTRIES, Tag.TAG_COMPOUND);
+        boolean healed = false;
         for (int i = 0; i < list.size(); i++) {
             var encoded = list.getCompound(i);
+            if (!hasRequiredFields(encoded)) {
+                LOGGER.warn("跳过缺少必需字段的 eject 注册条目: {}", encoded);
+                healed = true;
+                continue;
+            }
             // 畸形维度 id 在 tryParse 处返回 null，此时跳过整条记录并记日志，
             // 而不是把 null 传入 ResourceKey.create 让整个 SavedData load 抛 NPE。
             var interceptDimension = tryDimension(encoded.getString(TAG_I_DIM));
             var hostDimension = tryDimension(encoded.getString(TAG_P_DIM));
-            if (interceptDimension.isEmpty() || hostDimension.isEmpty()) continue;
+            if (interceptDimension.isEmpty() || hostDimension.isEmpty()) {
+                healed = true;
+                continue;
+            }
             var interceptPos = BlockPos.of(encoded.getLong(TAG_I_POS));
             var hostPos = BlockPos.of(encoded.getLong(TAG_P_POS));
             // 损坏的 long 可能被解出超出原版建筑高度范围的 y（BlockPos.of 本身不抛异常），
             // 这类坐标在游戏中永远无法命中，统一跳过并记日志。
             if (!isWithinBuildHeight(interceptPos) || !isWithinBuildHeight(hostPos)) {
                 LOGGER.warn("跳过畸形坐标的 eject 注册条目: {} / {}", interceptPos, hostPos);
+                healed = true;
                 continue;
             }
-            data.entries.add(new PersistentRegistration(
+            int rawFace = encoded.getInt(TAG_I_FACE);
+            if (rawFace < 0 || rawFace >= Direction.values().length) {
+                LOGGER.warn("跳过非法方向值的 eject 注册条目: {}", rawFace);
+                healed = true;
+                continue;
+            }
+            var registration = new PersistentRegistration(
                     interceptDimension.get(),
                     interceptPos,
-                    Direction.from3DDataValue(encoded.getInt(TAG_I_FACE)),
+                    Direction.from3DDataValue(rawFace),
                     hostDimension.get(),
-                    hostPos));
+                    hostPos);
+            if (!data.entries.contains(registration)) {
+                data.entries.add(registration);
+            } else {
+                healed = true;
+            }
         }
+        if (healed) data.setDirty();
         return data;
+    }
+
+    private static boolean hasRequiredFields(CompoundTag tag) {
+        return tag.contains(TAG_I_DIM, Tag.TAG_STRING)
+                && tag.contains(TAG_I_POS, Tag.TAG_LONG)
+                && tag.contains(TAG_I_FACE, Tag.TAG_INT)
+                && tag.contains(TAG_P_DIM, Tag.TAG_STRING)
+                && tag.contains(TAG_P_POS, Tag.TAG_LONG);
     }
 
     /**
