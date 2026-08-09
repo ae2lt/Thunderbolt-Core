@@ -44,7 +44,22 @@ minecraft {
 
 mixin {
     add sourceSets.main, "${mod_id}.refmap.json"
-    config "${mod_id}.mixins.json"
+}
+
+// Forge discovers Mixin configs from the mod manifest. Registering the config through
+// MixinGradle's `config` method also adds an early `--mixin.config` launch argument; on
+// ForgeGradle 6 userdev that argument is processed before exploded mod resources join the
+// transforming classloader, so runClient/runServer cannot read the otherwise valid JSON.
+// Keep the release-jar manifest explicit, while the source manifest covers exploded runs.
+jar {
+    manifest {
+        attributes 'MixinConfigs': "${mod_id}.mixins.json"
+    }
+    // The refmap is present once through processed resources (development runs) and
+    // once through MixinGradle's release-jar wiring. They are the same generated file.
+    filesMatching("${mod_id}.refmap.json") {
+        duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+    }
 }
 
 repositories {
@@ -107,9 +122,14 @@ dependencies {
     // Mixin annotation processor — generates thunderbolt.refmap.json.
     annotationProcessor 'org.spongepowered:mixin:0.8.5:processor'
 
-    // AE2 is provided by the modpack at runtime. The pure planner core under `crafting.core`
-    // has no AE2 dependency and is unit-tested standalone.
+    // AE2 is provided by the modpack in production, but ForgeGradle development runs still
+    // need it on their runtime classpath so client/server smoke tests exercise the real mod.
+    // `runtimeOnly` does not bundle AE2 into the published Thunderbolt jar.
     compileOnly "appeng:appliedenergistics2-forge:${ae2_version}"
+    runtimeOnly fg.deobf("appeng:appliedenergistics2-forge:${ae2_version}")
+    // The ModMaven AE2 artifact has no transitive POM metadata, so its mandatory
+    // GuideME dependency must be declared explicitly for development launches.
+    runtimeOnly fg.deobf("org.appliedenergistics:guideme:${guideme_version}")
 
     // Applied Flux — CurseForge 1.20.1 file.
     compileOnly "curse.maven:applied-flux-965012:7651647"
@@ -118,9 +138,6 @@ dependencies {
     testImplementation platform("org.junit:junit-bom:5.10.2")
     testImplementation "org.junit.jupiter:junit-jupiter"
     testRuntimeOnly "org.junit.platform:junit-platform-launcher"
-    // AE2 API types exercised directly by unit tests (e.g. ByteTracker's AEKeyType);
-    // compileOnly deps are absent from the test runtime classpath otherwise.
-    testRuntimeOnly "appeng:appliedenergistics2-forge:${ae2_version}"
 
     optionalModShapeArtifacts "maven.modrinth:advancedae:${advancedae_version}"
     optionalModShapeArtifacts "maven.modrinth:neoecoae:${neoecoae_version}"
@@ -148,6 +165,13 @@ tasks.register('prepareOptionalModShapeArtifacts', Sync) {
 }
 
 processResources {
+    // MixinGradle puts the annotation-processor refmap under build/tmp and wires it
+    // into jars, but ForgeGradle's exploded development mod only exposes classes and
+    // processed resources. Copy it as a generated resource so dev runs remap vanilla
+    // targets exactly like the published jar.
+    dependsOn compileJava
+    from(layout.buildDirectory.file("tmp/compileJava/${mod_id}.refmap.json"))
+
     var replaceProperties = [
         minecraft_version      : minecraft_version,
         minecraft_version_range: minecraft_version_range,

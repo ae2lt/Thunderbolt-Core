@@ -95,14 +95,14 @@ public abstract class TimeWheelCraftingCPUMenuMixin extends AEBaseMenu {
         }
     }
 
-    @Inject(method = "m_6877_", at = @At("TAIL")) // CraftingCPUMenu.removed(Player) — SRG name in the release jar
+    @Inject(method = "removed", at = @At("TAIL"))
     private void thunderbolt$removed(Player player, CallbackInfo ci) {
         if (this.thunderbolt$timeWheelCpu != null) {
             this.thunderbolt$timeWheelCpu.getCraftingLogic().removeListener(cpuChangeListener);
         }
     }
 
-    @Inject(method = "m_38946_", at = @At("HEAD")) // CraftingCPUMenu.broadcastChanges() — SRG name in the release jar
+    @Inject(method = "broadcastChanges", at = @At("HEAD"))
     private void thunderbolt$broadcastTimeWheelStatus(CallbackInfo ci) {
         if (!isServerSide() || this.thunderbolt$timeWheelCpu == null) {
             return;
