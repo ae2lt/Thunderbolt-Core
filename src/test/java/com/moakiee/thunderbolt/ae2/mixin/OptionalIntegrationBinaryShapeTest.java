@@ -117,6 +117,9 @@ class OptionalIntegrationBinaryShapeTest {
             assertTrue(serviceMixin.methods.contains(
                     "insertIntoCpus(Lappeng/api/stacks/AEKey;"
                             + "JLappeng/api/config/Actionable;)J"));
+            assertTrue(serviceMixin.methods.contains(
+                    "onGetRequestedAmount(Lappeng/api/stacks/AEKey;"
+                            + "Lorg/spongepowered/asm/mixin/injection/callback/CallbackInfoReturnable;J)V"));
         }
     }
 

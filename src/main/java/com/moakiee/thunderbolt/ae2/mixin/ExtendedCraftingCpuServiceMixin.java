@@ -6,6 +6,7 @@ import java.util.concurrent.Future;
 
 import com.google.common.collect.ImmutableSet;
 import com.llamalad7.mixinextras.sugar.Local;
+import com.llamalad7.mixinextras.sugar.ref.LocalLongRef;
 
 import org.apache.commons.lang3.mutable.MutableObject;
 import org.objectweb.asm.Opcodes;
@@ -295,14 +296,25 @@ public abstract class ExtendedCraftingCpuServiceMixin implements ExtendedCraftin
         }
     }
 
-    @Inject(method = "getRequestedAmount", at = @At("RETURN"), cancellable = true)
-    private void thunderbolt$getExtendedRequestedAmount(AEKey what, CallbackInfoReturnable<Long> cir) {
-        long requested = cir.getReturnValue();
+    @Inject(
+            method = "getRequestedAmount",
+            // AdvancedAE 1.3.6 also sets and cancels the RETURN callback. Mutate AE2's local
+            // accumulator before it is loaded for LRETURN so AdvancedAE observes this addition
+            // through its captured local instead of either addon discarding the other's value.
+            at = @At(value = "RETURN", shift = At.Shift.BY, by = -1))
+    private void thunderbolt$getExtendedRequestedAmount(
+            AEKey what,
+            CallbackInfoReturnable<Long> ignored,
+            @Local(ordinal = 0) LocalLongRef requestedRef) {
+        long requested = Math.max(0L, requestedRef.get());
         for (var cluster : thunderbolt$getExtendedCpuClusters()) {
             long addition = cluster.getRequestedAmount(what);
+            if (addition <= 0L) {
+                continue;
+            }
             requested = requested >= Long.MAX_VALUE - addition ? Long.MAX_VALUE : requested + addition;
         }
-        cir.setReturnValue(requested);
+        requestedRef.set(requested);
     }
 
     @Inject(method = "hasCpu", at = @At("HEAD"), cancellable = true)
