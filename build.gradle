@@ -34,6 +34,14 @@ minecraft {
             property 'thunderbolt.mixinAudit', 'true'
             mods { "${mod_id}" { source sourceSets.main } }
         }
+        gameTestServer {
+            workingDirectory project.file('run')
+            property 'forge.logging.markers', 'REGISTRIES'
+            property 'forge.logging.console.level', 'debug'
+            property 'thunderbolt.mixinAudit', 'true'
+            property 'forge.enabledGameTestNamespaces', mod_id
+            mods { "${mod_id}" { source sourceSets.main } }
+        }
         data {
             workingDirectory project.file('run')
             property 'forge.logging.markers', 'REGISTRIES'
