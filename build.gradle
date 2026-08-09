@@ -199,8 +199,13 @@ processResources {
 publishing {
     publications {
         register('mavenJava', MavenPublication) {
-            from components.java
             artifactId = mod_id
+            // Publish the actual distributable: Forge-remapped and with MixinExtras jar-in-jar.
+            // Publishing components.java leaks ForgeGradle's synthetic `_mapped_official`
+            // dependencies and selects the non-jarJar artifact.
+            artifact(tasks.named('jarJar')) {
+                classifier = null
+            }
         }
     }
     repositories {
@@ -208,6 +213,16 @@ publishing {
             url = project.projectDir.toPath().resolve("repo").toUri()
         }
     }
+}
+
+// The artifact-only publication intentionally has no Gradle module metadata: consumers already
+// provide Minecraft, Forge and AE2, and must not inherit this workspace's mapped dev coordinates.
+tasks.withType(GenerateModuleMetadata).configureEach {
+    enabled = false
+}
+
+tasks.withType(PublishToMavenLocal).configureEach {
+    dependsOn tasks.named('reobfJarJar')
 }
 
 if (plugins.hasPlugin('idea')) {
