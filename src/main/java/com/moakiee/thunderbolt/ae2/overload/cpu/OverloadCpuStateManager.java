@@ -289,37 +289,62 @@ public final class OverloadCpuStateManager {
    }
 
    @Nullable
+   public synchronized CompoundTag writeToTag(CraftingCpuLogic logic) {
+      return this.writeToTag((Object)logic);
+   }
+
+   @Nullable
+   public synchronized CompoundTag writeToTag(Object logic) {
+      Objects.requireNonNull(logic, "logic");
+      OverloadCpuState state = this.states.get(logic);
+      return state != null && !state.isEmpty() ? state.toTag() : null;
+   }
+
+   @Nullable
    public synchronized CompoundTag writeToTag(CraftingCpuLogic logic, Provider registries) {
-      return this.writeToTag((Object)logic, registries);
+      Objects.requireNonNull(registries, "registries");
+      return this.writeToTag(logic);
    }
 
    @Nullable
    public synchronized CompoundTag writeToTag(Object logic, Provider registries) {
-      Objects.requireNonNull(logic, "logic");
       Objects.requireNonNull(registries, "registries");
-      OverloadCpuState state = this.states.get(logic);
-      return state != null && !state.isEmpty() ? state.toTag(registries) : null;
+      return this.writeToTag(logic);
    }
 
-   public synchronized void readFromTag(CraftingCpuLogic logic, CompoundTag tag, Provider registries) {
+   public synchronized void readFromTag(CraftingCpuLogic logic, CompoundTag tag) {
       ICraftingLink link = logic.getLastLink();
+
+      // 実行中リンクがなければ保存状態の所有者を確定できないため、壊れた状態を復元しない。
       if (link == null) {
          throw new IllegalStateException("crafting logic has no active link");
-      } else {
-         this.readFromTag(logic, link.getCraftingID(), tag, registries);
       }
+
+      this.readFromTag(logic, link.getCraftingID(), tag);
    }
 
-   public synchronized void readFromTag(Object logic, UUID craftingId, CompoundTag tag, Provider registries) {
+   public synchronized void readFromTag(Object logic, UUID craftingId, CompoundTag tag) {
       Objects.requireNonNull(logic, "logic");
       Objects.requireNonNull(craftingId, "craftingId");
       Objects.requireNonNull(tag, "tag");
-      Objects.requireNonNull(registries, "registries");
+
+      // 空NBTは保留中の過負荷会計が存在しないことを示す。
       if (tag.isEmpty()) {
          this.states.remove(logic);
-      } else {
-         this.states.put(logic, OverloadCpuState.fromTag(OverloadCpuOwner.from(craftingId, logic), tag, registries));
+         return;
       }
+
+      this.states.put(logic, OverloadCpuState.fromTag(OverloadCpuOwner.from(craftingId, logic), tag));
+   }
+
+   public synchronized void readFromTag(CraftingCpuLogic logic, CompoundTag tag, Provider registries) {
+      Objects.requireNonNull(registries, "registries");
+      this.readFromTag(logic, tag);
+   }
+
+   public synchronized void readFromTag(Object logic, UUID craftingId, CompoundTag tag, Provider registries) {
+      Objects.requireNonNull(registries, "registries");
+      this.readFromTag(logic, craftingId, tag);
    }
 
    private static AEItemKey asItemKey(AEKey key) {

@@ -22,7 +22,6 @@ import com.moakiee.thunderbolt.ae2.overload.cpu.OverloadCpuStateManager;
 import com.moakiee.thunderbolt.ae2.overload.cpu.OverloadPatternReference;
 import com.moakiee.thunderbolt.ae2.overload.cpu.PendingOverloadClaim;
 import com.moakiee.thunderbolt.ae2.overload.pattern.OverloadedProviderOnlyPatternDetails;
-import net.minecraft.core.HolderLookup.Provider;
 import net.minecraft.nbt.CompoundTag;
 import java.util.Arrays;
 import org.jetbrains.annotations.Nullable;
@@ -179,9 +178,9 @@ public abstract class CraftingCpuLogicMixin {
       method = {"writeToNBT"},
       at = {@At("RETURN")}
    )
-   private void ae2lt$writeOverloadState(CompoundTag data, Provider registries, CallbackInfo ci) {
+   private void ae2lt$writeOverloadState(CompoundTag data, CallbackInfo ci) {
       CraftingCpuLogic logic = (CraftingCpuLogic)(Object)this;
-      CompoundTag overloadStateTag = OverloadCpuStateManager.INSTANCE.writeToTag(logic, registries);
+      CompoundTag overloadStateTag = OverloadCpuStateManager.INSTANCE.writeToTag(logic);
       if (overloadStateTag != null) {
          data.put("ae2ltOverloadState", overloadStateTag);
       } else {
@@ -193,12 +192,12 @@ public abstract class CraftingCpuLogicMixin {
       method = {"readFromNBT"},
       at = {@At("RETURN")}
    )
-   private void ae2lt$readOverloadState(CompoundTag data, Provider registries, CallbackInfo ci) {
+   private void ae2lt$readOverloadState(CompoundTag data, CallbackInfo ci) {
       CraftingCpuLogic logic = (CraftingCpuLogic)(Object)this;
       OverloadCpuStateManager.INSTANCE.clear(logic);
       ExecutingCraftingJob job = ((CraftingCpuLogicAccessor)logic).getJob();
       if (job != null && data.contains("ae2ltOverloadState", 10)) {
-         OverloadCpuStateManager.INSTANCE.readFromTag(logic, data.getCompound("ae2ltOverloadState"), registries);
+         OverloadCpuStateManager.INSTANCE.readFromTag(logic, data.getCompound("ae2ltOverloadState"));
       }
    }
 
