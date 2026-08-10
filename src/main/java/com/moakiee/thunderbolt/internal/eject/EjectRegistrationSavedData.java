@@ -14,10 +14,12 @@ import net.minecraft.resources.ResourceLocation;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.saveddata.SavedData;
+import net.minecraftforge.fml.ModList;
 
 public final class EjectRegistrationSavedData extends SavedData {
    private static final String DATA_NAME = "thunderbolt_eject_registrations";
    private static final String LEGACY_DATA_NAME = "ae2lt_eject_registrations";
+   private static final String LEGACY_OWNER_MOD_ID = "ae2lt";
    private static final String TAG_ENTRIES = "Entries";
    private static final String TAG_LEGACY_MIGRATION_COMPLETE = "LegacyMigrationComplete";
    private static final String TAG_I_DIM = "IDim";
@@ -30,25 +32,35 @@ public final class EjectRegistrationSavedData extends SavedData {
 
    public static EjectRegistrationSavedData get(MinecraftServer server) {
       return server.overworld().getDataStorage().computeIfAbsent(
-         EjectRegistrationSavedData::load, EjectRegistrationSavedData::new, "thunderbolt_eject_registrations"
+         EjectRegistrationSavedData::load, EjectRegistrationSavedData::new, DATA_NAME
       );
    }
 
    public void migrateLegacyIfNeeded(MinecraftServer server) {
-      if (!this.legacyMigrationComplete) {
-         EjectRegistrationSavedData legacy = server.overworld().getDataStorage().computeIfAbsent(
-            EjectRegistrationSavedData::load, EjectRegistrationSavedData::new, "ae2lt_eject_registrations"
-         );
-
-         for (EjectRegistrationSavedData.PersistentRegistration registration : legacy.entries) {
-            if (!this.entries.contains(registration)) {
-               this.entries.add(registration);
-            }
-         }
-
-         this.legacyMigrationComplete = true;
-         this.setDirty();
+      // 一度移行済みなら、旧SavedDataを再読込しない。
+      if (this.legacyMigrationComplete) {
+         return;
       }
+
+      // AE2LT導入中は旧キーをAE2LT自身に所有させ、異なるSavedData型のキャッシュ衝突を防ぐ。
+      if (ModList.get().isLoaded(LEGACY_OWNER_MOD_ID)) {
+         return;
+      }
+
+      EjectRegistrationSavedData legacy = server.overworld().getDataStorage().computeIfAbsent(
+         EjectRegistrationSavedData::load, EjectRegistrationSavedData::new, LEGACY_DATA_NAME
+      );
+
+      // AE2LTを外した旧環境から、未登録の搬出情報だけをThunderboltへ移す。
+      for (EjectRegistrationSavedData.PersistentRegistration registration : legacy.entries) {
+         if (this.entries.contains(registration)) {
+            continue;
+         }
+         this.entries.add(registration);
+      }
+
+      this.legacyMigrationComplete = true;
+      this.setDirty();
    }
 
    public List<EjectRegistrationSavedData.PersistentRegistration> getAll() {
