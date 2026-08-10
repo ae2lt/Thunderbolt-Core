@@ -7,6 +7,7 @@ import java.util.function.Predicate;
 public final class OptionalMixinSelector {
     private static final Map<String, String> REQUIRED_MODS = Map.ofEntries(
             Map.entry("Ae2CraftingTreeCompatibilityMixin", "ae2ct"),
+            Map.entry("CraftingTreeNodePatternAdapterMixin", "probabilitypattern"),
             Map.entry("AdvCraftingCpuLogicBatchMixin", "advanced_ae"),
             Map.entry("AdvCraftingCpuLogicMixin", "advanced_ae"),
             Map.entry("AdvCraftingCpuAccessor", "advanced_ae"),
