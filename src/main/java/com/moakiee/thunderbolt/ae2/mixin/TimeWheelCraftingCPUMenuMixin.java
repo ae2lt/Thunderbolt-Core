@@ -28,8 +28,11 @@ import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
+// Crazy AE2のCraftingCPUMenu拡張を先に適用し、Time Wheel用の補助処理を後から追加する。
+// 800はCrazy AE2の標準Mixin優先度1000より後段にするための固定値。
 @Mixin(
    value = {CraftingCPUMenu.class},
+   priority = 800,
    remap = false
 )
 public abstract class TimeWheelCraftingCPUMenuMixin extends AEBaseMenu {
