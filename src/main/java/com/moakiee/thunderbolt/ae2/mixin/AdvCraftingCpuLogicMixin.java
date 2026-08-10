@@ -25,7 +25,6 @@ import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.util.UUID;
 import java.util.Arrays;
-import net.minecraft.core.HolderLookup.Provider;
 import net.minecraft.nbt.CompoundTag;
 import org.jetbrains.annotations.Nullable;
 import org.spongepowered.asm.mixin.Mixin;
@@ -254,9 +253,9 @@ public abstract class AdvCraftingCpuLogicMixin {
       method = {"writeToNBT"},
       at = {@At("RETURN")}
    )
-   private void ae2lt$writeOverloadState(CompoundTag data, Provider registries, CallbackInfo ci) {
+   private void ae2lt$writeOverloadState(CompoundTag data, CallbackInfo ci) {
       if (AE2LT_ADV_AVAILABLE) {
-         CompoundTag overloadStateTag = OverloadCpuStateManager.INSTANCE.writeToTag(this, registries);
+         CompoundTag overloadStateTag = OverloadCpuStateManager.INSTANCE.writeToTag(this);
          if (overloadStateTag != null) {
             data.put("ae2ltOverloadState", overloadStateTag);
          } else {
@@ -269,14 +268,14 @@ public abstract class AdvCraftingCpuLogicMixin {
       method = {"readFromNBT"},
       at = {@At("RETURN")}
    )
-   private void ae2lt$readOverloadState(CompoundTag data, Provider registries, CallbackInfo ci) {
+   private void ae2lt$readOverloadState(CompoundTag data, CallbackInfo ci) {
       if (AE2LT_ADV_AVAILABLE) {
          OverloadCpuStateManager.INSTANCE.clear(this);
          Object job = this.ae2lt$getJob();
          if (job != null && data.contains("ae2ltOverloadState", 10)) {
             CraftingLink link = this.ae2lt$getJobLink(job);
             if (link != null) {
-               OverloadCpuStateManager.INSTANCE.readFromTag(this, link.getCraftingID(), data.getCompound("ae2ltOverloadState"), registries);
+               OverloadCpuStateManager.INSTANCE.readFromTag(this, link.getCraftingID(), data.getCompound("ae2ltOverloadState"));
             }
          }
       }

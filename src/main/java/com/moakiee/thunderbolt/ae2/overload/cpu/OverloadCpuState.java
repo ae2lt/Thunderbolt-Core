@@ -18,7 +18,6 @@ import java.util.Objects;
 import java.util.UUID;
 import java.util.function.BiPredicate;
 import java.util.function.Predicate;
-import net.minecraft.core.HolderLookup.Provider;
 import net.minecraft.nbt.CompoundTag;
 import net.minecraft.nbt.ListTag;
 import net.minecraft.resources.ResourceLocation;
@@ -300,8 +299,7 @@ public final class OverloadCpuState {
       this.pendingByItemId.clear();
    }
 
-   public CompoundTag toTag(Provider registries) {
-      Objects.requireNonNull(registries, "registries");
+   public CompoundTag toTag() {
       CompoundTag tag = new CompoundTag();
       tag.putLong("NextSequence", this.nextSequence);
       ListTag pendingList = new ListTag();
@@ -332,10 +330,9 @@ public final class OverloadCpuState {
       return tag;
    }
 
-   public static OverloadCpuState fromTag(OverloadCpuOwner owner, CompoundTag tag, Provider registries) {
+   public static OverloadCpuState fromTag(OverloadCpuOwner owner, CompoundTag tag) {
       Objects.requireNonNull(owner, "owner");
       Objects.requireNonNull(tag, "tag");
-      Objects.requireNonNull(registries, "registries");
       OverloadCpuState state = new OverloadCpuState(owner);
       state.nextSequence = Math.max(1L, tag.getLong("NextSequence"));
       ListTag pendingList = tag.getList("Pending", 10);
@@ -353,7 +350,7 @@ public final class OverloadCpuState {
             owner,
             patternReference,
             ResourceLocation.parse(pendingTag.getString("ItemId")),
-            loadExactExpectedKey(pendingTag, registries),
+             loadExactExpectedKey(pendingTag),
             pendingTag.getLong("RemainingAmount"),
             pendingTag.getBoolean("RoutesToRequester"),
             pendingTag.getLong("RegisteredOrder"),
@@ -411,7 +408,7 @@ public final class OverloadCpuState {
       }
    }
 
-   private static AEKey loadExactExpectedKey(CompoundTag pendingTag, Provider registries) {
+   private static AEKey loadExactExpectedKey(CompoundTag pendingTag) {
       if (!pendingTag.contains("ExactTemplate", 10)) {
          throw new IllegalArgumentException("pending overload entry is missing an exact expected key");
       } else {
