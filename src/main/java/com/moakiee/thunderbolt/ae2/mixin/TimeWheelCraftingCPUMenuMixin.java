@@ -103,7 +103,9 @@ public abstract class TimeWheelCraftingCPUMenuMixin extends AEBaseMenu {
 
    @Inject(
       method = {"removed"},
-      at = {@At("TAIL")}
+      at = {@At("TAIL")},
+      // removedはバニラ由来のoverrideなので、本番環境の難読化名へ変換する。
+      remap = true
    )
    private void thunderbolt$removed(Player player, CallbackInfo ci) {
       if (this.thunderbolt$timeWheelCpu != null) {
@@ -113,7 +115,9 @@ public abstract class TimeWheelCraftingCPUMenuMixin extends AEBaseMenu {
 
    @Inject(
       method = {"broadcastChanges"},
-      at = {@At("HEAD")}
+      at = {@At("HEAD")},
+      // broadcastChangesもバニラ由来のoverrideなので、Forgeのrefmapを使用する。
+      remap = true
    )
    private void thunderbolt$broadcastTimeWheelStatus(CallbackInfo ci) {
       if (this.isServerSide() && this.thunderbolt$timeWheelCpu != null) {
