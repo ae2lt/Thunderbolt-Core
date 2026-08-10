@@ -27,7 +27,7 @@ Mixin configuration.
 The distribution artifact is:
 
 ```text
-build/libs/thunderbolt-1.0.3-forge-1.20.1-r1.jar
+build/libs/thunderbolt-1.0.3-forge-1.20.1-r2.jar
 ```
 
 The `-slim.jar` file is the development artifact and should not be distributed.
