@@ -45,8 +45,11 @@ import org.spongepowered.asm.mixin.injection.At.Shift;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
 
+// Crazy AE2の互換Mixinが上書きしたCraftingServiceへ、Thunderboltの注入を適用する。
+// 1300はCrazy AE2互換Mixinの優先度1200を上回るための固定値。
 @Mixin(
    value = {CraftingService.class},
+   priority = 1300,
    remap = false
 )
 public abstract class ExtendedCraftingCpuServiceMixin {
@@ -291,15 +294,46 @@ public abstract class ExtendedCraftingCpuServiceMixin {
       )}
    )
    private void thunderbolt$getExtendedCpus(CallbackInfoReturnable<ImmutableSet<ICraftingCPU>> cir, @Local(ordinal = 0) Builder<ICraftingCPU> cpus) {
-      for (ExtendedCraftingCpuCluster cluster : this.thunderbolt$getExtendedCpuClusters()) {
-         if (cluster.isActive()) {
-            for (ICraftingCPU cpu : cluster.getActiveCpus()) {
-               cpus.add(cpu);
-            }
+      this.thunderbolt$addExtendedCpus(cpus);
+   }
 
-            if (cluster.getAvailableStorage() > 0L) {
-               cpus.add(cluster);
-            }
+   @Inject(
+      method = {"getCpus"},
+      at = {@At("HEAD")},
+      remap = false
+   )
+   private void thunderbolt$appendExtendedCpusAfterEarlyReturn(
+      CallbackInfoReturnable<ImmutableSet<ICraftingCPU>> cir
+   ) {
+      ImmutableSet<ICraftingCPU> existing = cir.getReturnValue();
+      // 先行Mixinが返却値を作っていない通常経路では、AE2本体のgetCpus処理へ任せる。
+      if (existing == null) {
+         return;
+      }
+
+      // Crazy AE2がCPU優先度処理で先に返した集合へ、Thunderboltの拡張CPUを重複なく追加する。
+      Builder<ICraftingCPU> cpus = ImmutableSet.builder();
+      cpus.addAll(existing);
+      this.thunderbolt$addExtendedCpus(cpus);
+      cir.setReturnValue(cpus.build());
+   }
+
+   @Unique
+   private void thunderbolt$addExtendedCpus(Builder<ICraftingCPU> cpus) {
+      // 接続中の各拡張CPUクラスタを走査し、稼働中のCPUだけをAE2のCPU集合へ追加する。
+      for (ExtendedCraftingCpuCluster cluster : this.thunderbolt$getExtendedCpuClusters()) {
+         // 構造が未形成または停止中のクラスタは、CPUとして公開しない。
+         if (!cluster.isActive()) {
+            continue;
+         }
+
+         for (ICraftingCPU cpu : cluster.getActiveCpus()) {
+            cpus.add(cpu);
+         }
+
+         // 空きクラフトストレージがある場合だけ、クラスタ自体を選択対象へ追加する。
+         if (cluster.getAvailableStorage() > 0L) {
+            cpus.add(cluster);
          }
       }
    }
