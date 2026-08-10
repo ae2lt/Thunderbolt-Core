@@ -61,6 +61,26 @@ mixin {
     config "${mod_id}.mixins.json"
 }
 
+def ae2Variant = (findProperty('ae2Variant') ?: 'upstream').toString().trim().toLowerCase()
+def ae2Versions = [
+        upstream: ae2_version,
+        uelm: '15.5.0-uelm'
+]
+if (!ae2Versions.containsKey(ae2Variant)) {
+    throw new GradleException("Unknown ae2Variant '${ae2Variant}'. Use 'upstream' or 'uelm'.")
+}
+
+def selectedAe2Version = ae2Versions[ae2Variant]
+def expectedAe2JarName = "appliedenergistics2-forge-${selectedAe2Version}.jar"
+def ae2JarOverrideProperty = findProperty('thunderboltAe2Jar')
+def ae2JarOverride = ae2JarOverrideProperty == null ? null : file(ae2JarOverrideProperty)
+if (ae2JarOverride != null && !ae2JarOverride.isFile()) {
+    throw new GradleException("thunderboltAe2Jar does not exist: ${ae2JarOverride.absolutePath}")
+}
+if (ae2JarOverride != null && ae2JarOverride.name != expectedAe2JarName) {
+    throw new GradleException("thunderboltAe2Jar must be named ${expectedAe2JarName}, got ${ae2JarOverride.name}")
+}
+
 repositories {
     mavenLocal()
     mavenCentral()
@@ -75,11 +95,21 @@ repositories {
         url = 'https://www.cursemaven.com'
         content { includeGroup 'curse.maven' }
     }
+    if (ae2JarOverride != null) {
+        flatDir {
+            dirs ae2JarOverride.parentFile
+        }
+    }
 }
 
 dependencies {
     minecraft "net.minecraftforge:forge:${minecraft_version}-${forge_version}"
-    implementation fg.deobf("appeng:appliedenergistics2-forge:${ae2_version}")
+    if (ae2JarOverride != null) {
+        // The local override verifies compatibility with replacement builds such as AE2-UELM.
+        implementation fg.deobf(group: 'local.mods', name: 'appliedenergistics2-forge', version: selectedAe2Version)
+    } else {
+        implementation fg.deobf("appeng:appliedenergistics2-forge:${selectedAe2Version}")
+    }
 
     // Advanced AE is optional at runtime; its accessors/mixins are selected only when loaded.
     compileOnly fg.deobf("curse.maven:advancedae-1084104:${advanced_ae_file_id}")
@@ -90,6 +120,36 @@ dependencies {
     jarJar(group: 'io.github.llamalad7', name: 'mixinextras-forge', version: "[${mixinextras_version},)") {
         jarJar.pin(it, "${mixinextras_version}")
     }
+}
+
+tasks.register('verifyAe2Profile') {
+    doLast {
+        logger.lifecycle("Thunderbolt AE2 dependency profile: ${ae2Variant} (${selectedAe2Version})")
+        if (ae2JarOverride == null) {
+            logger.lifecycle('Thunderbolt AE2 source: configured Maven dependency')
+            return
+        }
+
+        def metadataFiles = zipTree(ae2JarOverride).matching {
+            include 'META-INF/mods.toml'
+        }.files
+        if (metadataFiles.size() != 1) {
+            throw new GradleException("Expected one META-INF/mods.toml in ${ae2JarOverride.name}")
+        }
+
+        def metadata = metadataFiles.first().getText('UTF-8')
+        if (!metadata.contains('modId="ae2"')) {
+            throw new GradleException("${ae2JarOverride.name} does not declare the required mod id ae2")
+        }
+        if (!metadata.contains(selectedAe2Version)) {
+            throw new GradleException("${ae2JarOverride.name} does not declare AE2 version ${selectedAe2Version}")
+        }
+        logger.lifecycle("Thunderbolt AE2 source: ${ae2JarOverride.absolutePath}")
+    }
+}
+
+tasks.named('compileJava').configure {
+    dependsOn tasks.named('verifyAe2Profile')
 }
 
 sourceSets.main.resources { srcDir 'src/generated/resources' }

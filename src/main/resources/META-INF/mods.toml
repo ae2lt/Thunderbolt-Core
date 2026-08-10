@@ -18,7 +18,7 @@ Shared AE2 optimization and infrastructure layer for AE2 Lightning Tech. Provide
     modId="forge"
     type="required"
     mandatory=true
-    versionRange="[47.4.20,48)"
+    versionRange="${forge_version_range}"
     ordering="NONE"
     side="BOTH"
 
@@ -34,6 +34,6 @@ Shared AE2 optimization and infrastructure layer for AE2 Lightning Tech. Provide
     modId="ae2"
     type="required"
     mandatory=true
-    versionRange="[15.4.10,15.5.0)"
+    versionRange="${ae2_version_range}"
     ordering="AFTER"
     side="BOTH"

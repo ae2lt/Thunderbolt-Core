@@ -8,9 +8,10 @@ compatibility with Advanced AE and Neo ECO AE Extension.
 ## Target
 
 - Minecraft 1.20.1
-- Forge 47.4.20+
+- Forge 47.4.18+
 - Java 17
-- Applied Energistics 2 15.4.x
+- Applied Energistics 2 15.4.10 through 15.x
+- AE2 Unofficial Extended Life Modern 15.5.0-uelm
 - Optional Advanced AE integration
 
 The supplied upstream artifact is NeoForge 1.21.1 and cannot be copied directly
@@ -24,10 +25,17 @@ Mixin configuration.
 .\gradlew.bat build --no-daemon
 ```
 
+The default build uses upstream AE2 15.4.10. To verify the same source against
+AE2-UELM, provide its local JAR explicitly:
+
+```powershell
+.\gradlew.bat clean build --no-daemon -Pae2Variant=uelm -PthunderboltAe2Jar=C:\path\to\appliedenergistics2-forge-15.5.0-uelm.jar
+```
+
 The distribution artifact is:
 
 ```text
-build/libs/thunderbolt-1.0.3-forge-1.20.1-r2.jar
+build/libs/thunderbolt-1.0.3-forge-1.20.1-r3.jar
 ```
 
 The `-slim.jar` file is the development artifact and should not be distributed.
