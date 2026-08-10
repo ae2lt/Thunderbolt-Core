@@ -425,6 +425,17 @@ public final class FastCraftingPlanner {
     }
 
     /**
+     * A planned durability step is executable only when AE2's pattern input accepts the exact
+     * returned variant. In particular, a crafting pattern with substitutions disabled accepts the
+     * encoded tool but rejects the damaged key returned after the first craft. Counting that key as
+     * reusable stock would produce a feasible plan that the CPU can never dispatch.
+     */
+    static boolean acceptsDurabilityRemainder(
+            IPatternDetails.IInput input, AEKey remainder, Level level) {
+        return remainder != null && input.isValid(remainder, level);
+    }
+
+    /**
      * BFS the reachable recipe graph.
      *
      * @return durability conflicts plus demand modes discovered after their node was already expanded;
@@ -1104,6 +1115,12 @@ public final class FastCraftingPlanner {
         }
         // One degradation step under THIS slot's rule (null = consumed outright / leaves the item).
         AEKey step = remaining instanceof AEItemKey next && next.getItem() == item ? next : null;
+        if (step != null && !acceptsDurabilityRemainder(in, step, level)) {
+            // The recipe returns a damaged tool, but this strict pattern cannot consume it again.
+            // Rebuild this item with conservative whole-item semantics instead of promising a
+            // durability pool whose physical variants the CPU will reject during extraction.
+            return ChainLookup.conflict(item);
+        }
 
         // Merge index: is this slot's start key already a link of some built chain?
         DurabilityChain<AEKey> owner = linkOwner.get(full);
@@ -1129,7 +1146,8 @@ public final class FastCraftingPlanner {
                 k -> {
                     exportBudget.consume();
                     return in.getRemainingKey(k) instanceof AEItemKey next
-                            && next.getItem() == item ? next : null;
+                            && next.getItem() == item
+                            && acceptsDurabilityRemainder(in, next, level) ? next : null;
                 },
                 k -> {
                     exportBudget.consume();
@@ -1201,13 +1219,14 @@ public final class FastCraftingPlanner {
             return craftable; // craftable == full durability == absolute fullest; no scan needed
         }
         AEItemKey anchor = template;
-        long best = downwardLength(in, template, item, exportBudget);
+        long best = downwardLength(in, template, item, level, exportBudget);
         for (AEKey variant : snapshot.findFuzzyTemplates(template)) {
             exportBudget.consume();
-            if (!(variant instanceof AEItemKey ik) || ik.getItem() != item || ik.equals(anchor)) {
+            if (!(variant instanceof AEItemKey ik) || ik.getItem() != item || ik.equals(anchor)
+                    || !in.isValid(ik, level)) {
                 continue;
             }
-            long len = downwardLength(in, ik, item, exportBudget);
+            long len = downwardLength(in, ik, item, level, exportBudget);
             if (len > best) {
                 best = len;
                 anchor = ik;
@@ -1221,12 +1240,16 @@ public final class FastCraftingPlanner {
             IPatternDetails.IInput in,
             AEItemKey from,
             Item item,
+            Level level,
             GraphExportBudget exportBudget) {
         long len = 1;
         Set<AEKey> guard = new HashSet<>();
         AEKey cur = from;
         guard.add(cur);
-        while (in.getRemainingKey(cur) instanceof AEItemKey next && next.getItem() == item && guard.add(next)) {
+        while (in.getRemainingKey(cur) instanceof AEItemKey next
+                && next.getItem() == item
+                && acceptsDurabilityRemainder(in, next, level)
+                && guard.add(next)) {
             exportBudget.consume();
             cur = next;
             if (++len > FUZZY_CYCLE_STEPS) {
