@@ -14,7 +14,7 @@ best-effort basis.
 ## Requirements
 
 - Minecraft `1.20.1`
-- Forge `47.4.0`+ (not NeoForge)
+- Forge `47.1.3`+ (not NeoForge)
 - Java `17`
 - Applied Energistics 2 `15.4.10` (or any 1.20.1 release that keeps the
   patched crafting classes stable)
