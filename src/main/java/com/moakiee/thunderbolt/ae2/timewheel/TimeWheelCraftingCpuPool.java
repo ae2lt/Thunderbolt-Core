@@ -473,7 +473,7 @@ public final class TimeWheelCraftingCpuPool implements ExtendedCraftingCpuCluste
     @Nullable
     @Override
     public Component getName() {
-        return host.getDisplayName();
+        return host.getCpuDisplayName();
     }
 
     @Override

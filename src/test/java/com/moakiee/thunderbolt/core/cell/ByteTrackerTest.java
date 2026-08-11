@@ -32,7 +32,7 @@ class ByteTrackerTest {
         private final int apb;
 
         TestKeyType(String id, int apb) {
-            super(ResourceLocation.fromNamespaceAndPath("thunderbolt_test", id),
+            super(new ResourceLocation("thunderbolt_test", id),
                     AEItemKey.class, Component.literal(id));
             this.apb = apb;
         }

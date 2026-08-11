@@ -102,7 +102,7 @@ class FastCraftingPlannerDurabilityEligibilityTest {
 
         @Override
         public ResourceLocation getId() {
-            return ResourceLocation.fromNamespaceAndPath("thunderbolt_test", id);
+            return new ResourceLocation("thunderbolt_test", id);
         }
 
         @Override
@@ -133,7 +133,7 @@ class FastCraftingPlannerDurabilityEligibilityTest {
 
     private static final class TestKeyType extends AEKeyType {
         private TestKeyType() {
-            super(ResourceLocation.fromNamespaceAndPath(
+            super(new ResourceLocation(
                             "thunderbolt_test", "durability_eligibility_key"),
                     TestKey.class, Component.literal("durability eligibility key"));
         }

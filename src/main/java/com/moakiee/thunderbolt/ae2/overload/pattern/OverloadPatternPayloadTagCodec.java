@@ -142,7 +142,7 @@ public final class OverloadPatternPayloadTagCodec {
         } catch (RuntimeException malformed) {
             LOGGER.warn("Malformed source pattern snapshot in overload pattern payload; "
                     + "falling back to an inert air snapshot.", malformed);
-            return new SourcePatternSnapshot(ResourceLocation.fromNamespaceAndPath("minecraft", "air"), null, null);
+            return new SourcePatternSnapshot(new ResourceLocation("minecraft", "air"), null, null);
         }
     }
 

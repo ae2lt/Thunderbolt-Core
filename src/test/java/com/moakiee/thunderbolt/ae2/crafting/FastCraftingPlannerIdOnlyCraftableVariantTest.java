@@ -328,7 +328,7 @@ class FastCraftingPlannerIdOnlyCraftableVariantTest {
         }
         @Override public Object getPrimaryKey() { return id; }
         @Override public ResourceLocation getId() {
-            return ResourceLocation.fromNamespaceAndPath("thunderbolt_test", id);
+            return new ResourceLocation("thunderbolt_test", id);
         }
         @Override public void writeToPacket(FriendlyByteBuf data) { }
         @Override protected Component computeDisplayName() {
@@ -347,7 +347,7 @@ class FastCraftingPlannerIdOnlyCraftableVariantTest {
 
     private static final class VariantKeyType extends AEKeyType {
         private VariantKeyType() {
-            super(ResourceLocation.fromNamespaceAndPath("thunderbolt_test", "variant_key"),
+            super(new ResourceLocation("thunderbolt_test", "variant_key"),
                     VariantKey.class, Component.literal("variant key"));
         }
         @Override public AEKey loadKeyFromTag(CompoundTag tag) { return null; }

@@ -21,7 +21,7 @@ import com.moakiee.thunderbolt.ae2.overload.pattern.SourcePatternSnapshot;
 
 class OverloadCpuStatePersistenceTest {
     private static final ResourceLocation STONE_ID =
-            ResourceLocation.fromNamespaceAndPath("minecraft", "stone");
+            new ResourceLocation("minecraft", "stone");
     private static final TestKey EXACT_KEY = new TestKey();
 
     @Test
@@ -102,7 +102,7 @@ class OverloadCpuStatePersistenceTest {
 
     private static final class TestKeyType extends AEKeyType {
         private TestKeyType() {
-            super(ResourceLocation.fromNamespaceAndPath("thunderbolt_test", "item"),
+            super(new ResourceLocation("thunderbolt_test", "item"),
                     TestKey.class, Component.literal("test item"));
         }
 

@@ -19,7 +19,7 @@ public final class IndexedCellStorageSavedData extends SavedData {
     private static final String TAG_STORES = "Stores";
     private static final String TAG_LEGACY_MIGRATION_COMPLETE = "LegacyMigrationComplete";
     private static final ResourceLocation LEGACY_AE2LT_TYPE =
-            ResourceLocation.fromNamespaceAndPath("ae2lt", "infinite_cell");
+            new ResourceLocation("ae2lt", "infinite_cell");
 
     private record StorageKey(ResourceLocation type, UUID id) {}
 

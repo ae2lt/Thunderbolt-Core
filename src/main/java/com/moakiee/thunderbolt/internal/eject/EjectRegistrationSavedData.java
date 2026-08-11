@@ -212,7 +212,7 @@ public final class EjectRegistrationSavedData extends SavedData {
     static ResourceKey<Level> dimension(String id) {
         try {
             return (ResourceKey<Level>) RESOURCE_KEY_CREATE.invoke(null,
-                    ResourceLocation.fromNamespaceAndPath("minecraft", "dimension"),
+                    new ResourceLocation("minecraft", "dimension"),
                     ResourceLocation.tryParse(id));
         } catch (ReflectiveOperationException e) {
             throw new IllegalStateException("Failed to build dimension key " + id, e);

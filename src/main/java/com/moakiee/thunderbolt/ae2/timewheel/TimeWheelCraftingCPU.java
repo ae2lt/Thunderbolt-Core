@@ -111,7 +111,7 @@ public final class TimeWheelCraftingCPU implements ICraftingCPU {
     @Nullable
     @Override
     public Component getName() {
-        return host.getDisplayName();
+        return host.getCpuDisplayName();
     }
 
     @Override

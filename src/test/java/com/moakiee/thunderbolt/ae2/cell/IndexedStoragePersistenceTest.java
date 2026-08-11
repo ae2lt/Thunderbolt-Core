@@ -128,7 +128,7 @@ class IndexedStoragePersistenceTest {
 
     private static final class TestKeyType extends AEKeyType {
         private TestKeyType() {
-            super(ResourceLocation.fromNamespaceAndPath("thunderbolt_test", "indexed_storage"),
+            super(new ResourceLocation("thunderbolt_test", "indexed_storage"),
                     TestKey.class, Component.literal("indexed storage test"));
         }
 
@@ -180,7 +180,7 @@ class IndexedStoragePersistenceTest {
 
         @Override
         public ResourceLocation getId() {
-            return ResourceLocation.fromNamespaceAndPath("thunderbolt_test", name);
+            return new ResourceLocation("thunderbolt_test", name);
         }
 
         @Override

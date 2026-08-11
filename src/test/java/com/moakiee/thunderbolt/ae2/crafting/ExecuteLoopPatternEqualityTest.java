@@ -112,7 +112,7 @@ class ExecuteLoopPatternEqualityTest {
         }
         @Override public Object getPrimaryKey() { return id; }
         @Override public ResourceLocation getId() {
-            return ResourceLocation.fromNamespaceAndPath("thunderbolt_test", id);
+            return new ResourceLocation("thunderbolt_test", id);
         }
         @Override public void writeToPacket(FriendlyByteBuf data) { }
         @Override protected Component computeDisplayName() { return Component.literal(id); }
@@ -126,7 +126,7 @@ class ExecuteLoopPatternEqualityTest {
 
     private static final class TestKeyType extends AEKeyType {
         private TestKeyType() {
-            super(ResourceLocation.fromNamespaceAndPath("thunderbolt_test", "execute_loop_key"),
+            super(new ResourceLocation("thunderbolt_test", "execute_loop_key"),
                     TestKey.class, Component.literal("execute loop key"));
         }
         @Override public AEKey loadKeyFromTag(CompoundTag tag) { return null; }

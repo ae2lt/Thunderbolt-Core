@@ -11,8 +11,8 @@ import net.minecraftforge.event.server.ServerStartingEvent;
 import net.minecraftforge.event.server.ServerStoppedEvent;
 import net.minecraftforge.fml.common.Mod;
 import net.minecraftforge.fml.event.lifecycle.FMLCommonSetupEvent;
+import net.minecraftforge.eventbus.api.IEventBus;
 import net.minecraftforge.fml.event.lifecycle.FMLLoadCompleteEvent;
-import net.minecraftforge.fml.javafmlmod.FMLJavaModLoadingContext;
 import org.spongepowered.asm.mixin.MixinEnvironment;
 import org.slf4j.Logger;
 
@@ -29,8 +29,7 @@ public final class ThunderboltCore {
     public static final String MODID = "thunderbolt";
     public static final Logger LOGGER = LogUtils.getLogger();
 
-    public ThunderboltCore(FMLJavaModLoadingContext loadingContext) {
-        var modEventBus = loadingContext.getModEventBus();
+    public ThunderboltCore(IEventBus modEventBus) {
         ThunderboltBlockEntities.TYPES.register(modEventBus);
         modEventBus.addListener(this::onCommonSetup);
         modEventBus.addListener(this::onLoadComplete);

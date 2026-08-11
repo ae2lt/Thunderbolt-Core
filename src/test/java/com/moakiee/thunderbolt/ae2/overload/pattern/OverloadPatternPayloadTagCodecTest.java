@@ -26,7 +26,7 @@ class OverloadPatternPayloadTagCodecTest {
         assertNotNull(payload);
         assertEquals(PatternExecutionHostKind.OVERLOADED_PATTERN_PROVIDER, payload.requiredHostKind());
         // Missing source snapshot degrades to the inert air fallback.
-        assertEquals(ResourceLocation.fromNamespaceAndPath("minecraft", "air"), payload.sourcePattern().itemId());
+        assertEquals(new ResourceLocation("minecraft", "air"), payload.sourcePattern().itemId());
         assertTrue(payload.encodedPattern().inputSlots().isEmpty());
         assertTrue(payload.encodedPattern().outputSlots().isEmpty());
     }
@@ -40,7 +40,7 @@ class OverloadPatternPayloadTagCodecTest {
 
         var payload = OverloadPatternPayloadTagCodec.readPayload(tag);
 
-        assertEquals(ResourceLocation.fromNamespaceAndPath("minecraft", "air"), payload.sourcePattern().itemId());
+        assertEquals(new ResourceLocation("minecraft", "air"), payload.sourcePattern().itemId());
     }
 
     @Test
@@ -75,7 +75,7 @@ class OverloadPatternPayloadTagCodecTest {
 
     @Test
     void roundTripPreservesThePayload() {
-        var snapshot = new SourcePatternSnapshot(ResourceLocation.fromNamespaceAndPath("minecraft", "stone"), null, null);
+        var snapshot = new SourcePatternSnapshot(new ResourceLocation("minecraft", "stone"), null, null);
         var encoded = EncodedOverloadPattern.builder()
                 .input(0, MatchMode.STRICT)
                 .output(1, MatchMode.ID_ONLY)

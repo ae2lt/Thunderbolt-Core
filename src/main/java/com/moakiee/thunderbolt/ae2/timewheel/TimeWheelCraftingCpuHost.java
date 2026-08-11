@@ -64,6 +64,11 @@ public interface TimeWheelCraftingCpuHost {
      * Display name shown for this CPU (e.g. in the crafting status menu). The concrete
      * multiblock supplies its own translatable name so the lib dispatch engine stays free
      * of any host-mod resource keys.
+     *
+     * <p>Named {@code getCpuDisplayName} (not {@code getDisplayName}) on purpose: the latter
+     * collides with vanilla {@code MenuProvider.getDisplayName}, so host implementations
+     * get SRG-remapped to {@code m_5446_} while this interface method keeps its name,
+     * producing an AbstractMethodError across the two mod jars.</p>
      */
-    Component getDisplayName();
+    Component getCpuDisplayName();
 }
