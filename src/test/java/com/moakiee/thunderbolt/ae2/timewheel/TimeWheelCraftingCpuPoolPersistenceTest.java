@@ -111,7 +111,7 @@ class TimeWheelCraftingCpuPoolPersistenceTest {
         }
 
         @Override
-        public Component getDisplayName() {
+        public Component getCpuDisplayName() {
             return Component.literal("test");
         }
     }
