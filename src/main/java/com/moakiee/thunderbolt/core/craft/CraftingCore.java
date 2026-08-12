@@ -157,7 +157,7 @@ public final class CraftingCore implements Sweepable {
 
     @Override
     public boolean sweepTick() {
-        if (host.isRemoved()) {
+        if (host.isCraftingHostRemoved()) {
             drainAll(true);
             return false;
         }

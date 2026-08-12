@@ -9,7 +9,14 @@ import appeng.api.stacks.AEKey;
 public interface CraftingCoreHost {
     long getGameTime();
 
-    boolean isRemoved();
+    /**
+     * Whether the block entity hosting this core has been removed.
+     *
+     * <p>Named differently from {@code BlockEntity.isRemoved()} on purpose. Minecraft methods are
+     * SRG-remapped in the host mod while this interface lives in a separate mod jar, so sharing the
+     * vanilla name would make interface dispatch fail with {@link AbstractMethodError}.</p>
+     */
+    boolean isCraftingHostRemoved();
 
     boolean isConnected();
 
