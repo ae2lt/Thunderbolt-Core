@@ -31,7 +31,6 @@
     "AaeExecutingCraftingJobAccessor",
     "AaeElapsedTimeTrackerAccessor",
     "AaeTaskProgressAccessor",
-    "ExtendedAePlusVirtualCompletionSuppressionMixin",
     "ExtendedCraftingCpuServiceMixin",
     "TimeWheelCraftingCPUMenuMixin"
   ],

@@ -539,9 +539,6 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
             endStatusChangeBatch();
         }
 
-        if (job == activeJob && activeJob.virtualCompletionRequested) {
-            finishVirtualCompletionIfRequested(activeJob);
-        }
         if (job == activeJob) {
             flushUnusedRetainedFinalOutputs(activeJob);
         }
@@ -677,9 +674,9 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
                     return DispatchOutcome.RETRY_NO_POWER;
                 }
 
-                var pushResult = tryPushPattern(
+                boolean accepted = tryPushPattern(
                         resolvedProvider, craftingContainer, dispatchSchedule);
-                if (!pushResult.accepted()) {
+                if (!accepted) {
                     continue;
                 }
 
@@ -693,8 +690,6 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
                         remainderLoopCredits);
 
                 consumeTaskCopies(activeJob, details, 1L);
-                requestVirtualCompletionIfReady(
-                        activeJob, pushResult.virtualCraftingEnabled());
                 return DispatchOutcome.PUSHED;
             }
                 return DispatchOutcome.RETRY_SOON;
@@ -777,7 +772,6 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
 
         int dispatched = 0;
         boolean freeProviderRejected = false;
-        boolean lastDispatchedWasVirtual = false;
         try {
             var resolvedProvider = firstProvider;
             while (resolvedProvider != null && dispatched < affordable) {
@@ -786,15 +780,14 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
                     if (pending == null) {
                         pending = ParallelBatchCpuHelper.cloneSingleCopy(result);
                     }
-                    var pushResult = tryPushPattern(
+                    boolean accepted = tryPushPattern(
                             resolvedProvider, pending, dispatchSchedule);
-                    if (!pushResult.accepted()) {
+                    if (!accepted) {
                         // A rejecting provider must not consume the container, so the clone stays
                         // valid and is reused for the next provider instead of re-cloning.
                         freeProviderRejected = true;
                         break;
                     }
-                    lastDispatchedWasVirtual = pushResult.virtualCraftingEnabled();
                     pending = null; // ownership transferred to the provider
                     energyService.extractAEPower(powerOne, Actionable.MODULATE, PowerMultiplier.CONFIG);
                     ParallelBatchCpuHelper.markDispatched(result, 1);
@@ -814,7 +807,6 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
             ParallelBatchCpuHelper.registerExpectedOutputs(jobView, details, result, dispatched);
             recordLoopPatternDispatch(details, dispatched, false);
             consumeTaskCopies(activeJob, details, dispatched);
-            requestVirtualCompletionIfReady(activeJob, lastDispatchedWasVirtual);
             cpu.markDirty();
             // Energy-capped visits back off on the energy cadence; otherwise re-poll immediately
             // (delay 0) so the remaining copies keep filling providers this tick.
@@ -842,31 +834,25 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
         return null;
     }
 
-    private ProviderPushResult tryPushPattern(
+    private boolean tryPushPattern(
             ResolvedProvider resolvedProvider,
             KeyCounter[] inputs,
             TickProviderDispatchSchedule dispatchSchedule) {
         var provider = resolvedProvider.provider();
         try {
-            boolean accepted;
-            try (var ignored =
-                         ExtendedAePlusVirtualCraftingCompat.enterTimeWheelProviderPush()) {
-                accepted = provider.pushPattern(resolvedProvider.pattern(), inputs);
-            }
+            boolean accepted = provider.pushPattern(resolvedProvider.pattern(), inputs);
             if (!accepted) {
                 dispatchSchedule.recordFailure(resolvedProvider.pattern(), provider);
-                return ProviderPushResult.REJECTED;
+                return false;
             }
         } catch (Throwable t) {
             AELog.warn("[ae2lt] ICraftingProvider %s threw during pushPattern; blocking this pattern for the current tick. %s",
                     provider, t);
             dispatchSchedule.recordFailure(resolvedProvider.pattern(), provider);
-            return ProviderPushResult.REJECTED;
+            return false;
         }
         dispatchSchedule.recordSuccess(resolvedProvider.pattern(), provider);
-        return new ProviderPushResult(
-                true,
-                ExtendedAePlusVirtualCraftingCompat.isVirtualCraftingEnabled(provider));
+        return true;
     }
 
     public long insert(AEKey what, long amount, Actionable type) {
@@ -1184,34 +1170,6 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
                 || OverloadCpuStateManager.INSTANCE.hasAnyPending(this)) return;
         finalizeSeedReturnQuota();
         if (!returnReusableSeedsToHost()) return;
-        finishJob(true);
-        cpu.updateOutput(null);
-    }
-
-    private void requestVirtualCompletionIfReady(
-            TimeWheelJob activeJob,
-            boolean virtualCraftingEnabled) {
-        if (ExtendedAePlusVirtualCraftingCompat.shouldRequestCompletion(
-                virtualCraftingEnabled,
-                job == activeJob,
-                activeJob.closedLoopJob,
-                activeJob.softCancelling,
-                activeJob.tasks.isEmpty())) {
-            activeJob.virtualCompletionRequested = true;
-        }
-    }
-
-    private void finishVirtualCompletionIfRequested(TimeWheelJob activeJob) {
-        if (!activeJob.virtualCompletionRequested
-                || !ExtendedAePlusVirtualCraftingCompat.shouldRequestCompletion(
-                        true,
-                        job == activeJob,
-                        activeJob.closedLoopJob,
-                        activeJob.softCancelling,
-                        activeJob.tasks.isEmpty())) {
-            activeJob.virtualCompletionRequested = false;
-            return;
-        }
         finishJob(true);
         cpu.updateOutput(null);
     }
@@ -2176,11 +2134,6 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
 
     private record ResolvedProvider(ICraftingProvider provider, IPatternDetails pattern) { }
 
-    private record ProviderPushResult(boolean accepted, boolean virtualCraftingEnabled) {
-        private static final ProviderPushResult REJECTED =
-                new ProviderPushResult(false, false);
-    }
-
     private boolean hasAmbiguousOverloadOutput(IPatternDetails details) {
         return hasAmbiguousOverloadOutput(details, null);
     }
@@ -3015,7 +2968,6 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
         private boolean suspended;
         private boolean softCancelling;
         private boolean closedLoopJob;
-        private boolean virtualCompletionRequested;
 
         private TimeWheelJob(ICraftingPlan plan,
                              Consumer<AEKey> postCraftingDifference,
