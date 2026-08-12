@@ -22,8 +22,14 @@ public interface TimeWheelCraftingCpuHost {
 
     IActionSource getActionSource();
 
+    /**
+     * Level hosting this CPU. Named {@code getCpuLevel} (not {@code getLevel}) on purpose:
+     * {@code getLevel} collides with vanilla {@code BlockEntity.getLevel} ({@code m_58900_}), so
+     * host implementations get SRG-remapped while this interface method keeps its Mojang name,
+     * producing an AbstractMethodError across the two mod jars.
+     */
     @Nullable
-    Level getLevel();
+    Level getCpuLevel();
 
     void markCpuDirty();
 

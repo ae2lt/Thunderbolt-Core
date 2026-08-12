@@ -133,7 +133,7 @@ public final class TimeWheelCraftingCPU implements ICraftingCPU {
     }
 
     public Level getLevel() {
-        return host.getLevel();
+        return host.getCpuLevel();
     }
 
     public boolean canBeAutoSelectedFor(IActionSource source) {

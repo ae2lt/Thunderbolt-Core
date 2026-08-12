@@ -101,7 +101,7 @@ class TimeWheelCraftingCpuPoolPersistenceTest {
 
         @Nullable
         @Override
-        public Level getLevel() {
+        public Level getCpuLevel() {
             return null;
         }
 
