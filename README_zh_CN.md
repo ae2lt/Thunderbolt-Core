@@ -9,7 +9,7 @@ Thunderbolt Core 是 AE2 Lightning Tech 使用的 AE2 优化与底层基础设�
 ## 环境要求
 
 - Minecraft `1.20.1`
-- Forge `47.4.0` 及以上（非 NeoForge）
+- Forge `47.1.3` 及以上（非 NeoForge）
 - Java `17`
 - Applied Energistics 2 `15.4.10`（或任何合成类补丁所针对的类保持稳定的 1.20.1 版本）
 
