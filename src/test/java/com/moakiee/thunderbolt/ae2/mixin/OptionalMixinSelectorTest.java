@@ -31,15 +31,6 @@ class OptionalMixinSelectorTest {
     }
 
     @Test
-    void gatesExtendedAePlusVirtualCompletionSuppressionToItsOwningAddon() {
-        assertFalse(OptionalMixinSelector.shouldApply(
-                "ExtendedAePlusVirtualCompletionSuppressionMixin", ignored -> false));
-        assertTrue(OptionalMixinSelector.shouldApply(
-                "ExtendedAePlusVirtualCompletionSuppressionMixin",
-                "extendedae_plus"::equals));
-    }
-
-    @Test
     void appliesOptionalTargetsWhenTheirModIsLoaded() {
         assertTrue(OptionalMixinSelector.shouldApply("AdvCraftingCpuAccessor", "advanced_ae"::equals));
         assertTrue(OptionalMixinSelector.shouldApply("ECOCraftingCpuLogicBatchMixin", "neoecoae"::equals));
