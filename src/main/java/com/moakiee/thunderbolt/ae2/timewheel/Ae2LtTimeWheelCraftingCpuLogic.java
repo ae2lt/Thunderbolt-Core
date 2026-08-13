@@ -506,6 +506,7 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
                         ordinaryBudget,
                         craftingService,
                         energyService,
+                        level,
                         dispatchSchedule);
                 if (bulk != null) {
                     usedOps += bulk.dispatched();
@@ -703,14 +704,14 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
     }
 
     /**
-     * Fast path for homogeneous (non-overload) patterns. Instead of paying AE2's full per-copy
+     * Fast path for non-overload patterns. Instead of paying AE2's full per-copy
      * extraction (template resolution via {@code getValidItemTemplates}, input extraction and
      * pattern-power computation) once per copy, this extracts every copy it intends to push this
-     * visit in a single {@link ParallelBatchCpuHelper#bulkExtract} call and then hands the
-     * pre-resolved copies to the (non-batch) providers one {@code pushPattern} at a time.
+     * visit in a single {@link ParallelBatchCpuHelper#bulkExtract} call. Substitutions are first
+     * resolved through AE2's native rules, then only that concrete input set is scaled. The
+     * pre-resolved copies are handed to the (non-batch) providers one {@code pushPattern} at a time.
      *
-     * @return the visit result, or {@code null} when the pattern needs AE2's one-copy substitution
-     *         path (overload patterns or non-homogeneous/fuzzy inputs).
+     * @return the visit result, or {@code null} when the pattern needs the one-copy path.
      */
     @Nullable
     private BulkPush pushBulkForTask(TimeWheelJob activeJob,
@@ -719,6 +720,7 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
                                      int maxCopies,
                                      CraftingService craftingService,
                                      IEnergyService energyService,
+                                     Level level,
                                      TickProviderDispatchSchedule dispatchSchedule) {
         if (CraftingPatternDelegates.forProviderLookup(details)
                 instanceof OverloadedProviderOnlyPatternDetails) {
@@ -743,7 +745,7 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
 
         int budget = (int) Math.min(task.value, (long) maxCopies);
         var result = ParallelBatchCpuHelper.bulkExtract(
-                details, inventory, budget, false, reservedSeedStock(details));
+                details, inventory, budget, false, reservedSeedStock(details), level);
         if (result == null) {
             return null;
         }
