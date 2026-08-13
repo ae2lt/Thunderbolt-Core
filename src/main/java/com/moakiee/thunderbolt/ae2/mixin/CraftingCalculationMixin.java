@@ -142,7 +142,7 @@ public abstract class CraftingCalculationMixin implements FastCraftingControl {
                 : Math.max(0L, System.nanoTime() - thunderbolt$calculationStartedNanos);
         double wallMs = TimeUnit.NANOSECONDS.toMicros(elapsedNanos) / 1_000.0D;
         if (ae2lt$isFastPlanningEnabled()) {
-            ThunderboltCore.LOGGER.info(
+            ThunderboltCore.LOGGER.debug(
                     "[Thunderbolt Core][crafting-timing] finished: output={} requested={} wallMs={} "
                             + "attempts={} fastHandled={} fastFallback={} cachedSimulation={} "
                             + "fastFailures={} result={}",
