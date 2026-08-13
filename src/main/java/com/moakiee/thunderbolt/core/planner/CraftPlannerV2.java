@@ -124,6 +124,11 @@ public final class CraftPlannerV2<K> {
     /** Portion of each held feedback-output state borrowed from its private reusable-seed host. */
     private final Map<FeedbackSeedBootstrap<K>, Long> reservedFeedbackSeedHostOutputs =
             new HashMap<>();
+    /** Proven ordinary feedback state machines, classified before linear/integer planning. */
+    private List<ConservativeFeedbackAnalysis.Component<K>> conservativeFeedbackComponents = List.of();
+    /** Component members that can obtain their first state from an acyclic producer. */
+    private final Set<CraftPattern<K>> craftableConservativeFeedbackPatterns =
+            java.util.Collections.newSetFromMap(new IdentityHashMap<>());
     private boolean requiresSeedOrderedPlanning;
     /** Ordinary unchanged catalysts may share one seed in the linear pass when no byproduct can feed it. */
     private final Set<K> ordinaryReturnedSeedKeys = new HashSet<>();
@@ -549,6 +554,23 @@ public final class CraftPlannerV2<K> {
             for (int i = postOrder.size() - 1; i >= 0; i--) {
                 order.add(postOrder.get(i));
             }
+            // Include primary and byproduct material flow in SCC classification before any
+            // algebraic pass can treat a returned state as supply. Only proven non-growing marked
+            // graphs survive as ordinary feedback components; gain/ambiguous loops are excluded.
+            conservativeFeedbackComponents =
+                    ConservativeFeedbackAnalysis.analyze(order, patternsByOutput);
+            for (ConservativeFeedbackAnalysis.Component<K> component
+                    : conservativeFeedbackComponents) {
+                if (component.hasExternalProducer()) {
+                    craftableConservativeFeedbackPatterns.addAll(component.patterns());
+                }
+            }
+            if (!craftableConservativeFeedbackPatterns.isEmpty()) {
+                // A valid seed may itself be craftable by an acyclic producer. Ordered replay must
+                // get a chance to build it before bootstrap validation; the aggregate flow alone can
+                // cancel the transition's input against its own returned output.
+                requiresSeedOrderedPlanning = true;
+            }
             indexLinearContainerBootstrapReserves();
             indexSeedOrderedDependencyCone(order);
             this.capacity = capacityFromOrder(order, items.size());
@@ -690,6 +712,7 @@ public final class CraftPlannerV2<K> {
                 frozenContainerReserves,
                 frozenBootstraps,
                 frozenConverters,
+                conservativeFeedbackComponents,
                 requiresSeedOrderedPlanning,
                 Set.copyOf(seedOrderedDependencyCone),
                 new HashMap<>(capacity),
@@ -709,6 +732,13 @@ public final class CraftPlannerV2<K> {
         linearContainerBootstrapReserves.putAll(prepared.linearContainerBootstrapReserves);
         feedbackSeedBootstraps.putAll(prepared.feedbackSeedBootstraps);
         feedbackSeedConverters.putAll(prepared.feedbackSeedConverters);
+        conservativeFeedbackComponents = prepared.conservativeFeedbackComponents;
+        for (ConservativeFeedbackAnalysis.Component<K> component
+                : conservativeFeedbackComponents) {
+            if (component.hasExternalProducer()) {
+                craftableConservativeFeedbackPatterns.addAll(component.patterns());
+            }
+        }
         requiresSeedOrderedPlanning = prepared.seedOrdered;
         seedOrderedDependencyCone.addAll(prepared.seedOrderedDependencyCone);
         capacity = prepared.capacity;
@@ -775,11 +805,158 @@ public final class CraftPlannerV2<K> {
             }
         }
 
-        enforceDirectFeedbackBootstrap(plan, firedByOutput, used, missing);
+        Set<CraftPattern<K>> conservativeFeedbackPatterns =
+                enforceConservativeFeedbackBootstrap(plan, used, missing);
+        enforceDirectFeedbackBootstrap(
+                plan, firedByOutput, used, missing, conservativeFeedbackPatterns);
 
         return new CraftPlan<>(plan.supported(), missing.isEmpty(), plan.firings(), used,
                 plan.usedReusableStock(), missing, plan.grossDemand(), plan.itemsProcessed(),
                 plan.budgetExhausted());
+    }
+
+    /**
+     * Reserves one executable initial marking for every proven non-growing ordinary feedback SCC
+     * used by this plan. The aggregate solver may erase the state retained after a balanced or lossy
+     * round; this postcondition restores the physical token before the first transition.
+     *
+     * <p>Seed alternatives are the bounded cyclic rotations computed during graph compilation. A
+     * state already drawn (or already reported missing) for net demand can serve as that same token,
+     * as can a fired acyclic producer entering the SCC from outside. Components not fully used by the
+     * chosen firing vector are left to ordinary accounting and the legacy partial-return check.
+     */
+    private Set<CraftPattern<K>> enforceConservativeFeedbackBootstrap(
+            CraftPlan<K> plan,
+            Map<K, Long> used,
+            Map<K, Long> missing) {
+        Set<CraftPattern<K>> handled =
+                java.util.Collections.newSetFromMap(new IdentityHashMap<>());
+        for (ConservativeFeedbackAnalysis.Component<K> component
+                : conservativeFeedbackComponents) {
+            boolean active = true;
+            for (CraftPattern<K> pattern : component.patterns()) {
+                if (plan.firings().getOrDefault(pattern, 0L) <= 0) {
+                    active = false;
+                    break;
+                }
+            }
+            if (!active) continue;
+
+            long rounds = 0L;
+            if (component.lossy()) {
+                for (CraftPattern<K> pattern : component.patterns()) {
+                    long fired = plan.firings().getOrDefault(pattern, 0L);
+                    if (rounds == 0L) rounds = fired;
+                    else if (rounds != fired) {
+                        rounds = -1L;
+                        break;
+                    }
+                }
+                // A non-uniform lossy firing vector needs a general marked-graph scheduler. Keep it
+                // out of this proof and let the older narrow fallback diagnose it conservatively.
+                if (rounds < 0L) continue;
+            }
+
+            Map<K, Long> external = externalFeedbackSupply(component, plan.firings());
+            ConservativeFeedbackAnalysis.SeedOption<K> chosen = null;
+            int chosenMissingKinds = Integer.MAX_VALUE;
+            long chosenMissingTotal = Long.MAX_VALUE;
+            long chosenStock = Long.MAX_VALUE;
+            for (ConservativeFeedbackAnalysis.SeedOption<K> option : component.seedOptions()) {
+                int missingKinds = 0;
+                long missingTotal = 0L;
+                long stockNeeded = 0L;
+                for (Map.Entry<K, Long> seed : option.amounts().entrySet()) {
+                    K key = seed.getKey();
+                    long reserved = feedbackSeedCredit(
+                            component, rounds, key, used, missing, external);
+                    long additional = Math.max(0L, seed.getValue() - reserved);
+                    long stockAvailable = Math.max(
+                            0L, graph.stock(key) - used.getOrDefault(key, 0L));
+                    long shortage = Math.max(0L, additional - stockAvailable);
+                    if (shortage > 0) missingKinds++;
+                    missingTotal = Sat.add(missingTotal, shortage);
+                    stockNeeded = Sat.add(stockNeeded, Math.min(additional, stockAvailable));
+                }
+                if (chosen == null
+                        || missingKinds < chosenMissingKinds
+                        || (missingKinds == chosenMissingKinds
+                                && missingTotal < chosenMissingTotal)
+                        || (missingKinds == chosenMissingKinds
+                                && missingTotal == chosenMissingTotal
+                                && stockNeeded < chosenStock)) {
+                    chosen = option;
+                    chosenMissingKinds = missingKinds;
+                    chosenMissingTotal = missingTotal;
+                    chosenStock = stockNeeded;
+                }
+            }
+            if (chosen == null) continue;
+
+            handled.addAll(component.patterns());
+            for (Map.Entry<K, Long> seed : chosen.amounts().entrySet()) {
+                K key = seed.getKey();
+                long reserved = feedbackSeedCredit(
+                        component, rounds, key, used, missing, external);
+                long additional = Math.max(0L, seed.getValue() - reserved);
+                if (additional <= 0) continue;
+                long stockAvailable = Math.max(
+                        0L, graph.stock(key) - used.getOrDefault(key, 0L));
+                long extracted = Math.min(additional, stockAvailable);
+                if (extracted > 0) used.merge(key, extracted, Sat::add);
+                if (extracted < additional) {
+                    missing.merge(key, additional - extracted, Sat::add);
+                }
+            }
+        }
+        return handled;
+    }
+
+    private long feedbackSeedCredit(
+            ConservativeFeedbackAnalysis.Component<K> component,
+            long rounds,
+            K key,
+            Map<K, Long> used,
+            Map<K, Long> missing,
+            Map<K, Long> external) {
+        long accounted = Sat.add(
+                used.getOrDefault(key, 0L), missing.getOrDefault(key, 0L));
+        if (component.lossy()) {
+            long ordinaryLoss = Sat.mul(
+                    component.lossPerRound().getOrDefault(key, 0L), rounds);
+            accounted = Math.max(0L, accounted - ordinaryLoss);
+        }
+        return Sat.add(accounted, external.getOrDefault(key, 0L));
+    }
+
+    /** Supply entering a feedback SCC from a fired transition that does not consume any SCC state. */
+    private Map<K, Long> externalFeedbackSupply(
+            ConservativeFeedbackAnalysis.Component<K> component,
+            Map<CraftPattern<K>, Long> fired) {
+        Map<K, Long> result = new HashMap<>();
+        for (Map.Entry<CraftPattern<K>, Long> entry : fired.entrySet()) {
+            CraftPattern<K> pattern = entry.getKey();
+            long times = entry.getValue();
+            if (times <= 0 || component.patterns().contains(pattern)) continue;
+            boolean consumesState = pattern.inputs().stream()
+                    .anyMatch(input -> component.states().contains(input.key()));
+            if (consumesState) continue;
+
+            if (component.states().contains(pattern.output())) {
+                result.merge(pattern.output(), Sat.mul(pattern.outputAmount(), times), Sat::add);
+            }
+            for (CraftOutput<K> output : pattern.byproducts()) {
+                if (component.states().contains(output.key())) {
+                    result.merge(output.key(), Sat.mul(output.amount(), times), Sat::add);
+                }
+            }
+            for (CraftInput<K> input : pattern.inputs()) {
+                if (input.remainder() != null && component.states().contains(input.remainder())) {
+                    result.merge(input.remainder(), Sat.mul(input.amount(), times), Sat::add);
+                }
+            }
+        }
+        return result;
     }
 
     /**
@@ -798,13 +975,16 @@ public final class CraftPlannerV2<K> {
             CraftPlan<K> plan,
             Map<K, List<CraftPattern<K>>> firedByOutput,
             Map<K, Long> used,
-            Map<K, Long> missing) {
+            Map<K, Long> missing,
+            Set<CraftPattern<K>> conservativeFeedbackPatterns) {
         Map<K, SeedRequirement<K>> seedRequirements = new HashMap<>();
 
         for (Map.Entry<CraftPattern<K>, Long> consumerEntry : plan.firings().entrySet()) {
             CraftPattern<K> consumer = consumerEntry.getKey();
             long consumerFirings = consumerEntry.getValue();
-            if (consumerFirings <= 0 || consumer.byproducts().size() != 1
+            if (consumerFirings <= 0
+                    || conservativeFeedbackPatterns.contains(consumer)
+                    || consumer.byproducts().size() != 1
                     || ordinaryInputCount(consumer) != 1) {
                 continue;
             }
@@ -1250,6 +1430,7 @@ public final class CraftPlannerV2<K> {
     private boolean directlyRequiresSeedOrder(K output) {
         for (CraftPattern<K> pattern
                 : patternsByOutput.getOrDefault(output, List.of())) {
+            if (craftableConservativeFeedbackPatterns.contains(pattern)) return true;
             for (CraftInput<K> input : pattern.inputs()) {
                 if (!input.returned() || input.uses() != CraftInput.INFINITE_USES) {
                     continue;
@@ -3333,6 +3514,7 @@ public final class CraftPlannerV2<K> {
         private final Map<CraftPattern<K>, Map<K, Long>> linearContainerBootstrapReserves;
         private final Map<CraftPattern<K>, List<FeedbackSeedBootstrap<K>>> feedbackSeedBootstraps;
         private final Map<CraftPattern<K>, List<FeedbackSeedBootstrap<K>>> feedbackSeedConverters;
+        private final List<ConservativeFeedbackAnalysis.Component<K>> conservativeFeedbackComponents;
         private final boolean seedOrdered;
         private final Set<K> seedOrderedDependencyCone;
         private final Map<K, Long> capacity;
@@ -3354,6 +3536,7 @@ public final class CraftPlannerV2<K> {
                 Map<CraftPattern<K>, Map<K, Long>> linearContainerBootstrapReserves,
                 Map<CraftPattern<K>, List<FeedbackSeedBootstrap<K>>> feedbackSeedBootstraps,
                 Map<CraftPattern<K>, List<FeedbackSeedBootstrap<K>>> feedbackSeedConverters,
+                List<ConservativeFeedbackAnalysis.Component<K>> conservativeFeedbackComponents,
                 boolean seedOrdered,
                 Set<K> seedOrderedDependencyCone,
                 Map<K, Long> capacity,
@@ -3373,6 +3556,7 @@ public final class CraftPlannerV2<K> {
             this.linearContainerBootstrapReserves = linearContainerBootstrapReserves;
             this.feedbackSeedBootstraps = feedbackSeedBootstraps;
             this.feedbackSeedConverters = feedbackSeedConverters;
+            this.conservativeFeedbackComponents = List.copyOf(conservativeFeedbackComponents);
             this.seedOrdered = seedOrdered;
             this.seedOrderedDependencyCone = seedOrderedDependencyCone;
             this.capacity = capacity;
