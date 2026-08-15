@@ -175,7 +175,7 @@ public abstract class CraftingCalculationMixin implements FastCraftingControl {
             return;
         }
         var gridNode = simRequester.getGridNode();
-        if (gridNode == null) {
+        if (gridNode == null || !gridNode.isActive()) {
             thunderbolt$fastFallbackAttempts++;
             return;
         }
