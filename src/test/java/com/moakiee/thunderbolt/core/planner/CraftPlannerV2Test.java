@@ -3006,4 +3006,133 @@ class CraftPlannerV2Test {
             assertFalse(plan.missing().isEmpty());
         });
     }
+
+    @Test
+    void fuzzySiblingRouteConsumesStockBeforeCraftingTheDeclaredVariant() {
+        Object fuzzyPattern = new Object();
+        CraftPattern<String> fromStockVariant = new CraftPattern<>(
+                "tier3", 1, List.of(CraftInput.of("tier2-with-other-nbt", 1)), fuzzyPattern);
+        CraftPattern<String> fromDeclaredVariant = new CraftPattern<>(
+                "tier3", 1, List.of(CraftInput.of("tier2-declared-nbt", 1)), fuzzyPattern);
+        CraftPattern<String> makeDeclaredVariant = new CraftPattern<>(
+                "tier2-declared-nbt", 1, List.of(CraftInput.of("tier1", 1)), "tier1-to-tier2");
+        CraftGraph<String> graph = CraftGraph.<String>builder()
+                .pattern(fromStockVariant)
+                .pattern(fromDeclaredVariant)
+                .pattern(makeDeclaredVariant)
+                .stock("tier2-with-other-nbt", 1)
+                .stock("tier1", 64)
+                .build();
+
+        CraftPlan<String> plan = CraftPlannerV2.plan(graph, "tier3", 1);
+
+        assertTrue(plan.feasible());
+        assertEquals(1L, firingsOf(plan, fromStockVariant));
+        assertEquals(0L, firingsOf(plan, fromDeclaredVariant));
+        assertEquals(0L, firingsOf(plan, makeDeclaredVariant));
+        assertEquals(1L, plan.usedStock().get("tier2-with-other-nbt"));
+        assertNull(plan.usedStock().get("tier1"));
+    }
+
+    @Test
+    void fuzzySiblingRouteCraftsOnlyTheAmountMissingAfterStock() {
+        Object fuzzyPattern = new Object();
+        CraftPattern<String> fromStockVariant = new CraftPattern<>(
+                "tier3", 1, List.of(CraftInput.of("tier2-with-other-nbt", 1)), fuzzyPattern);
+        CraftPattern<String> fromDeclaredVariant = new CraftPattern<>(
+                "tier3", 1, List.of(CraftInput.of("tier2-declared-nbt", 1)), fuzzyPattern);
+        CraftPattern<String> makeDeclaredVariant = new CraftPattern<>(
+                "tier2-declared-nbt", 1, List.of(CraftInput.of("tier1", 1)), "tier1-to-tier2");
+        CraftGraph<String> graph = CraftGraph.<String>builder()
+                .pattern(fromStockVariant)
+                .pattern(fromDeclaredVariant)
+                .pattern(makeDeclaredVariant)
+                .stock("tier2-with-other-nbt", 1)
+                .stock("tier1", 64)
+                .build();
+
+        CraftPlan<String> plan = CraftPlannerV2.plan(graph, "tier3", 2);
+
+        assertTrue(plan.feasible());
+        assertEquals(1L, firingsOf(plan, fromStockVariant));
+        assertEquals(1L, firingsOf(plan, fromDeclaredVariant));
+        assertEquals(1L, firingsOf(plan, makeDeclaredVariant));
+        assertEquals(1L, plan.usedStock().get("tier2-with-other-nbt"));
+        assertEquals(1L, plan.usedStock().get("tier1"));
+    }
+
+    @Test
+    void balancedSelfReturnUsesOneBootstrapItemAtBillionScale() {
+        long amount = 1_000_000_000L;
+        CraftPattern<String> pattern = new CraftPattern<>(
+                "B", 1,
+                List.of(CraftInput.of("A", 1), CraftInput.of("C", 1)),
+                List.of(CraftOutput.of("C", 1)),
+                "1A+1C_to_1B+1C");
+        CraftGraph<String> graph = CraftGraph.<String>builder()
+                .pattern(pattern)
+                .stock("A", amount)
+                .stock("C", 1)
+                .build();
+
+        CraftPlan<String> plan = assertTimeoutPreemptively(
+                Duration.ofSeconds(1), () -> CraftPlannerV2.plan(graph, "B", amount));
+
+        assertTrue(plan.feasible(), () -> "missing=" + plan.missing());
+        assertEquals(amount, firingsOf(plan, pattern));
+        assertEquals(amount, plan.usedStock().get("A"));
+        assertEquals(1L, plan.usedStock().get("C"));
+        assertTrue(plan.missing().isEmpty());
+    }
+
+    @Test
+    void balancedSelfReturnCannotBootstrapFromItsOwnOutput() {
+        CraftPattern<String> pattern = new CraftPattern<>(
+                "B", 1,
+                List.of(CraftInput.of("A", 1), CraftInput.of("C", 1)),
+                List.of(CraftOutput.of("C", 1)),
+                "1A+1C_to_1B+1C");
+        CraftGraph<String> graph = CraftGraph.<String>builder()
+                .pattern(pattern)
+                .stock("A", 1_000)
+                .build();
+
+        CraftPlan<String> plan = assertTimeoutPreemptively(
+                Duration.ofSeconds(1), () -> CraftPlannerV2.plan(graph, "B", 1_000));
+
+        assertFalse(plan.feasible());
+        assertEquals(Map.of("C", 1L), plan.missing());
+    }
+
+    @Test
+    void multiStepContainerCycleCraftsOneBootstrapState() {
+        CraftPattern<String> finish = new CraftPattern<>(
+                "result", 1, List.of(CraftInput.consumedReturning("full", 1, "empty")),
+                List.of(CraftOutput.of("empty", 1)), "finish");
+        CraftPattern<String> fill = new CraftPattern<>(
+                "full", 1, List.of(CraftInput.of("dusted", 1)), "fill");
+        CraftPattern<String> dust = new CraftPattern<>(
+                "dusted", 1, List.of(CraftInput.of("empty", 1), CraftInput.of("dust", 2)), "dust");
+        CraftPattern<String> makeEmpty = new CraftPattern<>(
+                "empty", 1, List.of(CraftInput.of("gem", 3)), "makeEmpty");
+        CraftGraph<String> graph = CraftGraph.<String>builder()
+                .pattern(finish)
+                .pattern(fill)
+                .pattern(dust)
+                .pattern(makeEmpty)
+                .stock("dust", 20)
+                .stock("gem", 3)
+                .build();
+
+        CraftPlan<String> plan = CraftPlannerV2.plan(graph, "result", 10);
+
+        assertTrue(plan.feasible(), plan.toString());
+        assertEquals(10L, firingsOf(plan, finish));
+        assertEquals(10L, firingsOf(plan, fill));
+        assertEquals(10L, firingsOf(plan, dust));
+        assertEquals(1L, firingsOf(plan, makeEmpty));
+        assertEquals(20L, plan.usedStock().get("dust"));
+        assertEquals(3L, plan.usedStock().get("gem"));
+        assertTrue(plan.missing().isEmpty());
+    }
 }

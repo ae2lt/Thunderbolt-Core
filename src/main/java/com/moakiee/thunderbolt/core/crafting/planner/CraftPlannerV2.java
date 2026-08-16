@@ -17,6 +17,7 @@ import java.util.Objects;
 import java.util.PriorityQueue;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
+import java.util.function.ToLongFunction;
 
 /**
  * v2 autocrafting planner: an iterative linear backbone plus conflict-directed anytime search over a
@@ -36,8 +37,9 @@ import java.util.concurrent.TimeUnit;
  *       demand draws byproducts first, then stock, then crafts. Multi-output patterns are supported
  *       (a pattern's extra outputs feed sibling demands).</li>
  *   <li><b>Dynamic-capacity greedy</b>: among an item's recipes, the one with the highest current
- *       capacity ({@code stock + craftable}) is preferred, so the planner naturally balances onto the
- *       recipe current stock can actually fulfill (no scarcity metric needed).</li>
+ *       capacity ({@code stock + craftable}) is preferred. Concrete fuzzy expansions of one real
+ *       recipe are kept in a source group and consume already-stocked variants before recursively
+ *       crafting another accepted variant.</li>
  *   <li><b>Budgeted backtracking</b>: contended items (more than one recipe) are searched in
  *       capacity order with a {@code trail} for commit/rollback. No node drops candidates at a fixed
  *       route count: a hot node re-ranks every materially distinct route against the current pools and
@@ -207,6 +209,9 @@ public final class CraftPlannerV2<K> {
     private List<K> activeReplayOrder = List.of();
     private final Set<K> cutOutputs = new LinkedHashSet<>();
     private final Map<CraftPattern<K>, Set<K>> suppressedPositiveFeedbackOutputs =
+            new IdentityHashMap<>();
+    /** One physical remainder batch withheld from linear byproduct credit to start a feedback path. */
+    private final Map<CraftPattern<K>, Map<K, Long>> linearContainerBootstrapReserves =
             new IdentityHashMap<>();
     private final Map<K, Long> reservedSelfSeeds = new HashMap<>();
     /**
@@ -769,6 +774,7 @@ public final class CraftPlannerV2<K> {
                 // cancel the transition's input against its own returned output.
                 requiresSeedOrderedPlanning = true;
             }
+            indexLinearContainerBootstrapReserves();
             indexSeedOrderedDependencyCone(order);
             this.capacity = capacityFromOrder(order, items.size());
             indexCapacityOrder();
@@ -1010,6 +1016,10 @@ public final class CraftPlannerV2<K> {
         IdentityHashMap<CraftPattern<K>, Set<K>> frozenSuppressed = new IdentityHashMap<>();
         suppressedPositiveFeedbackOutputs.forEach(
                 (pattern, outputs) -> frozenSuppressed.put(pattern, Set.copyOf(outputs)));
+        IdentityHashMap<CraftPattern<K>, Map<K, Long>> frozenContainerReserves =
+                new IdentityHashMap<>();
+        linearContainerBootstrapReserves.forEach(
+                (pattern, reserves) -> frozenContainerReserves.put(pattern, Map.copyOf(reserves)));
         IdentityHashMap<CraftPattern<K>, List<FeedbackSeedBootstrap<K>>> frozenBootstraps =
                 new IdentityHashMap<>();
         feedbackSeedBootstraps.forEach(
@@ -1044,6 +1054,7 @@ public final class CraftPlannerV2<K> {
                 Set.copyOf(cutOutputs),
                 frozenPatterns,
                 frozenSuppressed,
+                frozenContainerReserves,
                 frozenBootstraps,
                 frozenConverters,
                 conservativeFeedbackComponents,
@@ -1065,6 +1076,7 @@ public final class CraftPlannerV2<K> {
         cutOutputs.addAll(prepared.cutOutputs);
         patternsByOutput.putAll(prepared.patternsByOutput);
         suppressedPositiveFeedbackOutputs.putAll(prepared.suppressedPositiveFeedbackOutputs);
+        linearContainerBootstrapReserves.putAll(prepared.linearContainerBootstrapReserves);
         feedbackSeedBootstraps.putAll(prepared.feedbackSeedBootstraps);
         feedbackSeedConverters.putAll(prepared.feedbackSeedConverters);
         conservativeFeedbackComponents = prepared.conservativeFeedbackComponents;
@@ -1498,6 +1510,54 @@ public final class CraftPlannerV2<K> {
             if (key.equals(output.key())) result = Sat.add(result, output.amount());
         }
         return result;
+    }
+
+    /**
+     * The linear pass aggregates all byproducts before resolving their consumers. For a path such as
+     * {@code full -> intermediate -> empty}, crediting every returned {@code empty} lets the path
+     * bootstrap itself from zero physical containers. Withhold one returned batch so ordinary demand
+     * obtains that bootstrap from stock or a real producer; the remaining returns still serve the
+     * rest of the batch.
+     */
+    private void indexLinearContainerBootstrapReserves() {
+        linearContainerBootstrapReserves.clear();
+        for (List<CraftPattern<K>> patterns : patternsByOutput.values()) {
+            PlanningCancellation.check();
+            for (CraftPattern<K> consumer : patterns) {
+                Map<K, Long> reserves = new HashMap<>();
+                for (CraftInput<K> transition : consumer.inputs()) {
+                    K remainder = transition.remainder();
+                    if (remainder == null || transition.key().equals(remainder)) continue;
+                    long returned = byproductAmount(consumer, remainder);
+                    if (returned <= 0 || !dependsOn(transition.key(), remainder)) continue;
+                    reserves.merge(remainder, transition.amount(), Sat::add);
+                }
+                reserves.replaceAll((key, required) ->
+                        Math.min(required, byproductAmount(consumer, key)));
+                reserves.values().removeIf(amount -> amount <= 0);
+                if (!reserves.isEmpty()) {
+                    linearContainerBootstrapReserves.put(consumer, Map.copyOf(reserves));
+                }
+            }
+        }
+    }
+
+    private boolean dependsOn(K output, K requiredInput) {
+        Set<K> seen = new HashSet<>();
+        Deque<K> queue = new ArrayDeque<>();
+        seen.add(output);
+        queue.add(output);
+        while (!queue.isEmpty()) {
+            PlanningCancellation.check();
+            K current = queue.removeFirst();
+            for (CraftPattern<K> pattern : patternsByOutput.getOrDefault(current, List.of())) {
+                for (CraftInput<K> input : pattern.inputs()) {
+                    if (requiredInput.equals(input.key())) return true;
+                    if (seen.add(input.key())) queue.addLast(input.key());
+                }
+            }
+        }
+        return false;
     }
 
     private boolean mayReuseByproduct(CraftPattern<K> pattern, K key) {
@@ -2028,8 +2088,8 @@ public final class CraftPlannerV2<K> {
             for (CraftPattern<K> pattern : ordered) {
                 capacityScore(pattern);
             }
-            ordered.sort((left, right) ->
-                    Long.compare(capacityScore(right), capacityScore(left)));
+            ordered = groupedCapacityOrder(
+                    ordered, this::capacityScore, this::preexistingStockCapacity);
             capacityOrderByOutput.put(entry.getKey(), List.copyOf(ordered));
         }
     }
@@ -2040,6 +2100,16 @@ public final class CraftPlannerV2<K> {
             return cached;
         }
         return producibleVia(pattern, capacity, capacityScoreByPattern);
+    }
+
+    /** Capacity supplied directly by the immutable inventory snapshot. */
+    private long preexistingStockCapacity(CraftPattern<K> pattern) {
+        long bound = Sat.SAT;
+        for (CraftInput<K> input : pattern.inputs()) {
+            bound = Math.min(bound, input.firingsFrom(graph.stock(input.key())));
+            if (bound == 0) return 0L;
+        }
+        return Sat.mul(bound, pattern.outputAmount());
     }
 
     private void indexDirectRawConsumables() {
@@ -3297,8 +3367,10 @@ public final class CraftPlannerV2<K> {
                                 Map<CraftPattern<K>, Long> capUnits,
                                 Map<CraftPattern<K>, Long> allocatedUnits,
                                 Map<K, Long> diagnosticUnitCosts) {
-        List<CraftPattern<K>> ordered = new ArrayList<>(ps);
-        ordered.sort((a, b) -> Long.compare(capRemainingVia(b, need), capRemainingVia(a, need)));
+        List<CraftPattern<K>> ordered = groupedCapacityOrder(
+                ps,
+                pattern -> capRemainingVia(pattern, need),
+                pattern -> preexistingStockRemainingCapacity(pattern, need));
 
         for (CraftPattern<K> r : ordered) {
             if (d <= 0) {
@@ -3464,6 +3536,7 @@ public final class CraftPlannerV2<K> {
                             Map<K, Long> need, Map<K, Long> bp,
                             Map<K, Long> returnedSeedReserve,
                             Map<CraftPattern<K>, Long> fired) {
+        long previousFirings = fired.getOrDefault(r, 0L);
         fired.merge(r, t, Sat::add);
         for (CraftInput<K> in : r.inputs()) {
             long amt = in.unitsFor(t); // closed form: normal=amount·t, catalyst=amount, finite-use=amount·ceil(t/uses)
@@ -3479,9 +3552,22 @@ public final class CraftPlannerV2<K> {
                 need.merge(in.key(), amt, Sat::add);
             }
         }
+        Map<K, Long> bootstrapReserves = new HashMap<>(
+                linearContainerBootstrapReserves.getOrDefault(r, Map.of()));
+        bootstrapReserves.replaceAll((key, reserve) -> Math.max(
+                0L, reserve - Math.min(
+                        reserve, Sat.mul(byproductAmount(r, key), previousFirings))));
         for (CraftOutput<K> out : r.byproducts()) {
             if (mayReuseByproduct(r, out.key())) {
-                bp.merge(out.key(), Sat.mul(out.amount(), t), Sat::add);
+                long produced = Sat.mul(out.amount(), t);
+                long withheld = Math.min(
+                        produced, bootstrapReserves.getOrDefault(out.key(), 0L));
+                if (withheld > 0) {
+                    bootstrapReserves.put(out.key(), bootstrapReserves.get(out.key()) - withheld);
+                }
+                if (produced > withheld) {
+                    bp.merge(out.key(), produced - withheld, Sat::add);
+                }
             }
         }
         long surplus = Sat.mul(t, r.outputAmount()) - consumedOwn;
@@ -3501,6 +3587,78 @@ public final class CraftPlannerV2<K> {
             }
         }
         return Sat.mul(bound, r.outputAmount());
+    }
+
+    private long preexistingStockRemainingCapacity(
+            CraftPattern<K> pattern, Map<K, Long> need) {
+        long bound = Sat.SAT;
+        for (CraftInput<K> input : pattern.inputs()) {
+            long remaining = Math.max(
+                    0L, graph.stock(input.key()) - need.getOrDefault(input.key(), 0L));
+            bound = Math.min(bound, input.firingsFrom(remaining));
+            if (bound == 0) return 0L;
+        }
+        return Sat.mul(bound, pattern.outputAmount());
+    }
+
+    /**
+     * Orders real recipes by total capacity, but keeps concrete fuzzy expansions of the same source
+     * together and consumes their stocked variants first.
+     */
+    private List<CraftPattern<K>> groupedCapacityOrder(
+            List<CraftPattern<K>> patterns,
+            ToLongFunction<CraftPattern<K>> totalCapacity,
+            ToLongFunction<CraftPattern<K>> directStockCapacity) {
+        if (patterns.size() < 2) return patterns;
+
+        List<List<CraftPattern<K>>> groups = new ArrayList<>();
+        IdentityHashMap<Object, List<CraftPattern<K>>> bySource = new IdentityHashMap<>();
+        for (CraftPattern<K> pattern : patterns) {
+            Object source = pattern.source();
+            if (source == null) {
+                groups.add(new ArrayList<>(List.of(pattern)));
+                continue;
+            }
+            List<CraftPattern<K>> group = bySource.get(source);
+            if (group == null) {
+                group = new ArrayList<>();
+                bySource.put(source, group);
+                groups.add(group);
+            }
+            group.add(pattern);
+        }
+
+        for (List<CraftPattern<K>> group : groups) {
+            if (group.size() > 1) {
+                group.sort((left, right) -> {
+                    int byStock = Long.compare(
+                            directStockCapacity.applyAsLong(right),
+                            directStockCapacity.applyAsLong(left));
+                    return byStock != 0
+                            ? byStock
+                            : Long.compare(
+                                    totalCapacity.applyAsLong(right),
+                                    totalCapacity.applyAsLong(left));
+                });
+            }
+        }
+        groups.sort((left, right) -> Long.compare(
+                maxCapacity(right, totalCapacity),
+                maxCapacity(left, totalCapacity)));
+
+        List<CraftPattern<K>> ordered = new ArrayList<>(patterns.size());
+        for (List<CraftPattern<K>> group : groups) ordered.addAll(group);
+        return ordered;
+    }
+
+    private long maxCapacity(
+            List<CraftPattern<K>> patterns,
+            ToLongFunction<CraftPattern<K>> capacityFunction) {
+        long best = 0L;
+        for (CraftPattern<K> pattern : patterns) {
+            best = Math.max(best, capacityFunction.applyAsLong(pattern));
+        }
+        return best;
     }
 
     private long lget(Map<K, Long> m, K k) {
@@ -4982,6 +5140,7 @@ public final class CraftPlannerV2<K> {
         private final Set<K> cutOutputs;
         private final Map<K, List<CraftPattern<K>>> patternsByOutput;
         private final Map<CraftPattern<K>, Set<K>> suppressedPositiveFeedbackOutputs;
+        private final Map<CraftPattern<K>, Map<K, Long>> linearContainerBootstrapReserves;
         private final Map<CraftPattern<K>, List<FeedbackSeedBootstrap<K>>> feedbackSeedBootstraps;
         private final Map<CraftPattern<K>, List<FeedbackSeedBootstrap<K>>> feedbackSeedConverters;
         private final List<ConservativeFeedbackAnalysis.Component<K>> conservativeFeedbackComponents;
@@ -5006,6 +5165,7 @@ public final class CraftPlannerV2<K> {
                 Set<K> cutOutputs,
                 Map<K, List<CraftPattern<K>>> patternsByOutput,
                 Map<CraftPattern<K>, Set<K>> suppressedPositiveFeedbackOutputs,
+                Map<CraftPattern<K>, Map<K, Long>> linearContainerBootstrapReserves,
                 Map<CraftPattern<K>, List<FeedbackSeedBootstrap<K>>> feedbackSeedBootstraps,
                 Map<CraftPattern<K>, List<FeedbackSeedBootstrap<K>>> feedbackSeedConverters,
                 List<ConservativeFeedbackAnalysis.Component<K>> conservativeFeedbackComponents,
@@ -5028,6 +5188,7 @@ public final class CraftPlannerV2<K> {
             this.cutOutputs = cutOutputs;
             this.patternsByOutput = patternsByOutput;
             this.suppressedPositiveFeedbackOutputs = suppressedPositiveFeedbackOutputs;
+            this.linearContainerBootstrapReserves = linearContainerBootstrapReserves;
             this.feedbackSeedBootstraps = feedbackSeedBootstraps;
             this.feedbackSeedConverters = feedbackSeedConverters;
             this.conservativeFeedbackComponents = List.copyOf(conservativeFeedbackComponents);

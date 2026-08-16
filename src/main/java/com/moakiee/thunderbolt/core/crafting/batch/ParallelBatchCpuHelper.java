@@ -2,16 +2,22 @@ package com.moakiee.thunderbolt.core.crafting.batch;
 
 import com.moakiee.thunderbolt.core.crafting.batch.SharedBatchInputPattern;
 
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 
 import org.jetbrains.annotations.Nullable;
+
+import net.minecraft.world.level.Level;
 
 import appeng.api.config.Actionable;
 import appeng.api.crafting.IPatternDetails;
 import appeng.api.stacks.AEKey;
 import appeng.api.stacks.KeyCounter;
+import appeng.crafting.execution.CraftingCpuHelper;
+import appeng.crafting.inv.ICraftingInventory;
 import appeng.crafting.inv.ListCraftingInventory;
 
 import com.moakiee.thunderbolt.api.crafting.batch.BatchJobView;
@@ -115,15 +121,117 @@ public final class ParallelBatchCpuHelper {
         return new BulkResult(scaled, actual, chosenKeys, units, shared);
     }
 
+    /**
+     * Resolves the first concrete copy with AE2's native substitution rules, then scales only that
+     * homogeneous input set. Different component variants therefore become separate batches.
+     */
+    @Nullable
+    public static BulkResult bulkExtract(IPatternDetails details, ListCraftingInventory inv, long maxCraft,
+                                         boolean allowSharedInputs, Map<AEKey, Long> reservedStock,
+                                         Level level) {
+        if (maxCraft <= 0) return null;
+
+        var guardedInventory = new ReservedInventory(inv, reservedStock);
+        var resolved = extractOneCopy(details, guardedInventory, allowSharedInputs, level);
+        if (resolved == null) return null;
+
+        int slots = resolved.inputs.length;
+        var scalablePerCopy = new KeyCounter[slots];
+        var sharedPerBatch = new KeyCounter[slots];
+        var scalableDemand = new HashMap<AEKey, Long>(slots * 2);
+        for (int slot = 0; slot < slots; slot++) {
+            scalablePerCopy[slot] = new KeyCounter();
+            sharedPerBatch[slot] = new KeyCounter();
+            for (var entry : resolved.inputs[slot]) {
+                boolean shared = allowSharedInputs
+                        && SharedBatchInputs.isSharedInput(details, slot, entry.getKey());
+                var target = shared ? sharedPerBatch[slot] : scalablePerCopy[slot];
+                target.add(entry.getKey(), entry.getLongValue());
+                if (!shared) {
+                    scalableDemand.merge(
+                            entry.getKey(), entry.getLongValue(), ParallelBatchCpuHelper::saturatingAdd);
+                }
+            }
+        }
+
+        long additionalCopies = maxCraft - 1;
+        for (var entry : scalableDemand.entrySet()) {
+            long available = guardedInventory.extract(entry.getKey(), Long.MAX_VALUE, Actionable.SIMULATE);
+            additionalCopies = Math.min(additionalCopies, available / entry.getValue());
+        }
+
+        var additionalExtracted = new HashMap<AEKey, Long>(scalableDemand.size() * 2);
+        if (additionalCopies > 0) {
+            for (var entry : scalableDemand.entrySet()) {
+                long needed = saturatingMultiply(entry.getValue(), additionalCopies);
+                long extracted = guardedInventory.extract(entry.getKey(), needed, Actionable.MODULATE);
+                additionalExtracted.put(entry.getKey(), extracted);
+                if (extracted < needed) {
+                    for (var rollback : additionalExtracted.entrySet()) {
+                        guardedInventory.insert(rollback.getKey(), rollback.getValue(), Actionable.MODULATE);
+                    }
+                    CraftingCpuHelper.reinjectPatternInputs(guardedInventory, resolved.inputs);
+                    return null;
+                }
+            }
+        }
+
+        long actualCopies = additionalCopies + 1;
+        var scaled = new KeyCounter[slots];
+        for (int slot = 0; slot < slots; slot++) {
+            scaled[slot] = new KeyCounter();
+            scaled[slot].addAll(sharedPerBatch[slot]);
+            addScaled(scaled[slot], scalablePerCopy[slot], actualCopies);
+        }
+        return new BulkResult(
+                scaled, actualCopies, scalablePerCopy, sharedPerBatch, resolved.remainders);
+    }
+
+    @Nullable
+    private static ResolvedCopy extractOneCopy(IPatternDetails details,
+                                               ICraftingInventory inventory,
+                                               boolean allowSharedInputs,
+                                               Level level) {
+        var inputs = details.getInputs();
+        var resolved = new KeyCounter[inputs.length];
+        var remainders = new ArrayList<RemainderSpec>();
+        for (int slot = 0; slot < inputs.length; slot++) {
+            var input = inputs[slot];
+            var holder = resolved[slot] = new KeyCounter();
+            long remainingMultiplier = input.getMultiplier();
+            for (var template : CraftingCpuHelper.getValidItemTemplates(inventory, input, level)) {
+                long extracted = CraftingCpuHelper.extractTemplates(
+                        inventory, template, remainingMultiplier);
+                if (extracted <= 0) continue;
+
+                holder.add(template.key(), saturatingMultiply(extracted, template.amount()));
+                var remaining = input.getRemainingKey(template.key());
+                if (remaining != null) {
+                    boolean shared = allowSharedInputs
+                            && SharedBatchInputs.isSharedInput(details, slot, template.key());
+                    remainders.add(new RemainderSpec(remaining, extracted, shared));
+                }
+                remainingMultiplier -= extracted;
+                if (remainingMultiplier == 0) break;
+            }
+            if (remainingMultiplier > 0) {
+                CraftingCpuHelper.reinjectPatternInputs(inventory, resolved);
+                return null;
+            }
+        }
+        return new ResolvedCopy(resolved, List.copyOf(remainders));
+    }
+
     public static void reinject(BulkResult result, long leftoverCopies, ListCraftingInventory inv) {
         if (leftoverCopies <= 0) return;
         long returnedCopies = Math.min(leftoverCopies, result.remainingCopies);
         for (int slot = 0; slot < result.scaledInputs.length; slot++) {
-            if (result.sharedInputs[slot]) continue;
-            long amount = saturatingMultiply(result.units[slot], returnedCopies);
-            if (amount > 0 && result.keys[slot] != null) {
-                inv.insert(result.keys[slot], amount, Actionable.MODULATE);
-                result.scaledInputs[slot].remove(result.keys[slot], amount);
+            for (var entry : result.scalablePerCopy[slot]) {
+                long amount = saturatingMultiply(entry.getLongValue(), returnedCopies);
+                if (amount > 0) {
+                    inv.insert(entry.getKey(), amount, Actionable.MODULATE);
+                    result.scaledInputs[slot].remove(entry.getKey(), amount);
+                }
             }
         }
         result.remainingCopies -= returnedCopies;
@@ -132,17 +240,29 @@ public final class ParallelBatchCpuHelper {
 
     public static void registerExpectedOutputs(BatchJobView job, IPatternDetails details,
                                                BulkResult result, long dispatched) {
-        registerExpectedOutputs(job, details, result.keys, result.sharedInputs, dispatched);
+        if (dispatched <= 0) return;
+        registerPatternOutputs(job, details, dispatched);
+        if (result.remainders != null) {
+            for (var remainder : result.remainders) {
+                long copies = remainder.shared ? 1L : dispatched;
+                long count = saturatingMultiply(remainder.count, copies);
+                job.insertWaitingFor(remainder.key, count);
+                job.addContainerMaxItems(count, remainder.key.getType());
+            }
+        } else {
+            registerLegacyRemainders(
+                    job, details, result.keys, result.sharedInputs, dispatched);
+        }
     }
 
     public static void registerExpectedOutputs(BatchJobView job, IPatternDetails details,
                                                AEKey[] chosenKeys, long dispatched) {
-        registerExpectedOutputs(job, details, chosenKeys, null, dispatched);
+        if (dispatched <= 0) return;
+        registerPatternOutputs(job, details, dispatched);
+        registerLegacyRemainders(job, details, chosenKeys, null, dispatched);
     }
 
-    private static void registerExpectedOutputs(BatchJobView job, IPatternDetails details,
-                                                AEKey[] chosenKeys, boolean[] shared, long dispatched) {
-        if (dispatched <= 0) return;
+    private static void registerPatternOutputs(BatchJobView job, IPatternDetails details, long dispatched) {
         var sharedPattern = details instanceof SharedBatchInputPattern pattern
                 ? pattern : null;
         var sharedOutputsLeft = new HashMap<AEKey, Long>();
@@ -158,6 +278,10 @@ public final class ParallelBatchCpuHelper {
             job.insertWaitingFor(output.what(), saturatingAdd(
                     sharedAmount, saturatingMultiply(scalable, dispatched)));
         }
+    }
+
+    private static void registerLegacyRemainders(BatchJobView job, IPatternDetails details,
+                                                 AEKey[] chosenKeys, boolean[] shared, long dispatched) {
         var inputs = details.getInputs();
         for (int slot = 0; slot < inputs.length; slot++) {
             var input = inputs[slot];
@@ -189,10 +313,8 @@ public final class ParallelBatchCpuHelper {
         var slice = new KeyCounter[result.scaledInputs.length];
         for (int slot = 0; slot < slice.length; slot++) {
             slice[slot] = new KeyCounter();
-            long amount = result.sharedInputs[slot]
-                    ? result.units[slot]
-                    : saturatingMultiply(Math.max(0, sliceCount), result.units[slot]);
-            if (amount > 0 && result.keys[slot] != null) slice[slot].add(result.keys[slot], amount);
+            slice[slot].addAll(result.sharedPerBatch[slot]);
+            addScaled(slice[slot], result.scalablePerCopy[slot], Math.max(0, sliceCount));
         }
         return slice;
     }
@@ -201,14 +323,16 @@ public final class ParallelBatchCpuHelper {
         if (dispatchedCopies <= 0) return;
         long accepted = Math.min(dispatchedCopies, result.remainingCopies);
         for (int slot = 0; slot < result.scaledInputs.length; slot++) {
-            long amount;
-            if (result.sharedInputs[slot]) {
-                amount = result.sharedDispatched ? 0L : result.units[slot];
-            } else {
-                amount = saturatingMultiply(result.units[slot], accepted);
+            for (var entry : result.scalablePerCopy[slot]) {
+                long amount = saturatingMultiply(entry.getLongValue(), accepted);
+                if (amount > 0) {
+                    result.scaledInputs[slot].remove(entry.getKey(), amount);
+                }
             }
-            if (amount > 0 && result.keys[slot] != null) {
-                result.scaledInputs[slot].remove(result.keys[slot], amount);
+            if (!result.sharedDispatched) {
+                for (var entry : result.sharedPerBatch[slot]) {
+                    result.scaledInputs[slot].remove(entry.getKey(), entry.getLongValue());
+                }
             }
         }
         result.sharedDispatched = true;
@@ -221,6 +345,10 @@ public final class ParallelBatchCpuHelper {
         final AEKey[] keys;
         final long[] units;
         final boolean[] sharedInputs;
+        final KeyCounter[] scalablePerCopy;
+        final KeyCounter[] sharedPerBatch;
+        @Nullable
+        final List<RemainderSpec> remainders;
         long remainingCopies;
         boolean sharedDispatched;
 
@@ -231,15 +359,91 @@ public final class ParallelBatchCpuHelper {
             this.keys = Arrays.copyOf(keys, keys.length);
             this.units = Arrays.copyOf(units, units.length);
             this.sharedInputs = Arrays.copyOf(sharedInputs, sharedInputs.length);
+            this.scalablePerCopy = new KeyCounter[scaledInputs.length];
+            this.sharedPerBatch = new KeyCounter[scaledInputs.length];
+            for (int slot = 0; slot < scaledInputs.length; slot++) {
+                this.scalablePerCopy[slot] = new KeyCounter();
+                this.sharedPerBatch[slot] = new KeyCounter();
+                if (keys[slot] != null && units[slot] > 0) {
+                    (sharedInputs[slot] ? this.sharedPerBatch[slot] : this.scalablePerCopy[slot])
+                            .add(keys[slot], units[slot]);
+                }
+            }
+            this.remainders = null;
             this.remainingCopies = actualCopies;
+        }
+
+        private BulkResult(KeyCounter[] scaledInputs, long actualCopies,
+                           KeyCounter[] scalablePerCopy, KeyCounter[] sharedPerBatch,
+                           List<RemainderSpec> remainders) {
+            this.scaledInputs = scaledInputs;
+            this.actualCopies = actualCopies;
+            this.keys = new AEKey[scaledInputs.length];
+            this.units = new long[scaledInputs.length];
+            this.sharedInputs = new boolean[scaledInputs.length];
+            this.scalablePerCopy = scalablePerCopy;
+            this.sharedPerBatch = sharedPerBatch;
+            this.remainders = remainders;
+            this.remainingCopies = actualCopies;
+        }
+
+        public boolean hasSharedInputs() {
+            for (var counter : sharedPerBatch) {
+                if (counter.iterator().hasNext()) return true;
+            }
+            return false;
         }
 
         private void reinjectShared(ListCraftingInventory inv) {
             for (int slot = 0; slot < scaledInputs.length; slot++) {
-                if (!sharedInputs[slot] || keys[slot] == null) continue;
-                inv.insert(keys[slot], units[slot], Actionable.MODULATE);
-                scaledInputs[slot].remove(keys[slot], units[slot]);
+                for (var entry : sharedPerBatch[slot]) {
+                    inv.insert(entry.getKey(), entry.getLongValue(), Actionable.MODULATE);
+                    scaledInputs[slot].remove(entry.getKey(), entry.getLongValue());
+                }
             }
+        }
+    }
+
+    private static void addScaled(KeyCounter target, KeyCounter source, long scale) {
+        if (scale <= 0) return;
+        for (var entry : source) {
+            target.add(entry.getKey(), saturatingMultiply(entry.getLongValue(), scale));
+        }
+    }
+
+    private record ResolvedCopy(KeyCounter[] inputs, List<RemainderSpec> remainders) {
+    }
+
+    private record RemainderSpec(AEKey key, long count, boolean shared) {
+    }
+
+    private static final class ReservedInventory implements ICraftingInventory {
+        private final ListCraftingInventory delegate;
+        private final Map<AEKey, Long> reserved;
+
+        private ReservedInventory(ListCraftingInventory delegate, Map<AEKey, Long> reserved) {
+            this.delegate = delegate;
+            this.reserved = reserved != null ? reserved : Map.of();
+        }
+
+        @Override
+        public void insert(AEKey what, long amount, Actionable mode) {
+            delegate.insert(what, amount, mode);
+        }
+
+        @Override
+        public long extract(AEKey what, long amount, Actionable mode) {
+            long available = delegate.extract(what, Long.MAX_VALUE, Actionable.SIMULATE);
+            long protectedAmount = Math.max(0L, reserved.getOrDefault(what, 0L));
+            long extractable = Math.max(0L, available - protectedAmount);
+            long allowed = Math.min(Math.max(0L, amount), extractable);
+            return mode == Actionable.SIMULATE
+                    ? allowed : delegate.extract(what, allowed, Actionable.MODULATE);
+        }
+
+        @Override
+        public Iterable<AEKey> findFuzzyTemplates(AEKey input) {
+            return delegate.findFuzzyTemplates(input);
         }
     }
 

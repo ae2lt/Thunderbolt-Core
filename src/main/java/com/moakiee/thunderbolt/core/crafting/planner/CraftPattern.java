@@ -11,8 +11,8 @@ import java.util.Objects;
  * {@link CraftOutput byproduct}. The v1 closed-form planner ignores byproducts (and its caller
  * declines such patterns), while the v2 planner ({@code CraftPlannerV2}) routes byproducts into a
  * shared pool for opportunistic reuse. {@code source} is an opaque handle back to the original recipe
- * object (e.g. AE2 {@code IPatternDetails}); the planner never inspects it and uses object identity
- * for {@link CraftPlan#firings()} keys.
+ * object (e.g. AE2 {@code IPatternDetails}); the planner uses its identity to group concrete fuzzy
+ * expansions of one real recipe and as the {@link CraftPlan#firings()} key.
  *
  * @param <K> item key type
  */

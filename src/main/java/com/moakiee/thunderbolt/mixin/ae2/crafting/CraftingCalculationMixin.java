@@ -150,7 +150,7 @@ public abstract class CraftingCalculationMixin implements CraftingPlanningContro
         thunderbolt$selectedEngine = null;
         thunderbolt$selectedVanilla = false;
 
-        ThunderboltCore.LOGGER.info(
+        ThunderboltCore.LOGGER.debug(
                 "[Thunderbolt Core][crafting-planner] started: output={} requested={} candidates={}",
                 output, requestedAmount,
                 thunderbolt$candidates.stream().map(CapturedPlanningChoice::choice).toList());
@@ -255,7 +255,7 @@ public abstract class CraftingCalculationMixin implements CraftingPlanningContro
         cir.setReturnValue(result);
         double wallMs = TimeUnit.NANOSECONDS.toMicros(Math.max(
                 0L, System.nanoTime() - thunderbolt$calculationStartedNanos)) / 1_000.0D;
-        ThunderboltCore.LOGGER.info(
+        ThunderboltCore.LOGGER.debug(
                 "[Thunderbolt Core][crafting-planner] finished: output={} requested={} wallMs={} "
                         + "selected={} attempts={} handled={} declinedEngines={} result={}",
                 output, requestedAmount, wallMs,

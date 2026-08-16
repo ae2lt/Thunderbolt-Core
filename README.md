@@ -1,40 +1,46 @@
 # Thunderbolt Core
 
+[简体中文](README_zh_CN.md)
+
 Thunderbolt Core is the shared AE2 optimization and infrastructure layer for
-AE2 Lightning Tech.
+AE2 Lightning Tech. It can also be installed as a standalone AE2 crafting
+accelerator.
 
-- Mod name: `Thunderbolt Core`
-- Mod id: `thunderbolt`
-- Java namespace: `com.moakiee.thunderbolt`
-- Maven coordinate: `com.moakiee.thunderbolt:thunderbolt:1.0.0` (version tracks `mod_version` in `gradle.properties`)
-- Minecraft / loader: Minecraft `1.21.1`, NeoForge `21.1.x`
+## Requirements
 
-## What It Provides
+- Minecraft `1.21.1`
+- NeoForge `21.1.x` (development baseline: `21.1.219`)
+- Applied Energistics 2 `19.2.17`–`19.2.x`
 
-Thunderbolt Core hosts low-level AE2 hooks used by AE2LT and compatible addons:
+Place Thunderbolt Core and AE2 in the `mods` directory on both the client and
+server.
 
-- a fast autocrafting planner installed through AE2 mixins
-- batch crafting helpers and public crafting extension APIs
-- overloaded-channel helpers used by AE2 Lightning Tech
-- pure planner/cell/crafting-core utilities with unit tests
+## Features
 
-The runtime mod can be used independently as an AE2 crafting accelerator, while
-AE2 Lightning Tech depends on it for its overloaded network and matrix crafting
-infrastructure.
+- fast AE2 autocrafting planning and batch dispatch
+- crafting extension APIs for compatible addons
+- overloaded-channel and matrix-crafting infrastructure for AE2LT
+- optional compatibility hooks for Advanced AE, NeoECO, AE2 Crafting Tree,
+  and ExtendedAE Plus
 
-## Build
+## Runtime Options
+
+- `-Dthunderbolt.watchdogMs=<ms>`: first slow-planning warning delay
+- `-Dthunderbolt.watchdogRepeatMs=<ms>`: repeated warning interval
+- `-Dthunderbolt.maxCraftSearchWork=<count>`: planner search-work budget
+- `-Dthunderbolt.maxCraftDepth=<count>`: planner depth limit
+
+## Development
 
 ```powershell
 .\gradlew.bat build
 ```
 
-To publish the local Maven artifact consumed by AE2 Lightning Tech:
-
 ```powershell
 .\gradlew.bat publishToMavenLocal
 ```
 
-## Runtime Switches
+Maven coordinate: `com.moakiee.thunderbolt:thunderbolt:1.0.3`.
 
-- `-Dthunderbolt.watchdogMs=<ms>` changes the first slow-planning warning delay.
-- `-Dthunderbolt.watchdogRepeatMs=<ms>` changes repeated slow-planning warnings.
+Issues: [GitHub Issues](https://github.com/ae2lt/Thunderbolt-Core/issues) ·
+License: [GNU LGPL 3.0](LICENSE)

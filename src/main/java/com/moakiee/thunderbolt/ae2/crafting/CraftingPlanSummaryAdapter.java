@@ -7,22 +7,27 @@ import appeng.api.networking.crafting.ICraftingPlan;
 import appeng.api.stacks.KeyCounter;
 import appeng.crafting.CraftingPlan;
 
+import com.moakiee.thunderbolt.core.crafting.plan.LoopCraftingPlan;
+
 /** Builds concrete, display-only AE2 plans for integrations that cast the public plan interface. */
 public final class CraftingPlanSummaryAdapter {
-
     private CraftingPlanSummaryAdapter() {
     }
 
     /**
      * Returns a concrete AE2 plan containing the interface-visible state of {@code plan}.
      *
-     * <p>The returned value is only for summary/display code. Menu storage and CPU submission must
-     * retain the original plan because it may carry private routing or execution metadata.
+     * <p>The returned value must only be passed to summary/display code. The original plan remains
+     * authoritative for menu storage and CPU submission because third-party implementations may
+     * carry routing, reservation, or execution metadata outside {@link ICraftingPlan}.
      */
     public static CraftingPlan adapt(ICraftingPlan plan) {
         Objects.requireNonNull(plan, "plan");
         if (plan instanceof CraftingPlan craftingPlan) {
             return craftingPlan;
+        }
+        if (plan instanceof LoopCraftingPlan loopPlan) {
+            return loopPlan.delegate();
         }
         return new CraftingPlan(
                 plan.finalOutput(),

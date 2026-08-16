@@ -280,9 +280,22 @@ public final class BatchExecutor {
             if (budget <= 0) continue;
 
             var result = ParallelBatchCpuHelper.bulkExtract(
-                    details, inv, budget, true, reservedStock);
+                    details, inv, budget, true, reservedStock, job.level());
             if (result == null) {
                 continue;
+            }
+            if (result.hasSharedInputs() && !hasSharedInputs) {
+                eligible.removeIf(provider -> !provider.provider().supportsSharedBatchInputs());
+                if (eligible.isEmpty()) {
+                    ParallelBatchCpuHelper.reinject(result, result.actualCopies, inv);
+                    continue;
+                }
+                if (eligible.size() > 1) {
+                    eligible.sort(java.util.Comparator
+                            .comparing((EligibleProvider provider) -> provider.mode() != BatchDispatchMode.UNBOUNDED)
+                            .thenComparing(EligibleProvider::capacity, java.util.Comparator.reverseOrder()));
+                    eligible.subList(1, eligible.size()).clear();
+                }
             }
 
             long realCraft = result.actualCopies;
