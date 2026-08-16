@@ -35,6 +35,8 @@
   ],
   "client": [
     "ae2.client.CraftConfirmScreenMixin",
+    "ae2.client.CPUSelectionListStorageMixin",
+    "ae2.client.CraftConfirmScreenCpuStatusMixin",
     "ae2.client.TooltipsByteAmountMixin"
   ],
   "injectors": {

@@ -34,8 +34,8 @@ api.crafting
 
 ```text
 core.crafting
-├── algorithm              候选路由状态、deadline 监控与默认算法适配
-├── planner                FastCraftingPlanner、图模型、反馈环和冲突求解
+├── algorithm              候选路由状态、deadline 监控与回退编排
+├── planner                默认引擎适配、FastCraftingPlanner、图模型、反馈环和冲突求解
 ├── pattern                Planner 的通用样板能力
 ├── overload               过载样板的 planner-facing 元数据
 ├── loop                   闭环宏样板、种子、任务顺序和 CPU 限制
@@ -59,7 +59,8 @@ AE2 `CraftingPlan` 的具体包装、可复用库存分配和宿主借用记录�
 - AE2CT/菜单所需的只读计划摘要；
 - AdvancedAE、NeoECO 等版本相关适配。
 
-Mixin 不拥有闭环种子账本、过载输出认领或产品持久化状态。
+Mixin 不拥有闭环种子账本、过载输出认领或产品持久化状态。无限 CPU 容量显示等只依赖
+Thunderbolt core 的 AE2 客户端适配也由 Thunderbolt 自己注册，不下放给 AE2LT。
 
 Batch 热路径直接把现有 `BatchJobView` 传给
 `pushBatch(details, template, maxCraft, job)`，不创建 dispatch context，也不复制 template
@@ -98,6 +99,8 @@ Thunderbolt 不依赖 AE2LT
 
 `CraftPlannerV2` 只计算图上的库存、样板 firing、缺失和可行性，不负责真实机器下发。
 `FastCraftingPlanner` 负责把 AE2 快照转换为通用图，再把结果转换回 AE2 `CraftingPlan`。
+`ThunderboltV2PlanningEngine` 与它适配的 planner 同处 `core.crafting.planner`，算法路由包不再
+反向拥有具体 planner 的引擎包装。
 
 ## 核心样板契约
 

@@ -1,4 +1,4 @@
-package com.moakiee.thunderbolt.core.crafting.algorithm;
+package com.moakiee.thunderbolt.core.crafting.planner;
 
 import java.util.IdentityHashMap;
 import java.util.Map;
@@ -20,9 +20,6 @@ import com.moakiee.thunderbolt.api.crafting.PlanningExitException;
 import com.moakiee.thunderbolt.api.crafting.PlanningEngineSession;
 import com.moakiee.thunderbolt.api.crafting.PlanningRequest;
 import com.moakiee.thunderbolt.core.crafting.pattern.CraftingStockPolicy;
-import com.moakiee.thunderbolt.core.crafting.planner.FastCraftingPlanner;
-import com.moakiee.thunderbolt.core.crafting.planner.PlanningMetadataStore;
-import com.moakiee.thunderbolt.core.crafting.planner.ReusableStockUsageKey;
 
 /** Adapter that exposes Thunderbolt's V2 planner through the multi-algorithm API. */
 public final class ThunderboltV2PlanningEngine implements CraftingPlanningEngine {

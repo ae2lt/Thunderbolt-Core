@@ -64,6 +64,13 @@ class PlannerPackageBoundaryTest {
         assertFalse(Files.exists(core.resolve("CapturedPlanningChoice.java")));
     }
 
+    @Test
+    void v2EngineLivesWithThePlannerItAdapts() {
+        var crafting = Path.of("src/main/java/com/moakiee/thunderbolt/core/crafting");
+        assertTrue(Files.exists(crafting.resolve("planner/ThunderboltV2PlanningEngine.java")));
+        assertFalse(Files.exists(crafting.resolve("algorithm/ThunderboltV2PlanningEngine.java")));
+    }
+
     private static void assertSourcesDoNotContain(
             Path root, String forbidden, String message) throws Exception {
         try (var files = Files.walk(root)) {

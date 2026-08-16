@@ -18,7 +18,7 @@ import com.moakiee.thunderbolt.api.crafting.ICraftingPlanningService;
 import com.moakiee.thunderbolt.api.eject.EjectCapabilityRegistry;
 import com.moakiee.thunderbolt.core.crafting.algorithm.CraftingPlanningService;
 import com.moakiee.thunderbolt.core.crafting.algorithm.ThunderboltMenus;
-import com.moakiee.thunderbolt.core.crafting.algorithm.ThunderboltV2PlanningEngine;
+import com.moakiee.thunderbolt.core.crafting.planner.ThunderboltV2PlanningEngine;
 import com.moakiee.thunderbolt.core.eject.EjectEndpointIndex;
 import com.moakiee.thunderbolt.core.eject.ThunderboltBlockEntities;
 import com.moakiee.thunderbolt.core.storage.cell.IndexedCellStorageRegistry;
