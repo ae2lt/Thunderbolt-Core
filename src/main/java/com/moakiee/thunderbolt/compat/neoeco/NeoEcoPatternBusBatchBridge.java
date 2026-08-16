@@ -1,4 +1,4 @@
-package com.moakiee.thunderbolt.mixin.compat.neoeco;
+package com.moakiee.thunderbolt.compat.neoeco;
 
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Method;
@@ -17,7 +17,7 @@ import appeng.blockentity.crafting.IMolecularAssemblerSupportedPattern;
 import com.moakiee.thunderbolt.core.util.MixinReflectionSupport;
 
 /** Reflection bridge to NeoECO's optional verified batch fast path. */
-final class NeoEcoPatternBusBatchBridge {
+public final class NeoEcoPatternBusBatchBridge {
     private static final @Nullable Class<?> BUS_CLASS = MixinReflectionSupport.findClassSafe(
             "cn.dancingsnow.neoecoae.blocks.entity.crafting.ECOCraftingPatternBusBlockEntity");
     private static final @Nullable Class<?> EXECUTION_CLASS = MixinReflectionSupport.findClassSafe(
@@ -86,7 +86,7 @@ final class NeoEcoPatternBusBatchBridge {
     }
 
     /** Old NeoECO versions have no verified batch API and remain ordinary single-copy providers. */
-    static long capacity(Object patternBus, IPatternDetails details) {
+    public static long capacity(Object patternBus, IPatternDetails details) {
         if (!AVAILABLE
                 || !BUS_CLASS.isInstance(patternBus)
                 || !(details instanceof IMolecularAssemblerSupportedPattern)) {
@@ -101,7 +101,7 @@ final class NeoEcoPatternBusBatchBridge {
                 : 1L;
     }
 
-    static long pushBatch(
+    public static long pushBatch(
             Object patternBus,
             IPatternDetails details,
             KeyCounter[] oneCopyTemplate,

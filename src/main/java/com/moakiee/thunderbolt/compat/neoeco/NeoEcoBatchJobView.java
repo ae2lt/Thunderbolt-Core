@@ -1,4 +1,4 @@
-package com.moakiee.thunderbolt.mixin.compat.neoeco;
+package com.moakiee.thunderbolt.compat.neoeco;
 
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
@@ -27,7 +27,7 @@ import com.moakiee.thunderbolt.core.util.MixinReflectionSupport;
  * resolved only when NeoECO is present, while the batching code continues to use the common
  * {@link BatchJobView} contract.
  */
-final class NeoEcoBatchJobView implements BatchJobView, BatchTaskHandle, Iterator<BatchTaskHandle> {
+public final class NeoEcoBatchJobView implements BatchJobView, BatchTaskHandle, Iterator<BatchTaskHandle> {
     private static final @Nullable Class<?> JOB_CLASS = MixinReflectionSupport.findClassSafe(
             "cn.dancingsnow.neoecoae.api.me.ExecutingCraftingJob");
     private static final @Nullable Class<?> TASK_PROGRESS_CLASS = MixinReflectionSupport.findClassSafe(
@@ -55,7 +55,7 @@ final class NeoEcoBatchJobView implements BatchJobView, BatchTaskHandle, Iterato
     private Iterator<? extends Map.Entry<IPatternDetails, ?>> rawIterator = Collections.emptyIterator();
     private @Nullable Map.Entry<IPatternDetails, ?> currentEntry;
 
-    NeoEcoBatchJobView(Object job, Level level) {
+    public NeoEcoBatchJobView(Object job, Level level) {
         this.job = job;
         this.level = level;
         Object link = MixinReflectionSupport.getFieldValueSafe(LINK_FIELD, job);
@@ -81,7 +81,7 @@ final class NeoEcoBatchJobView implements BatchJobView, BatchTaskHandle, Iterato
                 && ADD_MAX_ITEMS_METHOD != null;
     }
 
-    static boolean acceptsJob(@Nullable Object candidate) {
+    public static boolean acceptsJob(@Nullable Object candidate) {
         return isAvailable() && candidate != null && JOB_CLASS.isInstance(candidate);
     }
 

@@ -30,6 +30,7 @@ import appeng.me.service.CraftingService;
 import com.moakiee.thunderbolt.core.crafting.batch.BatchCpuAccounting;
 import com.moakiee.thunderbolt.core.crafting.batch.BatchExecutor;
 import com.moakiee.thunderbolt.core.crafting.batch.BatchProviderFilterIterable;
+import com.moakiee.thunderbolt.core.crafting.batch.DefaultBatchJobView;
 
 @Pseudo
 @Mixin(value = AdvCraftingCPULogic.class, remap = false)
@@ -82,12 +83,23 @@ public abstract class AdvCraftingCpuLogicBatchMixin {
             return original.call(self, remainingOps, craftingService, energyService, level);
         }
 
+        var jobAccessor = (AaeExecutingCraftingJobAccessor) (Object) job;
+        var timeTracker = (AaeElapsedTimeTrackerAccessor) jobAccessor.getTimeTracker();
         var batchResult = BatchExecutor.runBatchOnly(
                 remainingOps,
                 BatchCpuAccounting.Mode.LINEAR,
                 craftingService,
                 energyService,
-                new AaeBatchJobView(job, level),
+                new DefaultBatchJobView(
+                        level,
+                        jobAccessor.getLink().getCraftingID(),
+                        jobAccessor.getTasks(),
+                        jobAccessor.getWaitingFor(),
+                        task -> ((AaeTaskProgressAccessor) task).getValue(),
+                        (task, value) -> ((AaeTaskProgressAccessor) task).setValue(value),
+                        timeTracker,
+                        (tracker, count, type) -> ((AaeElapsedTimeTrackerAccessor) tracker)
+                                .invokeAddMaxItems(count, type)),
                 inventory,
                 batchedByTask,
                 cpu::markDirty);

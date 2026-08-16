@@ -27,6 +27,8 @@ import appeng.crafting.CraftingPlan;
 import appeng.crafting.inv.NetworkCraftingSimulationState;
 
 import com.moakiee.thunderbolt.ThunderboltCore;
+import com.moakiee.thunderbolt.ae2.crafting.CapturedPlanningChoice;
+import com.moakiee.thunderbolt.ae2.crafting.CraftingPlanningControl;
 import com.moakiee.thunderbolt.api.crafting.CraftingPlanningEngines;
 import com.moakiee.thunderbolt.api.crafting.PlanningAttempt;
 import com.moakiee.thunderbolt.api.crafting.PlanningAttemptContext;

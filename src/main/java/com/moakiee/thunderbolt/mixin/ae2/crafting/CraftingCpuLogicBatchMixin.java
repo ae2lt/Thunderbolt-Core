@@ -29,6 +29,7 @@ import appeng.me.service.CraftingService;
 import com.moakiee.thunderbolt.core.crafting.batch.BatchExecutor;
 import com.moakiee.thunderbolt.core.crafting.batch.BatchCpuAccounting;
 import com.moakiee.thunderbolt.core.crafting.batch.BatchProviderFilterIterable;
+import com.moakiee.thunderbolt.core.crafting.batch.DefaultBatchJobView;
 
 /**
  * Batches identical pattern firings on the vanilla crafting CPU within a tick.
@@ -91,12 +92,23 @@ public abstract class CraftingCpuLogicBatchMixin {
             return original.call(self, remainingOps, craftingService, energyService, level);
         }
 
+        var jobAccessor = (ExecutingCraftingJobAccessor) job;
+        var timeTracker = (ElapsedTimeTrackerAccessor) jobAccessor.getTimeTracker();
         var batchResult = BatchExecutor.runBatchOnly(
                 remainingOps,
                 BatchCpuAccounting.Mode.LINEAR,
                 craftingService,
                 energyService,
-                new VanillaBatchJobView(job, level),
+                new DefaultBatchJobView(
+                        level,
+                        jobAccessor.getLink().getCraftingID(),
+                        jobAccessor.getTasks(),
+                        jobAccessor.getWaitingFor(),
+                        task -> ((TaskProgressAccessor) task).getValue(),
+                        (task, value) -> ((TaskProgressAccessor) task).setValue(value),
+                        timeTracker,
+                        (tracker, count, type) -> ((ElapsedTimeTrackerAccessor) tracker)
+                                .invokeAddMaxItems(count, type)),
                 getInventory(),
                 batchedByTask,
                 cluster::markDirty);

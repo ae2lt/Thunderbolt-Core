@@ -58,10 +58,29 @@ class PlannerPackageBoundaryTest {
     }
 
     @Test
-    void mixinBridgesAreNotExposedFromCore() {
-        var core = Path.of("src/main/java/com/moakiee/thunderbolt/core/crafting/algorithm");
-        assertFalse(Files.exists(core.resolve("CraftingPlanningControl.java")));
-        assertFalse(Files.exists(core.resolve("CapturedPlanningChoice.java")));
+    void mixinBridgeLivesOutsideTheDeclaredMixinPackage() {
+        var source = Path.of("src/main/java/com/moakiee/thunderbolt");
+        assertTrue(Files.exists(source.resolve("ae2/crafting/CraftingPlanningControl.java")));
+        assertTrue(Files.exists(source.resolve("ae2/crafting/CapturedPlanningChoice.java")));
+        assertFalse(Files.exists(source.resolve("mixin/ae2/crafting/CraftingPlanningControl.java")));
+        assertFalse(Files.exists(source.resolve("mixin/ae2/crafting/CapturedPlanningChoice.java")));
+    }
+
+    @Test
+    void declaredMixinPackageContainsOnlyMixinsAndConfigInfrastructure() throws Exception {
+        var mixin = Path.of("src/main/java/com/moakiee/thunderbolt/mixin");
+        try (var files = Files.walk(mixin)) {
+            for (var file : files.filter(path -> path.toString().endsWith(".java")).toList()) {
+                var name = file.getFileName().toString();
+                if (name.equals("OptionalMixinSelector.java")
+                        || name.equals("ThunderboltMixinConfigPlugin.java")) {
+                    continue;
+                }
+                var source = Files.readString(file);
+                assertTrue(source.contains("@Mixin"),
+                        () -> "ordinary runtime helper must live outside the declared Mixin package: " + file);
+            }
+        }
     }
 
     @Test
