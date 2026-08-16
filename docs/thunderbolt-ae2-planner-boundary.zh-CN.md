@@ -25,7 +25,7 @@
 api.crafting
 ├── algorithm/provider     算法注册、节点提供器、优先级与会话
 ├── cpu                    扩展 CPU 发现、提交与 canHandle
-└── batch                  Mixin 批量下发注册与调用上下文
+└── batch                  批量供应器与调度模式契约
 ```
 
 ### `core`：Thunderbolt 默认实现
@@ -34,11 +34,12 @@ api.crafting
 
 ```text
 core.crafting
+├── algorithm              候选路由状态、deadline 监控与默认算法适配
 ├── planner                FastCraftingPlanner、图模型、反馈环和冲突求解
 ├── pattern                Planner 的通用样板能力
 ├── overload               过载样板的 planner-facing 元数据
 ├── loop                   闭环宏样板、种子、任务顺序和 CPU 限制
-├── support                Mixin 控制钩子和诊断支持
+├── support                与 planner 无关的 Mixin 控制钩子和样板辅助
 ├── plan                   LoopCraftingPlan 等默认计划实现
 └── batch                  默认批量调度实现
 ```
@@ -53,12 +54,18 @@ AE2 `CraftingPlan` 的具体包装、可复用库存分配和宿主借用记录�
 
 `mixin` 只负责将 API/core 接入 AE2 或没有主动适配的附属模组，包括：
 
-- 计算入口的算法解析和会话锁定；
+- 计算入口的候选解析、完整计算所有权和顺序回退；
 - 扩展 CPU 的发现、列表、提交和 tick；
 - AE2CT/菜单所需的只读计划摘要；
 - AdvancedAE、NeoECO 等版本相关适配。
 
 Mixin 不拥有闭环种子账本、过载输出认领或产品持久化状态。
+
+Batch 热路径直接把现有 `BatchJobView` 传给
+`pushBatch(details, template, maxCraft, job)`，不创建 dispatch context，也不复制 template
+数组。job view 统一提供 level、crafting ID、任务和 waiting-for 视图；NeoECO 等适配器自行读取
+所需信息，不把 job 拆成公共方法参数。已使用较久的三参数 `pushBatch` 保留为基础契约，job
+重载默认转发给它。
 
 依赖方向为：
 
@@ -71,6 +78,10 @@ api 不依赖 core 或 mixin
 core 不依赖 mixin
 Thunderbolt 不依赖 AE2LT
 ```
+
+候选抓取阶段的 `check/capture` 是 Grid 线程上的受信轻量钩子，必须有界且不得阻塞；真正的
+规划、会话创建和完成处理才进入统一的候选隔离与超时边界。只供两个 AE2 Mixin 互通的计算
+桥接类型留在 `mixin.ae2.crafting` 包内，不作为 `core` 公共实现面暴露。
 
 ## 通用 planner 合入范围
 
@@ -178,11 +189,16 @@ Thunderbolt API 不接管以下产品职责：
 ## 兼容与回退
 
 1. `CraftingPlanningEngines` 是唯一算法注册入口，不恢复第二套 planner registry；
-2. 一次计算锁定一个算法会话，网络分离/合并不在计算中途静默切换算法；
-3. 算法返回 `DECLINE` 时才尝试下一个算法或 AE2 原版；
-4. 扩展 CPU 默认只接受原版 `CraftingPlan`，必须显式重写 `canHandle` 才能接受自定义计划；
-5. `CraftingCpuRestrictedPattern` 的全部限制都通过后，闭环计划才可提交到对应 CPU；
-6. 预算耗尽和未证明反馈环不得伪装为可行计划。
+2. 每个候选会话独占一次完整 `computePlan`；成功前不对外宣布选中算法；
+3. 任一 probe `DECLINE`、运行时异常或 deadline 超时都会丢弃整次候选结果，并按固定顺序从头运行下一算法；
+4. 不在 probe 中途换算法，不混用不同算法的精确、`CRAFT_LESS` 或 simulation 结果；
+5. 外部取消向候选传入统一的 `PlanningExitException`，但路由层保留来源、丢弃返回值并按 cancel 直接传播；JVM 致命错误也直接传播，二者都不伪装为算法回退；
+6. 所有候选（含 Vanilla）失败时返回空 used、空 missing 的不可提交 simulation 计划，并显示“全部失败”；
+7. 所有候选（含 Vanilla）都在隔离线程运行：3 秒预算到点只发布 deadline，5 秒宽限期内接受已经算出的完整可用结果但不继续扩展搜索；8 秒仍不返回才隔离算法、发 `Thread.interrupt()`、摘除并继续顺序回退；旧调用退出后自动解除隔离；
+8. 等待隔离候选时持续让出 AE2 calculation；不响应 checkpoint/interrupt 的候选也不能卡住调用线程，同一算法在旧调用退出前不能创建新调用；
+9. 扩展 CPU 默认只接受原版 `CraftingPlan`，必须显式重写 `canHandle` 才能接受自定义计划；
+10. `CraftingCpuRestrictedPattern` 的全部限制都通过后，闭环计划才可提交到对应 CPU；
+11. 预算耗尽和未证明反馈环不得伪装为可行计划。
 
 ## 验证
 
@@ -203,5 +219,6 @@ AE2LT 必须使用本次 Thunderbolt 构建后执行：
 
 - Thunderbolt 生产源码没有 `com.moakiee.ae2lt` 导入；
 - `api` 没有依赖 `core`/`mixin`；
+- AE2LT 没有导入 `com.moakiee.thunderbolt.mixin.*`，所需 accessor 由 AE2LT 自己持有；
 - AE2LT 不再定义重复的 `LoopCraftingPlan` 和闭环/过载 planner-facing 接口；
 - 两仓库 `git diff --check` 通过。

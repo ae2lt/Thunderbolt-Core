@@ -46,7 +46,6 @@ import appeng.me.service.CraftingService;
 import com.moakiee.thunderbolt.api.crafting.ICraftingPlanningService;
 import com.moakiee.thunderbolt.api.crafting.cpu.ExtendedCraftingCpuCluster;
 import com.moakiee.thunderbolt.api.crafting.cpu.ExtendedCraftingCpuClusterProvider;
-import com.moakiee.thunderbolt.core.crafting.algorithm.CraftingPlanningControl;
 import com.moakiee.thunderbolt.core.crafting.cpu.CraftingCpuSelectionOrder;
 import com.moakiee.thunderbolt.core.crafting.cpu.DynamicCraftingCpuClusterIndex;
 
@@ -99,7 +98,7 @@ public abstract class ExtendedCraftingCpuServiceMixin {
                                                                @Local CraftingCalculation job) {
         var planning = grid.getService(ICraftingPlanningService.class);
         ((CraftingPlanningControl) job).thunderbolt$configurePlanning(
-                planning.resolve(), strategy);
+                planning.resolve(), grid);
     }
 
     @Inject(

@@ -10,6 +10,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
+import org.jetbrains.annotations.Nullable;
 
 import appeng.api.networking.IGrid;
 import net.minecraft.nbt.CompoundTag;
@@ -133,6 +134,15 @@ class CraftingAlgorithmResolverTest {
                 () -> CraftingPlanningEngines.register(engine, 2, true));
     }
 
+    @Test
+    void allFailedDisplaySentinelCannotBeRegisteredOrSelected() {
+        assertThrows(IllegalArgumentException.class, () -> CraftingPlanningEngines.register(
+                new TestEngine(CraftingPlanningEngines.ALL_FAILED_ID), 1, true));
+        assertFalse(CraftingPlanningEngines.isKnown(CraftingPlanningEngines.ALL_FAILED_ID));
+        assertFalse(CraftingPlanningEngines.getPublic().contains(
+                CraftingPlanningEngines.ALL_FAILED_ID));
+    }
+
     private static List<ResourceLocation> engineIds(List<PlanningChoice> choices) {
         assertEquals(PlanningChoice.VANILLA, choices.getLast());
         return choices.stream()
@@ -152,7 +162,10 @@ class CraftingAlgorithmResolverTest {
         }
 
         @Override
-        public PlanningEngineSession createSession(IGrid grid, PlanningRequest request) {
+        public PlanningEngineSession createSession(
+                PlanningRequest request,
+                @Nullable Object capturedInput,
+                PlanningAttemptContext context) {
             throw new UnsupportedOperationException("resolver test does not execute engines");
         }
     }

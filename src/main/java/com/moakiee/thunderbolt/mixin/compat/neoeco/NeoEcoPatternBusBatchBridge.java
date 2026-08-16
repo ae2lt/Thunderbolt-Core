@@ -1,4 +1,4 @@
-package com.moakiee.thunderbolt.core.crafting.batch;
+package com.moakiee.thunderbolt.mixin.compat.neoeco;
 
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Method;
@@ -14,11 +14,10 @@ import appeng.api.stacks.AEKey;
 import appeng.api.stacks.KeyCounter;
 import appeng.blockentity.crafting.IMolecularAssemblerSupportedPattern;
 
-import com.moakiee.thunderbolt.api.crafting.batch.BatchDispatchContext;
 import com.moakiee.thunderbolt.core.util.MixinReflectionSupport;
 
 /** Reflection bridge to NeoECO's optional verified batch fast path. */
-public final class NeoEcoPatternBusBatchBridge {
+final class NeoEcoPatternBusBatchBridge {
     private static final @Nullable Class<?> BUS_CLASS = MixinReflectionSupport.findClassSafe(
             "cn.dancingsnow.neoecoae.blocks.entity.crafting.ECOCraftingPatternBusBlockEntity");
     private static final @Nullable Class<?> EXECUTION_CLASS = MixinReflectionSupport.findClassSafe(
@@ -87,7 +86,7 @@ public final class NeoEcoPatternBusBatchBridge {
     }
 
     /** Old NeoECO versions have no verified batch API and remain ordinary single-copy providers. */
-    public static long capacity(Object patternBus, IPatternDetails details) {
+    static long capacity(Object patternBus, IPatternDetails details) {
         if (!AVAILABLE
                 || !BUS_CLASS.isInstance(patternBus)
                 || !(details instanceof IMolecularAssemblerSupportedPattern)) {
@@ -102,20 +101,25 @@ public final class NeoEcoPatternBusBatchBridge {
                 : 1L;
     }
 
-    public static long pushBatch(Object patternBus, BatchDispatchContext context) {
-        long maxCraft = context.maxCraft();
+    static long pushBatch(
+            Object patternBus,
+            IPatternDetails details,
+            KeyCounter[] oneCopyTemplate,
+            long maxCraft,
+            Level level,
+            @Nullable UUID craftingJobId) {
         if (maxCraft <= 0L) {
             return 0L;
         }
         if (!AVAILABLE
                 || !BUS_CLASS.isInstance(patternBus)
-                || context.details() == null
-                || context.oneCopyTemplate() == null
-                || context.level() == null) {
+                || details == null
+                || oneCopyTemplate == null
+                || level == null) {
             return maxCraft;
         }
 
-        Object execution = createExecution(context);
+        Object execution = createExecution(details, oneCopyTemplate, level);
         if (execution == null || !isTrue(invoke(
                 EXECUTION_FAST_PATH_ELIGIBLE,
                 execution,
@@ -126,7 +130,8 @@ public final class NeoEcoPatternBusBatchBridge {
         }
 
         int requested = (int) Math.min(maxCraft, Integer.MAX_VALUE);
-        long accepted = pushVerifiedBatch(patternBus, execution, context, requested);
+        long accepted = pushVerifiedBatch(
+                patternBus, execution, details, craftingJobId, requested);
         if (accepted > 0L) {
             return maxCraft - accepted;
         }
@@ -138,7 +143,7 @@ public final class NeoEcoPatternBusBatchBridge {
                 patternBus,
                 "warm NeoECO verified batch cache",
                 execution,
-                context.craftingJobId()))) {
+                craftingJobId))) {
             return maxCraft;
         }
         accepted = 1L;
@@ -147,25 +152,25 @@ public final class NeoEcoPatternBusBatchBridge {
         if (remaining > 0L) {
             int remainingRequest = (int) Math.min(remaining, Integer.MAX_VALUE);
             accepted += pushVerifiedBatch(
-                    patternBus, execution, context, remainingRequest);
+                    patternBus, execution, details, craftingJobId, remainingRequest);
         }
         return maxCraft - accepted;
     }
 
     @Nullable
-    private static Object createExecution(BatchDispatchContext context) {
+    private static Object createExecution(
+            IPatternDetails details, KeyCounter[] oneCopyTemplate, Level level) {
         var outputs = new KeyCounter();
-        for (var output : context.details().getOutputs()) {
+        for (var output : details.getOutputs()) {
             if (output != null && output.what() != null && output.amount() > 0L) {
                 outputs.add(output.what(), output.amount());
             }
         }
 
         var remainingItems = new KeyCounter();
-        var inputs = context.details().getInputs();
-        var template = context.oneCopyTemplate();
-        for (int slot = 0; slot < inputs.length && slot < template.length; slot++) {
-            AEKey consumed = firstKey(template[slot]);
+        var inputs = details.getInputs();
+        for (int slot = 0; slot < inputs.length && slot < oneCopyTemplate.length; slot++) {
+            AEKey consumed = firstKey(oneCopyTemplate[slot]);
             if (consumed == null) {
                 continue;
             }
@@ -179,17 +184,18 @@ public final class NeoEcoPatternBusBatchBridge {
                 CREATE_EXECUTION,
                 null,
                 "create NeoECO extracted pattern execution",
-                context.details(),
-                template,
+                details,
+                oneCopyTemplate,
                 outputs,
                 remainingItems,
-                context.level());
+                level);
     }
 
     private static long pushVerifiedBatch(
             Object patternBus,
             Object execution,
-            BatchDispatchContext context,
+            IPatternDetails details,
+            @Nullable UUID craftingJobId,
             int requested) {
         if (requested <= 0) {
             return 0L;
@@ -215,7 +221,7 @@ public final class NeoEcoPatternBusBatchBridge {
             return 0L;
         }
 
-        Object request = createRequest(context, execution, batchSize);
+        Object request = createRequest(details, craftingJobId, execution, batchSize);
         if (request == null) {
             return 0L;
         }
@@ -231,7 +237,8 @@ public final class NeoEcoPatternBusBatchBridge {
 
     @Nullable
     private static Object createRequest(
-            BatchDispatchContext context,
+            IPatternDetails details,
+            @Nullable UUID craftingJobId,
             Object execution,
             int batchSize) {
         Object key = invoke(EXECUTION_KEY, execution, "read NeoECO fast-path key");
@@ -246,13 +253,13 @@ public final class NeoEcoPatternBusBatchBridge {
         }
         try {
             return REQUEST_CONSTRUCTOR.newInstance(
-                    context.details(),
+                    details,
                     key,
                     batchSize,
                     inputs,
                     outputs,
                     remaining,
-                    context.craftingJobId());
+                    craftingJobId);
         } catch (ReflectiveOperationException | RuntimeException e) {
             MixinReflectionSupport.logReflectionFailure(
                     "construct NeoECO verified batch request", e);

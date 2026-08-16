@@ -11,9 +11,8 @@ import appeng.api.crafting.IPatternDetails;
 import appeng.api.stacks.KeyCounter;
 
 import com.moakiee.thunderbolt.CoreConfig;
-import com.moakiee.thunderbolt.api.crafting.batch.BatchDispatchContext;
+import com.moakiee.thunderbolt.api.crafting.batch.BatchJobView;
 import com.moakiee.thunderbolt.api.crafting.batch.IBatchCraftingProvider;
-import com.moakiee.thunderbolt.core.crafting.batch.NeoEcoPatternBusBatchBridge;
 
 /** Adds Thunderbolt's batch-provider contract to NeoECO's native verified batch bus. */
 @Pseudo
@@ -41,21 +40,24 @@ public abstract class NeoEcoPatternBusBatchMixin implements IBatchCraftingProvid
     }
 
     @Override
-    public long pushBatch(BatchDispatchContext context) {
-        long limited = Math.min(context.maxCraft(), thunderbolt$batchCopyLimit());
+    public long pushBatch(
+            IPatternDetails details,
+            KeyCounter[] oneCopyTemplate,
+            long maxCraft,
+            BatchJobView job) {
+        long limited = Math.min(maxCraft, thunderbolt$batchCopyLimit());
         if (limited <= 0L) {
-            return context.maxCraft();
+            return maxCraft;
         }
         long limitedLeftover = NeoEcoPatternBusBatchBridge.pushBatch(
                 this,
-                new BatchDispatchContext(
-                        context.details(),
-                        context.oneCopyTemplate(),
-                        limited,
-                        context.level(),
-                        context.craftingJobId()));
+                details,
+                oneCopyTemplate,
+                limited,
+                job.level(),
+                job.craftingId());
         long accepted = limited - Math.clamp(limitedLeftover, 0L, limited);
-        return context.maxCraft() - accepted;
+        return maxCraft - accepted;
     }
 
     @Unique

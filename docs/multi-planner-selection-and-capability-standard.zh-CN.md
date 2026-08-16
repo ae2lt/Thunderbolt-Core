@@ -14,8 +14,10 @@ Grid 节点提供器
 CraftingCalculation 快照
   当前 Grid 的公开算法和在线提供器选择
   -> 去重、排序
-  -> 第一项能够处理请求的算法锁定整次计算
-  -> AE2 原版算法兜底
+  -> 每个候选独占运行一次完整计算
+  -> 第一项完整成功的算法成为结果算法
+  -> 失败、拒绝或超时后整次重算下一候选
+  -> AE2 原版算法作为最后一个普通候选
 ```
 
 Grid 不保存也不复制一份全局选择。节点只保存自己的选择，因此网络分裂不复制冲突
@@ -33,7 +35,8 @@ CraftingPlanningEngines.register(engine, algorithmPriority, publicAlgorithm);
 - `publicAlgorithm=true`：没有任何提供器节点时仍可参与规划；
 - `publicAlgorithm=false`：必须由至少一个在线节点选择才可参与规划；
 - 重复 ID 不允许替换已有实现或元数据；
-- `ae2:vanilla` 是保留 ID，代表 AE2 原版规划器。
+- `ae2:vanilla` 是保留 ID，代表 AE2 原版规划器；
+- `thunderbolt:all_failed` 是只用于结果显示的保留 ID，不能注册或选择。
 
 注册表提供：
 
@@ -198,7 +201,7 @@ CraftingAlgorithmProviderMenu.open(
 
 默认 GUI 是可选辅助层，不是 `CraftingAlgorithmProvider` 的依赖。
 
-## 8. 计算快照与算法锁定
+## 8. 完整计算所有权、诊断与顺序回退
 
 AE2 在选择实际 CPU 之前创建 `CraftingCalculation`。Thunderbolt 因此在任务提交到规划
 线程之前完成以下工作：
@@ -206,18 +209,36 @@ AE2 在选择实际 CPU 之前创建 `CraftingCalculation`。Thunderbolt 因此�
 1. 从 Grid service 读取在线提供器；
 2. 读取每个节点的算法 ID 和玩家优先级；
 3. 与公开算法合并、去重和排序；
-4. 把不可变候选链写入本次 `CraftingCalculation`；
-5. 异步线程只使用算法注册表和不可变请求数据，不持有方块实体或提供器对象。
+4. 构造所有候选共用的 `PlanningRequest`；
+5. 在当前 Grid 所在线程依次执行每个引擎的 `check`，通过后立即执行 `capture`；
+6. 把候选、引擎引用和抓取结果绑定后写入本次 `CraftingCalculation`；
+7. 异步线程只接收公共请求和已经抓取的数据，不再直接接收 `IGrid`、方块实体或提供器对象。
 
 引擎协议：
 
 ```java
 boolean check(IGrid grid, PlanningRequest request);
 
-PlanningEngineSession createSession(IGrid grid, PlanningRequest request);
+default Object capture(IGrid grid, PlanningRequest request) {
+    return null;
+}
+
+@Nullable PlanningEngineSession createSession(
+        PlanningRequest request,
+        @Nullable Object capturedInput,
+        PlanningAttemptContext context);
 ```
 
-首次 probe 可以返回：
+`check` 是同步、低成本且必须有界、不得阻塞的适用性检查；返回 `false` 时直接跳过该候选，
+不执行抓取。`capture` 同样必须有界、不得阻塞，只负责从 live Grid 抓取该引擎额外需要的
+数据，默认返回 `null`，表示无需额外数据。返回对象必须能在后台安全读取，后台不得再通过它
+间接访问或修改 live Grid。这两个入口在候选隔离线程创建之前执行，因此故意不承担后台超时
+兜底；注册实现必须把它们当作 Grid 线程上的轻量快照阶段。
+`createSession` 在隔离的候选线程执行，只接收公共请求、对应抓取结果和通用生命周期
+context；返回 `null` 等价于该候选 `DECLINE`。V2 当前所需输入已包含在公共请求中，因此
+使用默认空抓取。
+
+会话在每个 amount probe 返回：
 
 ```text
 DECLINE
@@ -225,11 +246,58 @@ HANDLED(plan)
 HANDLED(null)
 ```
 
-- `DECLINE`：继续下一候选算法；
-- `HANDLED(plan)`：锁定算法，并复用同一 session 处理后续 amount probe；
-- `HANDLED(null)`：权威的不可合成结果，同样锁定算法；
-- 已锁定算法后续再返回 `DECLINE` 属于协议错误，不能中途换算法；
-- 候选链最终必须进入 Vanilla，保证 AE2 原版行为仍是兜底。
+- `HANDLED(plan)`：本 probe 成功；
+- `HANDLED(null)`：本 probe 的权威不可合成结果；
+- `DECLINE`：当前候选放弃整次计算，而不是只把这一个 probe 交给另一算法。
+
+一个候选必须独占 AE2 的完整 `computePlan`，包括精确数量、`CRAFT_LESS` 探测和最终
+simulation。只有完整计算与 session `finish` 都成功后才写入结果算法。任何 probe
+`DECLINE`、运行时异常或候选超时都会丢弃该候选的全部结果，从初始 requested amount
+开始运行下一候选；不同算法的 probe 绝不拼成同一份计划。外部取消在候选内部使用统一退出
+协议，但路由层保留取消来源：候选后来返回的结果会被丢弃，整次计算按 cancel 退出且不回退。
+JVM 致命错误同样不回退。
+
+deadline 与诊断通过稳定 API 提供：
+
+```java
+PlanningAttempt attempt(long amount, boolean simulate, PlanningAttemptContext context);
+
+ICraftingPlan finish(ICraftingPlan result, PlanningAttemptContext context);
+
+context.deadlineNanos();
+context.checkpoint();
+context.report(new PlanningDiagnosticSnapshot(phase, metrics));
+```
+
+`createSession`、`attempt` 和 `finish` 共用同一个 context。引擎应在图导出、搜索以及高频循环中调用
+`checkpoint()`，并用 engine-neutral 的 phase
+与数值 metrics 报告进度。默认时序为：2 秒记录慢调用诊断；前 3 秒为正常计算预算，
+预算结束后 `checkpoint()` 直接抛候选级 `PlanningExitException`，不发线程中断。外部计算
+取消传入候选时也抛同一个 `PlanningExitException`，不向引擎暴露第二种退出状态。引擎必须在
+捕获 exit 后立刻收敛：已有经过验证的当前最优计划就返回该计划，没有可用计划就返回
+`DECLINE`，不得再启动新的 probe 或扩展搜索。路由层随后按保留的来源处理：预算退出允许
+接受当前可用结果或顺序回退；外部取消则丢弃任何返回结果，向调用方传播 cancel，绝不回退。返回和
+`finally`/session 清理共用随后 5 秒宽限期；总计 8 秒仍未返回时才调用
+`Thread.interrupt()`。三个时间分别可用
+`thunderbolt.planningWarnMs`、`thunderbolt.planningTimeoutMs` 和
+`thunderbolt.planningStopGraceMs` 调整。
+
+每个非 Vanilla 候选的 `check/capture` 在提交 AE2 计算任务前由 Grid 所在线程顺序执行；
+所有候选（包括 Vanilla）的计算都在隔离的 daemon 平台线程中执行，自定义引擎的
+`createSession/probe/finish/close` 也全部限制在同一个候选线程。session 在成功、`DECLINE`、
+异常或协作退出后统一关闭。等待后台候选时，AE2 计算
+所有者持续执行 `handlePausing()`，不会把服务端 tick 卡在
+`simulateFor()`。宽限期内只接受完整可用结果，不继续启动新的 amount probe；8 秒硬期限到达时
+先把仍在运行的算法（Vanilla 使用其保留 ID）标记为隔离并阻止它的新调用，再发 interrupt，随后调用方立即摘除该次调用并
+按顺序回退。被摘除的调用实际返回后自动解除隔离。Java 的
+`Thread.interrupt()` 只设置中断状态，并只会让 `sleep/wait/join` 等阻塞点直接抛
+`InterruptedException`；任意纯计算代码不会自动抛异常。因此永久忽略 checkpoint 和中断的
+第三方线程可能继续占用一个 daemon 线程，但不能继续卡住 AE2 或被再次选用。Java 21 的
+`Thread.stop()` 直接抛 `UnsupportedOperationException`，不作为强杀手段。
+
+候选链按顺序包含 Vanilla。若包括 Vanilla 在内的所有候选均失败，返回一个 fail-closed
+结果：`simulation=true`，`usedItems`、`missingItems`、`emittedItems` 和 pattern times
+全部为空，算法显示 ID 为 `thunderbolt:all_failed`（中文显示“全部失败”）。该计划不能提交执行。
 
 ## 9. 算法能力声明
 
@@ -253,13 +321,13 @@ Thunderbolt 不要求服务器启动时重新跑完整能力测试。能力声�
 
 | 生产路径结果 | 分类 | 是否算支持 | 调度行为 |
 | --- | --- | --- | --- |
-| 正确完成 | `SUPPORTED` | 是 | 使用并锁定 |
+| 完整计算正确完成 | `SUPPORTED` | 是 | 使用该结果 |
 | `check=false` | `CHECK_REJECTED` | 否 | 尝试下一项 |
-| 首次 probe 为 `DECLINE` | `ATTEMPT_DECLINED` | 否 | 尝试下一项 |
+| 任一 probe 为 `DECLINE` | `ATTEMPT_DECLINED` | 否 | 整次重算下一项 |
 | 生产路径拒绝但强制调用成功 | `FALSE_NEGATIVE` | 否 | 只损失优化机会 |
 | 抛出异常 | `ENGINE_ERROR` | 否 | 记录并尝试下一项 |
 | 超时且可取消 | `ENGINE_TIMEOUT` | 否 | 取消并降级 |
-| 超时且不响应取消 | `NON_COOPERATIVE_TIMEOUT` | 否 | 隔离算法 |
+| 超时且不响应取消 | `NON_COOPERATIVE_TIMEOUT` | 否 | 记录诊断并停用实现 |
 | 返回错误 HANDLED 结果 | `FALSE_POSITIVE` | 否 | 高风险，禁止提交 |
 
 参考用例应至少覆盖：

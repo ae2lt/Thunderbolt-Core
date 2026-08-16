@@ -338,7 +338,7 @@ R2: X(i-2) + X(i-3) -> Xi
 
 当前依赖的 AE2 19.2.17 已经把每个 `CraftingCalculation` 提交到静态 `Executors.newCachedThreadPool`，线程名为 `AE Crafting Calculator`。本次修改明确不替换、不限制也不重配这个 AE2 执行器。Thunderbolt 只保证自己的状态隔离：`CalculationSession`、`CraftPlannerV2` 可变池、tableau 和分支前沿都属于一个 calculation；不同 calculation 没有共享预算或可变求解状态，可以在不同平台线程上并发。
 
-所有 Thunderbolt 重循环、图导出、SCC/拓扑、模糊最大流和有理数求解都保留线程中断检查。取消 future 或中断计算线程时抛出 `CancellationException`，mixin 不再把它吞掉并转入 AE2 慢路径；中断标志也不会被清除。普通运行时异常仍记录上下文后回退，`OutOfMemoryError` 等致命 VM 错误不会被 `catch Throwable` 吞掉后再启动一次高成本计算。
+所有 Thunderbolt 重循环、图导出、SCC/拓扑、模糊最大流和有理数求解都保留退出检查。隔离候选收到外部取消时，候选内部由 `PlanningExitException` 统一要求尽快返回当前最优或 `DECLINE`；路由层仍按 cancel 传播、丢弃返回结果且不进入 AE2 慢路径。未绑定候选上下文的旧路径仍以线程中断和 `CancellationException` 退出。普通运行时异常仍记录上下文后回退，`OutOfMemoryError` 等致命 VM 错误不会被 `catch Throwable` 吞掉后再启动一次高成本计算。
 
 本实现不在单次规划内部再开虚拟线程或并行 branch-and-bound：
 
@@ -409,5 +409,5 @@ R2: X(i-2) + X(i-3) -> Xi
 28. AE2 适配层使用同一个 session 连续规划两个数量时，`getCraftingFor` 调用数在第一次之后不再增加。
 29. 14000 路副产物扇出超过整图上限后 `planRuns=0` 并保守返回目标 Missing；25000 路对抗基准由约 3.5 秒降至几十毫秒级。
 30. 256×256 全模糊 reusable 匹配仍完整求解；513×513 在候选枚举前保守退出；2000×2000 对抗输入不再创建 400 万条配对边。
-31. 已中断的规划线程抛出 `CancellationException` 且保留中断状态，不回落到 AE2 模拟器。
+31. 外部取消传入隔离候选时抛 `PlanningExitException`，但路由层仍按 cancel 结束且不回落到 AE2 模拟器；未绑定上下文的旧路径继续抛 `CancellationException`。
 32. 8 个独立近整数规划并发执行时没有共享状态、串行锁或预算串扰。

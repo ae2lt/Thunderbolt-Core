@@ -2,9 +2,8 @@ package com.moakiee.thunderbolt.core.crafting.batch;
 
 import java.util.IdentityHashMap;
 import java.util.Map;
+import java.util.Objects;
 import java.util.function.Predicate;
-
-import net.minecraft.world.level.Level;
 
 import appeng.api.config.Actionable;
 import appeng.api.config.PowerMultiplier;
@@ -16,9 +15,9 @@ import appeng.crafting.execution.CraftingCpuHelper;
 import appeng.crafting.inv.ListCraftingInventory;
 import appeng.me.service.CraftingService;
 
-import com.moakiee.thunderbolt.api.crafting.batch.IBatchCraftingProvider;
-import com.moakiee.thunderbolt.api.crafting.batch.BatchDispatchContext;
 import com.moakiee.thunderbolt.api.crafting.batch.BatchDispatchMode;
+import com.moakiee.thunderbolt.api.crafting.batch.BatchJobView;
+import com.moakiee.thunderbolt.api.crafting.batch.IBatchCraftingProvider;
 import com.moakiee.thunderbolt.core.crafting.batch.BatchCopyLimitPattern;
 import com.moakiee.thunderbolt.core.crafting.support.CraftingPatternDelegates;
 
@@ -34,29 +33,41 @@ public final class BatchExecutor {
     private static volatile Predicate<IPatternDetails> skipRule = details -> false;
     private static volatile Predicate<IPatternDetails> batchEligibleRule = details -> true;
 
-    /** Installs the pattern skip rule. Call once from the host mod's setup. */
-    public static void setSkipRule(Predicate<IPatternDetails> rule) {
-        skipRule = rule != null ? rule : details -> false;
+    /** Adds a pattern skip rule. Registered rules are combined with logical OR. */
+    public static synchronized void registerSkipRule(Predicate<IPatternDetails> rule) {
+        Objects.requireNonNull(rule, "rule");
+        var previous = skipRule;
+        skipRule = details -> previous.test(details) || rule.test(details);
     }
 
     /**
-     * Installs the pattern eligibility rule for batch providers. Defaults to "try every pattern"
-     * so standalone library users keep the original behavior.
+     * Adds a pattern eligibility rule. Registered rules are combined with logical AND, so one
+     * integration cannot silently relax another integration's restriction.
      */
-    public static void setBatchEligibleRule(Predicate<IPatternDetails> rule) {
-        batchEligibleRule = rule != null ? rule : details -> true;
+    public static synchronized void registerBatchEligibilityRule(
+            Predicate<IPatternDetails> rule) {
+        Objects.requireNonNull(rule, "rule");
+        var previous = batchEligibleRule;
+        batchEligibleRule = details -> previous.test(details) && rule.test(details);
+    }
+
+    static boolean shouldSkip(IPatternDetails details) {
+        return skipRule.test(details);
+    }
+
+    static boolean isBatchEligible(IPatternDetails details) {
+        return batchEligibleRule.test(details);
     }
 
     public static BatchRunResult runBatchOnly(int remainingOps,
                                               BatchCpuAccounting.Mode accountingMode,
                                               CraftingService cs,
                                               IEnergyService es,
-                                              Level level,
                                               BatchJobView job,
                                               ListCraftingInventory inv,
                                               Map<IPatternDetails, IdentityHashMap<ICraftingProvider, Boolean>> batchedByTask,
                                               Runnable markDirty) {
-        return runBatchOnly(remainingOps, accountingMode, cs, es, level, job, inv,
+        return runBatchOnly(remainingOps, accountingMode, cs, es, job, inv,
                 batchedByTask, markDirty, Map.of());
     }
 
@@ -64,7 +75,6 @@ public final class BatchExecutor {
                                               BatchCpuAccounting.Mode accountingMode,
                                               CraftingService cs,
                                               IEnergyService es,
-                                              Level level,
                                               BatchJobView job,
                                               ListCraftingInventory inv,
                                               Map<IPatternDetails, IdentityHashMap<ICraftingProvider, Boolean>> batchedByTask,
@@ -75,7 +85,6 @@ public final class BatchExecutor {
                 accountingMode,
                 cs,
                 es,
-                level,
                 job,
                 inv,
                 batchedByTask,
@@ -89,7 +98,6 @@ public final class BatchExecutor {
                                               BatchCpuAccounting.Mode accountingMode,
                                               CraftingService cs,
                                               IEnergyService es,
-                                              Level level,
                                               BatchJobView job,
                                               ListCraftingInventory inv,
                                               Map<IPatternDetails, IdentityHashMap<ICraftingProvider, Boolean>> batchedByTask,
@@ -102,7 +110,6 @@ public final class BatchExecutor {
                 accountingMode,
                 cs,
                 es,
-                level,
                 job,
                 inv,
                 batchedByTask,
@@ -118,7 +125,6 @@ public final class BatchExecutor {
                                               BatchCpuAccounting.Mode accountingMode,
                                               CraftingService cs,
                                               IEnergyService es,
-                                              Level level,
                                               BatchJobView job,
                                               ListCraftingInventory inv,
                                               Map<IPatternDetails, IdentityHashMap<ICraftingProvider, Boolean>> batchedByTask,
@@ -132,7 +138,6 @@ public final class BatchExecutor {
                 accountingMode,
                 cs,
                 es,
-                level,
                 job,
                 inv,
                 batchedByTask,
@@ -148,7 +153,6 @@ public final class BatchExecutor {
                                               BatchCpuAccounting.Mode accountingMode,
                                               CraftingService cs,
                                               IEnergyService es,
-                                              Level level,
                                               BatchJobView job,
                                               ListCraftingInventory inv,
                                               Map<IPatternDetails, IdentityHashMap<ICraftingProvider, Boolean>> batchedByTask,
@@ -183,10 +187,10 @@ public final class BatchExecutor {
 
             var details = task.details();
             var executionDetails = CraftingPatternDelegates.forProviderLookup(details);
-            if (skipRule.test(executionDetails)) {
+            if (shouldSkip(executionDetails)) {
                 continue;
             }
-            if (!batchEligibleRule.test(executionDetails)) {
+            if (!isBatchEligible(executionDetails)) {
                 continue;
             }
             boolean hasSharedInputs = SharedBatchInputs.hasSharedInputs(details);
@@ -327,8 +331,7 @@ public final class BatchExecutor {
 
                 long subLeftover;
                 try {
-                    subLeftover = batch.pushBatch(new BatchDispatchContext(
-                            executionDetails, oneCopy, slice, level, job.craftingId()));
+                    subLeftover = batch.pushBatch(executionDetails, oneCopy, slice, job);
                 } catch (Throwable t) {
                     appeng.core.AELog.warn("[thunderbolt] IBatchCraftingProvider %s threw during pushBatch; treating as full leftover. %s",
                             batch, t);

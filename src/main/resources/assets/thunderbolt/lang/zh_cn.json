@@ -11,5 +11,6 @@
   "gui.thunderbolt.algorithm_provider.algorithm_priority.unknown": "算法声明优先级：未知算法",
   "algorithm.thunderbolt.ae2_vanilla": "AE2 原版规划器",
   "algorithm.thunderbolt.v2": "雷霆 V2 规划器",
+  "algorithm.thunderbolt.all_failed": "全部失败",
   "gui.thunderbolt.crafting_plan.algorithm": "%1$s [%2$s]"
 }

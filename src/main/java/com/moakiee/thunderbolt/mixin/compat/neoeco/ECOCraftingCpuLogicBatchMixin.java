@@ -27,7 +27,6 @@ import appeng.me.service.CraftingService;
 import com.moakiee.thunderbolt.core.crafting.batch.BatchCpuAccounting;
 import com.moakiee.thunderbolt.core.crafting.batch.BatchExecutor;
 import com.moakiee.thunderbolt.core.crafting.batch.BatchProviderFilterIterable;
-import com.moakiee.thunderbolt.core.crafting.batch.NeoEcoBatchJobView;
 import com.moakiee.thunderbolt.core.util.MixinReflectionSupport;
 
 /** Makes NeoECO CPUs dispatch compatible patterns through Thunderbolt batch providers. */
@@ -91,8 +90,7 @@ public abstract class ECOCraftingCpuLogicBatchMixin {
                 BatchCpuAccounting.Mode.LINEAR,
                 craftingService,
                 energyService,
-                level,
-                new NeoEcoBatchJobView(job),
+                new NeoEcoBatchJobView(job, level),
                 inventory,
                 batchedByTask,
                 () -> thunderbolt$markEcoCpuDirty(cpu));

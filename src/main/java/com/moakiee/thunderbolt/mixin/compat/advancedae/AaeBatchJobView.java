@@ -1,33 +1,43 @@
-package com.moakiee.thunderbolt.ae2.crafting;
+package com.moakiee.thunderbolt.mixin.compat.advancedae;
 
 import java.util.Iterator;
 import java.util.Map;
 import java.util.UUID;
 
+import net.pedroksl.advanced_ae.common.logic.ExecutingCraftingJob;
+import net.minecraft.world.level.Level;
+
 import appeng.api.crafting.IPatternDetails;
 import appeng.api.stacks.AEKeyType;
-import appeng.crafting.execution.ExecutingCraftingJob;
 import appeng.crafting.inv.ListCraftingInventory;
 
-import com.moakiee.thunderbolt.mixin.ae2.crafting.ElapsedTimeTrackerAccessor;
-import com.moakiee.thunderbolt.mixin.ae2.crafting.ExecutingCraftingJobAccessor;
-import com.moakiee.thunderbolt.mixin.ae2.crafting.TaskProgressAccessor;
-import com.moakiee.thunderbolt.core.crafting.batch.BatchJobView;
-import com.moakiee.thunderbolt.core.crafting.batch.BatchTaskHandle;
+import com.moakiee.thunderbolt.api.crafting.batch.BatchJobView;
+import com.moakiee.thunderbolt.api.crafting.batch.BatchTaskHandle;
 
-public final class VanillaBatchJobView implements BatchJobView, BatchTaskHandle, Iterator<BatchTaskHandle> {
+final class AaeBatchJobView implements BatchJobView, BatchTaskHandle, Iterator<BatchTaskHandle> {
     private final ExecutingCraftingJob job;
+    private final Level level;
+    private final UUID craftingId;
     private Iterator<? extends Map.Entry<IPatternDetails, ?>> rawIter;
     private Map.Entry<IPatternDetails, ?> currentEntry;
 
-    public VanillaBatchJobView(ExecutingCraftingJob job) {
+    AaeBatchJobView(ExecutingCraftingJob job, Level level) {
         this.job = job;
+        this.level = level;
+        this.craftingId = ((AaeExecutingCraftingJobAccessor) (Object) job)
+                .getLink()
+                .getCraftingID();
+    }
+
+    @Override
+    public Level level() {
+        return level;
     }
 
     @SuppressWarnings("unchecked")
     @Override
     public Iterator<BatchTaskHandle> taskIterator() {
-        Map<IPatternDetails, ?> tasks = ((ExecutingCraftingJobAccessor) job).getTasks();
+        Map<IPatternDetails, ?> tasks = ((AaeExecutingCraftingJobAccessor) (Object) job).getTasks();
         rawIter = (Iterator<? extends Map.Entry<IPatternDetails, ?>>) tasks.entrySet().iterator();
         currentEntry = null;
         return this;
@@ -57,27 +67,27 @@ public final class VanillaBatchJobView implements BatchJobView, BatchTaskHandle,
 
     @Override
     public long getValue() {
-        return ((TaskProgressAccessor) currentEntry.getValue()).getValue();
+        return ((AaeTaskProgressAccessor) currentEntry.getValue()).getValue();
     }
 
     @Override
     public void setValue(long value) {
-        ((TaskProgressAccessor) currentEntry.getValue()).setValue(value);
+        ((AaeTaskProgressAccessor) currentEntry.getValue()).setValue(value);
     }
 
     @Override
     public ListCraftingInventory waitingFor() {
-        return ((ExecutingCraftingJobAccessor) job).getWaitingFor();
+        return ((AaeExecutingCraftingJobAccessor) (Object) job).getWaitingFor();
     }
 
     @Override
     public UUID craftingId() {
-        return ((ExecutingCraftingJobAccessor) job).getLink().getCraftingID();
+        return craftingId;
     }
 
     @Override
     public void addContainerMaxItems(long count, AEKeyType type) {
-        var timeTracker = ((ExecutingCraftingJobAccessor) job).getTimeTracker();
-        ((ElapsedTimeTrackerAccessor) timeTracker).invokeAddMaxItems(count, type);
+        var tracker = ((AaeExecutingCraftingJobAccessor) (Object) job).getTimeTracker();
+        ((AaeElapsedTimeTrackerAccessor) tracker).invokeAddMaxItems(count, type);
     }
 }

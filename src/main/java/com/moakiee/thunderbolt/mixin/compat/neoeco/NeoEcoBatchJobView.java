@@ -1,4 +1,4 @@
-package com.moakiee.thunderbolt.core.crafting.batch;
+package com.moakiee.thunderbolt.mixin.compat.neoeco;
 
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
@@ -9,13 +9,15 @@ import java.util.UUID;
 
 import org.jetbrains.annotations.Nullable;
 
+import net.minecraft.world.level.Level;
+
 import appeng.api.crafting.IPatternDetails;
 import appeng.api.stacks.AEKeyType;
 import appeng.crafting.CraftingLink;
 import appeng.crafting.inv.ListCraftingInventory;
 
-import com.moakiee.thunderbolt.core.crafting.batch.BatchJobView;
-import com.moakiee.thunderbolt.core.crafting.batch.BatchTaskHandle;
+import com.moakiee.thunderbolt.api.crafting.batch.BatchJobView;
+import com.moakiee.thunderbolt.api.crafting.batch.BatchTaskHandle;
 import com.moakiee.thunderbolt.core.util.MixinReflectionSupport;
 
 /**
@@ -25,7 +27,7 @@ import com.moakiee.thunderbolt.core.util.MixinReflectionSupport;
  * resolved only when NeoECO is present, while the batching code continues to use the common
  * {@link BatchJobView} contract.
  */
-public final class NeoEcoBatchJobView implements BatchJobView, BatchTaskHandle, Iterator<BatchTaskHandle> {
+final class NeoEcoBatchJobView implements BatchJobView, BatchTaskHandle, Iterator<BatchTaskHandle> {
     private static final @Nullable Class<?> JOB_CLASS = MixinReflectionSupport.findClassSafe(
             "cn.dancingsnow.neoecoae.api.me.ExecutingCraftingJob");
     private static final @Nullable Class<?> TASK_PROGRESS_CLASS = MixinReflectionSupport.findClassSafe(
@@ -48,14 +50,26 @@ public final class NeoEcoBatchJobView implements BatchJobView, BatchTaskHandle, 
                     ELAPSED_TIME_TRACKER_CLASS, "addMaxItems", long.class, AEKeyType.class);
 
     private final Object job;
+    private final Level level;
+    private final @Nullable UUID craftingId;
     private Iterator<? extends Map.Entry<IPatternDetails, ?>> rawIterator = Collections.emptyIterator();
     private @Nullable Map.Entry<IPatternDetails, ?> currentEntry;
 
-    public NeoEcoBatchJobView(Object job) {
+    NeoEcoBatchJobView(Object job, Level level) {
         this.job = job;
+        this.level = level;
+        Object link = MixinReflectionSupport.getFieldValueSafe(LINK_FIELD, job);
+        this.craftingId = link instanceof CraftingLink craftingLink
+                ? craftingLink.getCraftingID()
+                : null;
     }
 
-    public static boolean isAvailable() {
+    @Override
+    public Level level() {
+        return level;
+    }
+
+    static boolean isAvailable() {
         return JOB_CLASS != null
                 && TASK_PROGRESS_CLASS != null
                 && ELAPSED_TIME_TRACKER_CLASS != null
@@ -67,7 +81,7 @@ public final class NeoEcoBatchJobView implements BatchJobView, BatchTaskHandle, 
                 && ADD_MAX_ITEMS_METHOD != null;
     }
 
-    public static boolean acceptsJob(@Nullable Object candidate) {
+    static boolean acceptsJob(@Nullable Object candidate) {
         return isAvailable() && candidate != null && JOB_CLASS.isInstance(candidate);
     }
 
@@ -131,10 +145,7 @@ public final class NeoEcoBatchJobView implements BatchJobView, BatchTaskHandle, 
 
     @Override
     public @Nullable UUID craftingId() {
-        Object link = MixinReflectionSupport.getFieldValueSafe(LINK_FIELD, job);
-        return link instanceof CraftingLink craftingLink
-                ? craftingLink.getCraftingID()
-                : null;
+        return craftingId;
     }
 
     @Override

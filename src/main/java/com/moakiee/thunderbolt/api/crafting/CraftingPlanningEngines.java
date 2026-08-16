@@ -17,6 +17,9 @@ public final class CraftingPlanningEngines {
     /** Public sentinel used when a provider explicitly selects AE2's native planner. */
     public static final ResourceLocation VANILLA_ID = ResourceLocation.fromNamespaceAndPath(
             "ae2", "vanilla");
+    /** Display-only sentinel for a fail-closed result after every candidate failed. */
+    public static final ResourceLocation ALL_FAILED_ID = ResourceLocation.fromNamespaceAndPath(
+            "thunderbolt", "all_failed");
 
     private static final Map<ResourceLocation, CraftingPlanningEngineDescriptor> ENGINES =
             new LinkedHashMap<>();
@@ -33,8 +36,8 @@ public final class CraftingPlanningEngines {
     public static synchronized void register(
             CraftingPlanningEngine engine, int algorithmPriority, boolean publicAlgorithm) {
         Objects.requireNonNull(engine, "engine");
-        if (VANILLA_ID.equals(engine.id())) {
-            throw new IllegalArgumentException(VANILLA_ID + " is reserved for AE2's native planner");
+        if (VANILLA_ID.equals(engine.id()) || ALL_FAILED_ID.equals(engine.id())) {
+            throw new IllegalArgumentException(engine.id() + " is a reserved planning sentinel");
         }
         var descriptor = new CraftingPlanningEngineDescriptor(
                 engine, algorithmPriority, publicAlgorithm);
@@ -122,6 +125,9 @@ public final class CraftingPlanningEngines {
 
     /** Player-facing name, with useful fallbacks for vanilla and unavailable registrations. */
     public static Component getName(ResourceLocation id) {
+        if (ALL_FAILED_ID.equals(id)) {
+            return Component.translatable("algorithm.thunderbolt.all_failed");
+        }
         if (VANILLA_ID.equals(id)) {
             return Component.translatable("algorithm.thunderbolt.ae2_vanilla");
         }

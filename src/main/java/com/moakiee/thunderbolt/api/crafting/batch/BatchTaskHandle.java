@@ -1,4 +1,4 @@
-package com.moakiee.thunderbolt.core.crafting.batch;
+package com.moakiee.thunderbolt.api.crafting.batch;
 
 import appeng.api.crafting.IPatternDetails;
 

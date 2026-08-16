@@ -26,7 +26,6 @@ import appeng.hooks.ticking.TickHandler;
 import appeng.me.cluster.implementations.CraftingCPUCluster;
 import appeng.me.service.CraftingService;
 
-import com.moakiee.thunderbolt.ae2.crafting.VanillaBatchJobView;
 import com.moakiee.thunderbolt.core.crafting.batch.BatchExecutor;
 import com.moakiee.thunderbolt.core.crafting.batch.BatchCpuAccounting;
 import com.moakiee.thunderbolt.core.crafting.batch.BatchProviderFilterIterable;
@@ -97,8 +96,7 @@ public abstract class CraftingCpuLogicBatchMixin {
                 BatchCpuAccounting.Mode.LINEAR,
                 craftingService,
                 energyService,
-                level,
-                new VanillaBatchJobView(job),
+                new VanillaBatchJobView(job, level),
                 getInventory(),
                 batchedByTask,
                 cluster::markDirty);

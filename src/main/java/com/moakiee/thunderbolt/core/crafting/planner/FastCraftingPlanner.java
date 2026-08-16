@@ -32,12 +32,12 @@ import appeng.crafting.inv.ChildCraftingSimulationState;
 import appeng.crafting.inv.CraftingSimulationState;
 import appeng.crafting.pattern.AECraftingPattern;
 
+import com.moakiee.thunderbolt.api.crafting.PlanningDiagnosticSnapshot;
 import com.moakiee.thunderbolt.core.crafting.pattern.CraftingStockPolicy;
 import com.moakiee.thunderbolt.core.crafting.pattern.FuzzyPatternInputs;
 import com.moakiee.thunderbolt.core.crafting.pattern.IWrappedPatternDetails;
 import com.moakiee.thunderbolt.core.crafting.pattern.ReusableStockPattern;
 import com.moakiee.thunderbolt.core.crafting.support.CraftingPatternDelegates;
-import com.moakiee.thunderbolt.core.crafting.support.FastPlanningWatchdog;
 
 /**
  * Bridges one of AE2's per-amount crafting attempts ({@code CraftingCalculation#runCraftAttempt})
@@ -107,6 +107,10 @@ import com.moakiee.thunderbolt.core.crafting.support.FastPlanningWatchdog;
  * memoized DAG: byte-identical to AE2 for jobs without shared sub-graphs, smaller otherwise.
  */
 public final class FastCraftingPlanner {
+    private static final PlanningDiagnosticSnapshot GRAPH_EXPORT_DIAGNOSTIC =
+            PlanningDiagnosticSnapshot.phase("graph_export");
+    private static final PlanningDiagnosticSnapshot PLANNING_DIAGNOSTIC =
+            PlanningDiagnosticSnapshot.phase("planning");
 
     /**
      * Hard-fuzzy budget: an input slot that accepts several substitutes is expanded into the cartesian
@@ -258,9 +262,8 @@ public final class FastCraftingPlanner {
         snapshot.ignore(output);
 
         CompiledGraph compiled = session.compiledGraph;
-        long graphBuildNanos = 0L;
         if (compiled == null) {
-            long graphBuildStarted = System.nanoTime();
+            PlanningCancellation.report(GRAPH_EXPORT_DIAGNOSTIC);
             compiled = compileGraph(
                     craftingService,
                     snapshot,
@@ -268,14 +271,12 @@ public final class FastCraftingPlanner {
                     level,
                     output,
                     reservedStock);
-            graphBuildNanos = Math.max(0L, System.nanoTime() - graphBuildStarted);
             session.compiledGraph = compiled;
         }
 
-        FastPlanningWatchdog.recordGraphBuild(graphBuildNanos);
+        PlanningCancellation.report(PLANNING_DIAGNOSTIC);
         PlanningResult<AEKey> planning = CraftPlannerV2.planDetailed(
                 compiled.graph, output, amount, session.plannerSession);
-        FastPlanningWatchdog.record(planning.diagnostics());
         CraftPlan<AEKey> plan = planning.plan();
         if (!plan.supported()) {
             return FastAttempt.decline();

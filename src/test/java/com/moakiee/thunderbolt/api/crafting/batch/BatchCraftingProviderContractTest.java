@@ -1,5 +1,6 @@
 package com.moakiee.thunderbolt.api.crafting.batch;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -11,9 +12,24 @@ import org.junit.jupiter.api.Test;
 class BatchCraftingProviderContractTest {
 
     @Test
-    void legacyThirdPartySingleSeedCapabilityFeedsTheNeutralSharedInputName() {
-        var legacyProvider = proxy((proxy, method, args) -> {
-            if (method.getName().equals("supportsSingleSeedBatch")) {
+    void jobOverloadDelegatesToTheEstablishedFlatContract() {
+        var provider = proxy((proxy, method, args) -> {
+            if (method.getName().equals("pushBatch") && method.getParameterCount() == 3) {
+                return 4L;
+            }
+            if (method.isDefault()) {
+                return InvocationHandler.invokeDefault(proxy, method, args);
+            }
+            return defaultValue(method.getReturnType());
+        });
+
+        assertEquals(4L, provider.pushBatch(null, null, 7L, null));
+    }
+
+    @Test
+    void sharedInputsRequireExplicitOptIn() {
+        var provider = proxy((proxy, method, args) -> {
+            if (method.getName().equals("supportsSharedBatchInputs")) {
                 return true;
             }
             if (method.isDefault()) {
@@ -22,8 +38,7 @@ class BatchCraftingProviderContractTest {
             return defaultValue(method.getReturnType());
         });
 
-        assertTrue(legacyProvider.supportsSingleSeedBatch());
-        assertTrue(legacyProvider.supportsSharedBatchInputs());
+        assertTrue(provider.supportsSharedBatchInputs());
     }
 
     @Test

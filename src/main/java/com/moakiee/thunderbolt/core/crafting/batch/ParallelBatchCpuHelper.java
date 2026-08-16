@@ -14,6 +14,8 @@ import appeng.api.stacks.AEKey;
 import appeng.api.stacks.KeyCounter;
 import appeng.crafting.inv.ListCraftingInventory;
 
+import com.moakiee.thunderbolt.api.crafting.batch.BatchJobView;
+
 public final class ParallelBatchCpuHelper {
     private ParallelBatchCpuHelper() {
     }
