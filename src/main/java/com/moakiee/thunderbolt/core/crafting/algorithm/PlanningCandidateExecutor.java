@@ -15,18 +15,16 @@ import com.moakiee.thunderbolt.core.crafting.planner.PlanningCancellation;
 
 /**
  * Isolates an engine candidate so a non-cooperative implementation cannot block AE2's worker.
- * The monitor first publishes a cooperative deadline, interrupts only after the exit grace, then
- * the caller detaches and quarantines an invocation that still does not return.
+ * The monitor first publishes a cooperative deadline, interrupts after the exit grace, then the
+ * caller detaches and quarantines an invocation that still does not return.
  */
 public final class PlanningCandidateExecutor {
     private static final ThreadLocal<Boolean> CANDIDATE_THREAD = new ThreadLocal<>();
 
     private static final java.util.concurrent.ExecutorService EXECUTOR =
-            Executors.newCachedThreadPool(runnable -> {
-                var thread = new Thread(runnable, "thunderbolt-planning-candidate");
-                thread.setDaemon(true);
-                return thread;
-            });
+            Executors.newThreadPerTaskExecutor(Thread.ofVirtual()
+                    .name("thunderbolt-planning-candidate-", 0L)
+                    .factory());
 
     /** Number of detached invocations that have not actually returned yet, keyed by engine. */
     private static final ConcurrentHashMap<ResourceLocation, AtomicInteger> QUARANTINED =
@@ -105,6 +103,16 @@ public final class PlanningCandidateExecutor {
                         id, taskLabel, 0L, timeoutMs, stopGraceMs, hardTimeoutAction));
     }
 
+    static <T> Result<T> executeWithMonitorForTest(
+            ResourceLocation engineId,
+            String label,
+            Work<T> work,
+            SchedulerYield schedulerYield,
+            MonitorFactory monitorFactory) throws InterruptedException {
+        return execute(
+                engineId, label, work, schedulerYield, ignored -> { }, monitorFactory);
+    }
+
     private static <T> Result<T> execute(
             ResourceLocation engineId,
             String label,
@@ -123,7 +131,14 @@ public final class PlanningCandidateExecutor {
         Runnable quarantine = () -> quarantineUntilReturnedOnce(
                 engineId, result, quarantineRegistered);
         EXECUTOR.execute(() -> {
-            var monitor = monitorFactory.start(engineId, label, quarantine);
+            final PlanningAttemptMonitor monitor;
+            try {
+                monitor = monitorFactory.start(engineId, label, quarantine);
+            } catch (Throwable failure) {
+                monitorReady.completeExceptionally(failure);
+                result.completeExceptionally(failure);
+                return;
+            }
             monitorReady.complete(monitor);
             try (monitor; var ignored = PlanningCancellation.bind(monitor)) {
                 T value;
@@ -165,8 +180,6 @@ public final class PlanningCandidateExecutor {
                 }
                 if (!result.isDone()) {
                     if (monitor.hardTimedOut()) {
-                        monitor.interruptCandidate();
-                        quarantine.run();
                         return new Result<>(Status.HARD_TIMEOUT, null, null);
                     }
                     schedulerYield.run();
@@ -210,8 +223,15 @@ public final class PlanningCandidateExecutor {
         }
         try {
             return monitorReady.get();
-        } catch (ExecutionException impossible) {
-            throw new IllegalStateException("candidate monitor failed to start", impossible.getCause());
+        } catch (ExecutionException failed) {
+            Throwable cause = failed.getCause();
+            if (cause instanceof Error error) {
+                throw error;
+            }
+            if (cause instanceof RuntimeException runtimeFailure) {
+                throw runtimeFailure;
+            }
+            throw new IllegalStateException("candidate monitor failed to start", cause);
         }
     }
 
@@ -262,7 +282,7 @@ public final class PlanningCandidateExecutor {
     }
 
     @FunctionalInterface
-    private interface MonitorFactory {
+    interface MonitorFactory {
         PlanningAttemptMonitor start(
                 ResourceLocation engineId, String label, Runnable hardTimeoutAction);
     }

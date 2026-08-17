@@ -20,9 +20,34 @@ import com.moakiee.thunderbolt.api.crafting.PlanningExitException;
 
 class PlanningCandidateExecutorTest {
     @Test
+    void monitorStartupFailureCannotLeaveTheCallerYieldingForever() {
+        var workRan = new AtomicBoolean();
+
+        var failure = org.junit.jupiter.api.Assertions.assertTimeoutPreemptively(
+                Duration.ofSeconds(1),
+                () -> org.junit.jupiter.api.Assertions.assertThrows(
+                        IllegalStateException.class,
+                        () -> PlanningCandidateExecutor.executeWithMonitorForTest(
+                                id("monitor_startup_failure"),
+                                "monitor startup failure test",
+                                context -> {
+                                    workRan.set(true);
+                                    return 1;
+                                },
+                                Thread::yield,
+                                (engineId, label, hardTimeoutAction) -> {
+                                    throw new IllegalStateException("monitor startup failure");
+                                })));
+
+        assertEquals("monitor startup failure", failure.getMessage());
+        assertFalse(workRan.get());
+    }
+
+    @Test
     void candidateThreadMarkerIsLimitedToIsolatedWork() throws Exception {
         var candidateMayFinish = new CountDownLatch(1);
         var workMarked = new AtomicBoolean();
+        var workVirtual = new AtomicBoolean();
         var schedulerMarked = new AtomicBoolean(true);
 
         assertFalse(PlanningCandidateExecutor.isCandidateThread());
@@ -31,6 +56,7 @@ class PlanningCandidateExecutorTest {
                 "candidate thread marker test",
                 context -> {
                     workMarked.set(PlanningCandidateExecutor.isCandidateThread());
+                    workVirtual.set(Thread.currentThread().isVirtual());
                     assertTrue(PlanningCandidateExecutor.checkpointCandidateThread());
                     assertTrue(candidateMayFinish.await(1, TimeUnit.SECONDS));
                     return 42;
@@ -47,6 +73,7 @@ class PlanningCandidateExecutorTest {
         assertEquals(PlanningCandidateExecutor.Status.SUCCESS, result.status());
         assertEquals(42, result.value());
         assertTrue(workMarked.get());
+        assertTrue(workVirtual.get());
         assertFalse(schedulerMarked.get());
         assertFalse(PlanningCandidateExecutor.isCandidateThread());
     }
@@ -126,6 +153,7 @@ class PlanningCandidateExecutorTest {
         var internalExit = new CompletableFuture<Boolean>();
         var outerCancellation = new CompletableFuture<Boolean>();
         var discarded = new CompletableFuture<Integer>();
+        var candidateInterrupted = new AtomicBoolean(true);
 
         var caller = Thread.ofPlatform().start(() -> {
             try {
@@ -138,6 +166,7 @@ class PlanningCandidateExecutorTest {
                                 try {
                                     context.checkpoint();
                                 } catch (PlanningExitException expected) {
+                                    candidateInterrupted.set(Thread.currentThread().isInterrupted());
                                     internalExit.complete(true);
                                     return 42;
                                 }
@@ -163,6 +192,8 @@ class PlanningCandidateExecutorTest {
         assertTrue(internalExit.get(2, TimeUnit.SECONDS));
         assertTrue(outerCancellation.get(2, TimeUnit.SECONDS));
         assertEquals(42, discarded.get(2, TimeUnit.SECONDS));
+        assertFalse(candidateInterrupted.get(),
+                "ordinary cancellation must reach the candidate without interrupting it");
         caller.join(2_000);
         assertFalse(caller.isAlive());
         assertFalse(
@@ -173,6 +204,64 @@ class PlanningCandidateExecutorTest {
                 Thread.onSpinWait();
             }
         });
+    }
+
+    @Test
+    void nonCooperativeExternalCancellationUsesItsOwnGraceBeforeHardInterrupt() throws Exception {
+        var engineId = id("external_cancel_hard_timeout");
+        var started = new CountDownLatch(1);
+        var interruptObserved = new CountDownLatch(1);
+        var mayReturn = new CountDownLatch(1);
+        var outerCancellation = new CompletableFuture<Boolean>();
+        var discarded = new AtomicInteger();
+
+        var caller = Thread.ofPlatform().start(() -> {
+            try {
+                PlanningCandidateExecutor.executeForTest(
+                        engineId,
+                        "non-cooperative external cancellation test",
+                        context -> {
+                            started.countDown();
+                            while (mayReturn.getCount() > 0L) {
+                                if (Thread.currentThread().isInterrupted()) {
+                                    interruptObserved.countDown();
+                                }
+                                Thread.onSpinWait();
+                            }
+                            return 1;
+                        },
+                        Thread::yield,
+                        ignored -> discarded.incrementAndGet(),
+                        5_000,
+                        50);
+                outerCancellation.complete(false);
+            } catch (InterruptedException expected) {
+                outerCancellation.complete(true);
+            } catch (Throwable failure) {
+                outerCancellation.completeExceptionally(failure);
+            }
+        });
+
+        assertTrue(started.await(1, TimeUnit.SECONDS));
+        caller.interrupt();
+        assertTrue(outerCancellation.get(1, TimeUnit.SECONDS));
+        caller.join(1_000L);
+        assertFalse(caller.isAlive());
+
+        try {
+            assertTrue(interruptObserved.await(1, TimeUnit.SECONDS),
+                    "cancellation must use its own grace instead of the original 5 second budget");
+            assertTrue(PlanningCandidateExecutor.isQuarantined(engineId));
+        } finally {
+            mayReturn.countDown();
+        }
+
+        org.junit.jupiter.api.Assertions.assertTimeoutPreemptively(Duration.ofSeconds(2), () -> {
+            while (PlanningCandidateExecutor.isQuarantined(engineId)) {
+                Thread.onSpinWait();
+            }
+        });
+        assertEquals(1, discarded.get());
     }
 
     @Test

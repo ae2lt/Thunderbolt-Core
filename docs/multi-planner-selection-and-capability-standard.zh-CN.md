@@ -252,8 +252,9 @@ HANDLED(null)
 
 一个候选必须独占 AE2 的完整 `computePlan`，包括精确数量、`CRAFT_LESS` 探测和最终
 simulation。只有完整计算与 session `finish` 都成功后才写入结果算法。任何 probe
-`DECLINE`、运行时异常或候选超时都会丢弃该候选的全部结果，从初始 requested amount
-开始运行下一候选；不同算法的 probe 绝不拼成同一份计划。外部取消在候选内部使用统一退出
+`DECLINE` 或运行时异常都会丢弃该候选的全部结果，从初始 requested amount 开始运行下一候选；
+软超时仅停止继续扩展，宽限期内返回的完整结果仍可接受，硬超时才无条件丢弃。不同算法的 probe
+绝不拼成同一份计划。外部取消在候选内部使用统一退出
 协议，但路由层保留取消来源：候选后来返回的结果会被丢弃，整次计算按 cancel 退出且不回退。
 JVM 致命错误同样不回退。
 
@@ -272,27 +273,30 @@ context.report(new PlanningDiagnosticSnapshot(phase, metrics));
 `createSession`、`attempt` 和 `finish` 共用同一个 context。引擎应在图导出、搜索以及高频循环中调用
 `checkpoint()`，并用 engine-neutral 的 phase
 与数值 metrics 报告进度。默认时序为：2 秒记录慢调用诊断；前 3 秒为正常计算预算，
-预算结束后 `checkpoint()` 直接抛候选级 `PlanningExitException`，不发线程中断。外部计算
-取消传入候选时也抛同一个 `PlanningExitException`，不向引擎暴露第二种退出状态。引擎必须在
+预算结束后 `checkpoint()` 直接抛候选级 `PlanningExitException`，但不发线程中断。外部计算
+取消也先传入同一个 `PlanningExitException`，不立刻发线程中断，并从取消时刻给予最多 1 秒
+退出宽限（与原硬期限取先到者）；不向引擎暴露第二种协作退出状态。引擎必须在
 捕获 exit 后立刻收敛：已有经过验证的当前最优计划就返回该计划，没有可用计划就返回
 `DECLINE`，不得再启动新的 probe 或扩展搜索。路由层随后按保留的来源处理：预算退出允许
-接受当前可用结果或顺序回退；外部取消则丢弃任何返回结果，向调用方传播 cancel，绝不回退。返回和
-`finally`/session 清理共用随后 5 秒宽限期；总计 8 秒仍未返回时才调用
-`Thread.interrupt()`。三个时间分别可用
+接受宽限期内返回的完整可用结果或顺序回退；外部取消仍会立即向调用方传播 cancel，并丢弃候选
+后来返回的结果。只有候选未在取消宽限内退出时才发硬中断并隔离，因此正常取消不会令算法进入
+中断路径。
+返回和 `finally`/session 清理共用随后 1 秒宽限期；总计 4 秒仍未返回时隔离并摘除该调用，
+同时发送中断。三个时间分别可用
 `thunderbolt.planningWarnMs`、`thunderbolt.planningTimeoutMs` 和
 `thunderbolt.planningStopGraceMs` 调整。
 
 每个非 Vanilla 候选的 `check/capture` 在提交 AE2 计算任务前由 Grid 所在线程顺序执行；
-所有候选（包括 Vanilla）的计算都在隔离的 daemon 平台线程中执行，自定义引擎的
+所有候选（包括 Vanilla）的计算都在隔离的 daemon 虚拟线程中执行，自定义引擎的
 `createSession/probe/finish/close` 也全部限制在同一个候选线程。session 在成功、`DECLINE`、
-异常或协作退出后统一关闭。等待后台候选时，AE2 计算
-所有者持续执行 `handlePausing()`，不会把服务端 tick 卡在
-`simulateFor()`。宽限期内只接受完整可用结果，不继续启动新的 amount probe；8 秒硬期限到达时
-先把仍在运行的算法（Vanilla 使用其保留 ID）标记为隔离并阻止它的新调用，再发 interrupt，随后调用方立即摘除该次调用并
+异常或超时退出后统一关闭。等待后台候选时，AE2 计算所有者每次只检查一次结果就把当前 tick
+交还给 AE2，不会把服务端 tick 卡在 `simulateFor()`。宽限期内可以接受完整可用结果，但不继续
+启动新的 amount probe；4 秒硬期限到达时先把仍在运行的算法（Vanilla 使用其保留 ID）标记为隔离并
+阻止它的新调用，再发 interrupt，随后调用方立即摘除该次调用并
 按顺序回退。被摘除的调用实际返回后自动解除隔离。Java 的
 `Thread.interrupt()` 只设置中断状态，并只会让 `sleep/wait/join` 等阻塞点直接抛
 `InterruptedException`；任意纯计算代码不会自动抛异常。因此永久忽略 checkpoint 和中断的
-第三方线程可能继续占用一个 daemon 线程，但不能继续卡住 AE2 或被再次选用。Java 21 的
+第三方线程可能继续占用一个 daemon 虚拟线程，但不能继续卡住 AE2 或被再次选用。Java 21 的
 `Thread.stop()` 直接抛 `UnsupportedOperationException`，不作为强杀手段。
 
 候选链按顺序包含 Vanilla。若包括 Vanilla 在内的所有候选均失败，返回一个 fail-closed

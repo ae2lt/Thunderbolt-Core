@@ -193,11 +193,11 @@ Thunderbolt API 不接管以下产品职责：
 
 1. `CraftingPlanningEngines` 是唯一算法注册入口，不恢复第二套 planner registry；
 2. 每个候选会话独占一次完整 `computePlan`；成功前不对外宣布选中算法；
-3. 任一 probe `DECLINE`、运行时异常或 deadline 超时都会丢弃整次候选结果，并按固定顺序从头运行下一算法；
+3. 任一 probe `DECLINE` 或运行时异常都会丢弃整次候选结果并按固定顺序从头运行下一算法；软超时宽限内返回的完整结果仍可接受，硬超时才无条件丢弃；
 4. 不在 probe 中途换算法，不混用不同算法的精确、`CRAFT_LESS` 或 simulation 结果；
-5. 外部取消向候选传入统一的 `PlanningExitException`，但路由层保留来源、丢弃返回值并按 cancel 直接传播；JVM 致命错误也直接传播，二者都不伪装为算法回退；
+5. 外部取消先向候选传入统一的 cooperative `PlanningExitException`，不立刻 interrupt，并从取消时刻给最多 1 秒退出宽限（与原硬期限取先到者）；路由层保留来源、丢弃返回值并按 cancel 直接传播，只有候选不退出才硬中断和隔离；JVM 致命错误也直接传播，二者都不伪装为算法回退；
 6. 所有候选（含 Vanilla）失败时返回空 used、空 missing 的不可提交 simulation 计划，并显示“全部失败”；
-7. 所有候选（含 Vanilla）都在隔离线程运行：3 秒预算到点只发布 deadline，5 秒宽限期内接受已经算出的完整可用结果但不继续扩展搜索；8 秒仍不返回才隔离算法、发 `Thread.interrupt()`、摘除并继续顺序回退；旧调用退出后自动解除隔离；
+7. 所有候选（含 Vanilla）都在隔离虚拟线程运行：3 秒预算到点只发布 cooperative timeout，1 秒宽限期内可接受完整可用结果但不继续扩展搜索；4 秒仍不返回才隔离算法、发 `Thread.interrupt()`、丢弃后续结果、摘除并继续顺序回退；旧调用退出后自动解除隔离；
 8. 等待隔离候选时持续让出 AE2 calculation；不响应 checkpoint/interrupt 的候选也不能卡住调用线程，同一算法在旧调用退出前不能创建新调用；
 9. 扩展 CPU 默认只接受原版 `CraftingPlan`，必须显式重写 `canHandle` 才能接受自定义计划；
 10. `CraftingCpuRestrictedPattern` 的全部限制都通过后，闭环计划才可提交到对应 CPU；

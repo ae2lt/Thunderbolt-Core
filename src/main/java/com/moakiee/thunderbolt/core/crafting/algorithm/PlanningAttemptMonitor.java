@@ -27,7 +27,7 @@ final class PlanningAttemptMonitor implements PlanningAttemptContext, AutoClosea
     private static final long DEFAULT_TIMEOUT_MS = Math.max(1L, Long.getLong(
             "thunderbolt.planningTimeoutMs", 3_000L));
     private static final long DEFAULT_STOP_GRACE_MS = Math.max(0L, Long.getLong(
-            "thunderbolt.planningStopGraceMs", 5_000L));
+            "thunderbolt.planningStopGraceMs", 1_000L));
 
     private static final int ACTIVE = 0;
     private static final int BUDGET_EXPIRED = 1;
@@ -54,11 +54,13 @@ final class PlanningAttemptMonitor implements PlanningAttemptContext, AutoClosea
     private final long startedNanos;
     private final long deadlineNanos;
     private final long hardDeadlineNanos;
+    private final long stopGraceMs;
     private final Runnable hardTimeoutAction;
     private final AtomicInteger state = new AtomicInteger(ACTIVE);
     private final ScheduledFuture<?> warningTask;
     private final ScheduledFuture<?> budgetExpiryTask;
     private final ScheduledFuture<?> hardTimeoutTask;
+    private volatile ScheduledFuture<?> externalCancellationHardTimeoutTask;
 
     private volatile PlanningDiagnosticSnapshot latest = PlanningDiagnosticSnapshot.phase("starting");
     private volatile boolean timeoutObserved;
@@ -78,6 +80,7 @@ final class PlanningAttemptMonitor implements PlanningAttemptContext, AutoClosea
         this.startedNanos = System.nanoTime();
         this.deadlineNanos = saturatedDeadline(startedNanos, timeoutMs);
         this.hardDeadlineNanos = saturatedDeadline(deadlineNanos, stopGraceMs);
+        this.stopGraceMs = stopGraceMs;
         this.hardTimeoutAction = hardTimeoutAction;
         this.warningTask = warnMs <= 0L || warnMs >= timeoutMs
                 ? null
@@ -183,26 +186,24 @@ final class PlanningAttemptMonitor implements PlanningAttemptContext, AutoClosea
         return hardTimeoutObserved;
     }
 
-    void interruptCandidate() {
-        calculationThread.interrupt();
-    }
-
-    /** Forwards an outer cancellation to the engine as the candidate-local exit protocol. */
+    /**
+     * Forwards an outer cancellation as a cooperative exit request. The caller detaches
+     * immediately, but the candidate gets its own grace period before hard interruption.
+     */
     void requestExitForExternalCancellation() {
         while (true) {
             int current = state.get();
-            if (current == CLOSED) {
+            if (current == CLOSED || current == HARD_TIMED_OUT) {
                 return;
             }
-            if (current == HARD_TIMED_OUT || current == EXTERNAL_EXIT_REQUESTED) {
-                break;
+            if (current == EXTERNAL_EXIT_REQUESTED) {
+                return;
             }
             if (state.compareAndSet(current, EXTERNAL_EXIT_REQUESTED)) {
                 break;
             }
         }
-        interruptIssued = true;
-        calculationThread.interrupt();
+        scheduleExternalCancellationHardTimeout();
     }
 
     private void warnSlow() {
@@ -243,10 +244,15 @@ final class PlanningAttemptMonitor implements PlanningAttemptContext, AutoClosea
             }
             if (state.compareAndSet(current, HARD_TIMED_OUT)) {
                 timeoutObserved = true;
-                hardTimeoutObserved = true;
-                hardTimeoutAction.run();
-                interruptIssued = true;
-                calculationThread.interrupt();
+                try {
+                    hardTimeoutAction.run();
+                } finally {
+                    interruptIssued = true;
+                    calculationThread.interrupt();
+                    // Publish completion only after quarantine and interruption are in effect.
+                    // The owning calculation thread can then detach without repeating either.
+                    hardTimeoutObserved = true;
+                }
                 return true;
             }
         }
@@ -290,6 +296,26 @@ final class PlanningAttemptMonitor implements PlanningAttemptContext, AutoClosea
         }
         budgetExpiryTask.cancel(false);
         hardTimeoutTask.cancel(false);
+        var externalHardTimeout = externalCancellationHardTimeoutTask;
+        if (externalHardTimeout != null) {
+            externalHardTimeout.cancel(false);
+        }
+    }
+
+    private void scheduleExternalCancellationHardTimeout() {
+        final ScheduledFuture<?> task;
+        try {
+            task = EXECUTOR.schedule(this::hardTimeout, stopGraceMs, TimeUnit.MILLISECONDS);
+        } catch (RuntimeException schedulingFailure) {
+            // Losing the cancellation timer must not leave an abandoned candidate running
+            // without a hard boundary.
+            markHardTimeout();
+            return;
+        }
+        externalCancellationHardTimeoutTask = task;
+        if (state.get() == CLOSED) {
+            task.cancel(false);
+        }
     }
 
     private static long saturatedDeadline(long started, long timeoutMs) {
