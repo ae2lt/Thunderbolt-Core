@@ -41,13 +41,6 @@ final class PlanningAttemptMonitor implements PlanningAttemptContext, AutoClosea
                 thread.setDaemon(true);
                 return thread;
             });
-    private static final java.util.concurrent.ExecutorService DIAGNOSTICS =
-            Executors.newCachedThreadPool(runnable -> {
-                var thread = new Thread(runnable, "thunderbolt-planning-diagnostics");
-                thread.setDaemon(true);
-                return thread;
-            });
-
     private final ResourceLocation engineId;
     private final String label;
     private final Thread calculationThread;
@@ -65,7 +58,6 @@ final class PlanningAttemptMonitor implements PlanningAttemptContext, AutoClosea
     private volatile PlanningDiagnosticSnapshot latest = PlanningDiagnosticSnapshot.phase("starting");
     private volatile boolean timeoutObserved;
     private volatile boolean hardTimeoutObserved;
-    private volatile boolean interruptIssued;
 
     private PlanningAttemptMonitor(
             ResourceLocation engineId,
@@ -154,12 +146,7 @@ final class PlanningAttemptMonitor implements PlanningAttemptContext, AutoClosea
                         "planning candidate exceeded its stop grace: " + engineId);
             }
             if (current == EXTERNAL_EXIT_REQUESTED) {
-                if (state.compareAndSet(EXTERNAL_EXIT_REQUESTED, CLOSED)) {
-                    Thread.interrupted();
-                    cancelScheduledTasks();
-                    return;
-                }
-                continue;
+                throw new PlanningExitException("planning candidate was cancelled: " + engineId);
             }
             if (Thread.currentThread().isInterrupted()) {
                 throw new CancellationException("crafting calculation interrupted");
@@ -210,7 +197,7 @@ final class PlanningAttemptMonitor implements PlanningAttemptContext, AutoClosea
         if (state.get() != ACTIVE) {
             return;
         }
-        DIAGNOSTICS.execute(() -> LOG.warn(
+        runDiagnostic(() -> LOG.warn(
                 "[Thunderbolt Core] slow planning candidate: engine={} elapsedMs={} {}\n{}",
                 engineId, elapsedMillis(), label, diagnosticDump(true)));
     }
@@ -220,7 +207,7 @@ final class PlanningAttemptMonitor implements PlanningAttemptContext, AutoClosea
             return;
         }
         timeoutObserved = true;
-        DIAGNOSTICS.execute(() -> LOG.warn(
+        runDiagnostic(() -> LOG.warn(
                 "[Thunderbolt Core] planning candidate exhausted its computation budget; "
                         + "waiting for cooperative exit: engine={} elapsedMs={} {}\n{}",
                 engineId, elapsedMillis(), label, diagnosticDump(true)));
@@ -230,7 +217,7 @@ final class PlanningAttemptMonitor implements PlanningAttemptContext, AutoClosea
         if (!markHardTimeout()) {
             return;
         }
-        DIAGNOSTICS.execute(() -> LOG.error(
+        runDiagnostic(() -> LOG.error(
                 "[Thunderbolt Core] planning candidate did not exit within its grace period; "
                         + "interrupting it now: engine={} elapsedMs={} {}\n{}",
                 engineId, elapsedMillis(), label, diagnosticDump(true)));
@@ -247,7 +234,6 @@ final class PlanningAttemptMonitor implements PlanningAttemptContext, AutoClosea
                 try {
                     hardTimeoutAction.run();
                 } finally {
-                    interruptIssued = true;
                     calculationThread.interrupt();
                     // Publish completion only after quarantine and interruption are in effect.
                     // The owning calculation thread can then detach without repeating either.
@@ -283,9 +269,7 @@ final class PlanningAttemptMonitor implements PlanningAttemptContext, AutoClosea
     public void close() {
         int previous = state.getAndSet(CLOSED);
         cancelScheduledTasks();
-        if ((previous == EXTERNAL_EXIT_REQUESTED || previous == HARD_TIMED_OUT)
-                && interruptIssued
-                && Thread.currentThread() == calculationThread) {
+        if (previous == HARD_TIMED_OUT && Thread.currentThread() == calculationThread) {
             Thread.interrupted();
         }
     }
@@ -316,6 +300,10 @@ final class PlanningAttemptMonitor implements PlanningAttemptContext, AutoClosea
         if (state.get() == CLOSED) {
             task.cancel(false);
         }
+    }
+
+    private static void runDiagnostic(Runnable diagnostic) {
+        Thread.ofVirtual().name("thunderbolt-planning-diagnostics").start(diagnostic);
     }
 
     private static long saturatedDeadline(long started, long timeoutMs) {

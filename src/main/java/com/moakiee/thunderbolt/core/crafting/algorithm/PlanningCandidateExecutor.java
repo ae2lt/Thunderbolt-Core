@@ -3,8 +3,6 @@ package com.moakiee.thunderbolt.core.crafting.algorithm;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
-import java.util.concurrent.Executors;
-import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Consumer;
 
@@ -19,12 +17,8 @@ import com.moakiee.thunderbolt.core.crafting.planner.PlanningCancellation;
  * caller detaches and quarantines an invocation that still does not return.
  */
 public final class PlanningCandidateExecutor {
-    private static final ThreadLocal<Boolean> CANDIDATE_THREAD = new ThreadLocal<>();
-
-    private static final java.util.concurrent.ExecutorService EXECUTOR =
-            Executors.newThreadPerTaskExecutor(Thread.ofVirtual()
-                    .name("thunderbolt-planning-candidate-", 0L)
-                    .factory());
+    private static final java.util.concurrent.ThreadFactory CANDIDATE_THREADS =
+            Thread.ofVirtual().name("thunderbolt-planning-candidate-", 0L).factory();
 
     /** Number of detached invocations that have not actually returned yet, keyed by engine. */
     private static final ConcurrentHashMap<ResourceLocation, AtomicInteger> QUARANTINED =
@@ -33,14 +27,9 @@ public final class PlanningCandidateExecutor {
     private PlanningCandidateExecutor() {
     }
 
-    public static boolean isQuarantined(ResourceLocation engineId) {
+    static boolean isQuarantined(ResourceLocation engineId) {
         var count = QUARANTINED.get(engineId);
         return count != null && count.get() > 0;
-    }
-
-    /** True only while the current thread is running isolated candidate work. */
-    public static boolean isCandidateThread() {
-        return Boolean.TRUE.equals(CANDIDATE_THREAD.get());
     }
 
     /**
@@ -48,21 +37,7 @@ public final class PlanningCandidateExecutor {
      * calculation-thread scheduler must be bypassed on this thread.
      */
     public static boolean checkpointCandidateThread() {
-        if (!isCandidateThread()) {
-            return false;
-        }
-        PlanningCancellation.check();
-        return true;
-    }
-
-    public static <T> Result<T> execute(
-            ResourceLocation engineId,
-            String label,
-            Work<T> work,
-            SchedulerYield schedulerYield) throws InterruptedException {
-        return execute(
-                engineId, label, work, schedulerYield, ignored -> { },
-                PlanningAttemptMonitor::start);
+        return PlanningCancellation.checkpointIfBound();
     }
 
     public static <T> Result<T> execute(
@@ -126,11 +101,8 @@ public final class PlanningCandidateExecutor {
 
         var monitorReady = new CompletableFuture<PlanningAttemptMonitor>();
         var result = new CompletableFuture<T>();
-        var quarantineRegistered = new AtomicBoolean();
-        var discardRegistered = new AtomicBoolean();
-        Runnable quarantine = () -> quarantineUntilReturnedOnce(
-                engineId, result, quarantineRegistered);
-        EXECUTOR.execute(() -> {
+        Runnable quarantine = () -> quarantineUntilReturned(engineId, result);
+        CANDIDATE_THREADS.newThread(() -> {
             final PlanningAttemptMonitor monitor;
             try {
                 monitor = monitorFactory.start(engineId, label, quarantine);
@@ -141,13 +113,7 @@ public final class PlanningCandidateExecutor {
             }
             monitorReady.complete(monitor);
             try (monitor; var ignored = PlanningCancellation.bind(monitor)) {
-                T value;
-                CANDIDATE_THREAD.set(Boolean.TRUE);
-                try {
-                    value = work.run(monitor);
-                } finally {
-                    CANDIDATE_THREAD.remove();
-                }
+                T value = work.run(monitor);
                 try {
                     monitor.acceptReturnedResult();
                 } catch (Throwable failure) {
@@ -162,13 +128,13 @@ public final class PlanningCandidateExecutor {
             } catch (Throwable failure) {
                 result.completeExceptionally(failure);
             }
-        });
+        }).start();
 
         PlanningAttemptMonitor monitor;
         try {
             monitor = awaitMonitor(monitorReady, schedulerYield);
         } catch (InterruptedException interrupted) {
-            discardWhenReturnedOnce(result, discard, discardRegistered);
+            discardWhenReturned(result, discard);
             monitorReady.thenAccept(PlanningAttemptMonitor::requestExitForExternalCancellation);
             throw interrupted;
         }
@@ -206,7 +172,7 @@ public final class PlanningCandidateExecutor {
                 }
             }
         } catch (InterruptedException interrupted) {
-            discardWhenReturnedOnce(result, discard, discardRegistered);
+            discardWhenReturned(result, discard);
             monitor.requestExitForExternalCancellation();
             throw interrupted;
         }
@@ -235,13 +201,8 @@ public final class PlanningCandidateExecutor {
         }
     }
 
-    private static void quarantineUntilReturnedOnce(
-            ResourceLocation engineId,
-            CompletableFuture<?> result,
-            AtomicBoolean quarantineRegistered) {
-        if (!quarantineRegistered.compareAndSet(false, true)) {
-            return;
-        }
+    private static void quarantineUntilReturned(
+            ResourceLocation engineId, CompletableFuture<?> result) {
         var count = QUARANTINED.computeIfAbsent(engineId, ignored -> new AtomicInteger());
         count.incrementAndGet();
         result.whenComplete((ignoredResult, ignoredFailure) -> {
@@ -251,13 +212,9 @@ public final class PlanningCandidateExecutor {
         });
     }
 
-    private static <T> void discardWhenReturnedOnce(
-            CompletableFuture<T> result,
-            Consumer<T> discard,
-            AtomicBoolean discardRegistered) {
-        if (discardRegistered.compareAndSet(false, true)) {
-            result.thenAccept(discard);
-        }
+    private static <T> void discardWhenReturned(
+            CompletableFuture<T> result, Consumer<T> discard) {
+        result.thenAccept(discard);
     }
 
     public enum Status {

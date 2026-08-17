@@ -44,26 +44,24 @@ class PlanningCandidateExecutorTest {
     }
 
     @Test
-    void candidateThreadMarkerIsLimitedToIsolatedWork() throws Exception {
+    void cancellationContextIsLimitedToIsolatedWork() throws Exception {
         var candidateMayFinish = new CountDownLatch(1);
-        var workMarked = new AtomicBoolean();
+        var workBound = new AtomicBoolean();
         var workVirtual = new AtomicBoolean();
-        var schedulerMarked = new AtomicBoolean(true);
+        var schedulerBound = new AtomicBoolean(true);
 
-        assertFalse(PlanningCandidateExecutor.isCandidateThread());
+        assertFalse(PlanningCandidateExecutor.checkpointCandidateThread());
         var result = PlanningCandidateExecutor.executeForTest(
-                id("candidate_thread_marker"),
-                "candidate thread marker test",
+                id("candidate_cancellation_context"),
+                "candidate cancellation context test",
                 context -> {
-                    workMarked.set(PlanningCandidateExecutor.isCandidateThread());
+                    workBound.set(PlanningCandidateExecutor.checkpointCandidateThread());
                     workVirtual.set(Thread.currentThread().isVirtual());
-                    assertTrue(PlanningCandidateExecutor.checkpointCandidateThread());
                     assertTrue(candidateMayFinish.await(1, TimeUnit.SECONDS));
                     return 42;
                 },
                 () -> {
-                    schedulerMarked.set(PlanningCandidateExecutor.isCandidateThread());
-                    assertFalse(PlanningCandidateExecutor.checkpointCandidateThread());
+                    schedulerBound.set(PlanningCandidateExecutor.checkpointCandidateThread());
                     candidateMayFinish.countDown();
                     Thread.yield();
                 },
@@ -72,10 +70,10 @@ class PlanningCandidateExecutorTest {
 
         assertEquals(PlanningCandidateExecutor.Status.SUCCESS, result.status());
         assertEquals(42, result.value());
-        assertTrue(workMarked.get());
+        assertTrue(workBound.get());
         assertTrue(workVirtual.get());
-        assertFalse(schedulerMarked.get());
-        assertFalse(PlanningCandidateExecutor.isCandidateThread());
+        assertFalse(schedulerBound.get());
+        assertFalse(PlanningCandidateExecutor.checkpointCandidateThread());
     }
 
     @Test

@@ -74,11 +74,10 @@ class PlannerPackageBoundaryTest {
         assertTrue(mixin.contains("monitor.notify();"));
         assertTrue(mixin.contains("while (!running)"));
         assertFalse(mixin.contains("handlePausing()"));
-        assertTrue(executor.contains("CANDIDATE_THREAD.set(Boolean.TRUE)"));
-        assertTrue(executor.contains("CANDIDATE_THREAD.remove()"));
+        assertFalse(executor.contains("ThreadLocal<"));
         assertTrue(mixin.contains("method = \"handlePausing\""));
         assertTrue(mixin.contains("PlanningCandidateExecutor.checkpointCandidateThread()"));
-        assertTrue(executor.contains("PlanningCancellation.check()"));
+        assertTrue(executor.contains("PlanningCancellation.checkpointIfBound()"));
         assertTrue(mixin.contains("ci.cancel()"));
     }
 

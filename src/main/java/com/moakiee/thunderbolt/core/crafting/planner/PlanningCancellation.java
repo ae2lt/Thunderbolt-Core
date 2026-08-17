@@ -23,6 +23,16 @@ public final class PlanningCancellation {
         }
     }
 
+    /** Runs the bound planning checkpoint and reports whether this is candidate work. */
+    public static boolean checkpointIfBound() {
+        var context = CURRENT.get();
+        if (context == null) {
+            return false;
+        }
+        context.checkpoint();
+        return true;
+    }
+
     public static void report(PlanningDiagnosticSnapshot snapshot) {
         var context = CURRENT.get();
         if (context != null) {
