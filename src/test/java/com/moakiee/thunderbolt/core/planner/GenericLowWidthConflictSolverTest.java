@@ -35,7 +35,9 @@ class GenericLowWidthConflictSolverTest {
         assertFalse(result.plan().feasible());
         assertEquals(Map.of("B", 1L, "C", 1L), result.plan().missing());
         assertEquals(0, result.diagnostics().lowWidthAttempts(),
-                "one local fork keeps the established bounded-search semantics");
+                "the optimistic capacity proof should reject this before building a matrix");
+        assertEquals(1, result.diagnostics().lowWidthInfeasible());
+        assertEquals(1, result.diagnostics().planRuns());
         assertEquals(0, result.diagnostics().consumedFallbackBudget());
     }
 
@@ -58,6 +60,46 @@ class GenericLowWidthConflictSolverTest {
         assertTrue(plan.feasible());
         assertEquals(1L, plan.firings().getOrDefault(viaA, 0L));
         assertEquals(0L, plan.firings().getOrDefault(viaB, 0L));
+    }
+
+    @Test
+    void orderedValidationRejectsRelaxedHostMatchAndResolvesWithNoGood() {
+        var left = new ReusableStockSource("host", "left-pool", "left-route");
+        var right = new ReusableStockSource("host", "right-pool", "right-route");
+        CraftPattern<String> good = new CraftPattern<>(
+                "X", 1, List.of(CraftInput.of("special", 1)), "good");
+        CraftPattern<String> relaxedBad = new CraftPattern<>(
+                "X",
+                1,
+                List.of(
+                        CraftInput.returnedFrom("left-seed", 1, left),
+                        CraftInput.returnedFrom("right-seed", 1, right)),
+                "relaxed-bad");
+        CraftGraph<String> graph = CraftGraph.<String>builder()
+                // Coordinate minimization removes the first route when both look feasible, making
+                // the relaxed fuzzy-host candidate the first vector sent to ordered validation.
+                .pattern(good)
+                .pattern(relaxedBad)
+                .stock("special", 1)
+                .reusableStock("host", "shared", 1)
+                .reusableStock("host", "unrelated", 1)
+                .reusableStockRoute(left, "left-seed", List.of("shared"))
+                .reusableStockRoute(right, "right-seed", List.of("shared"))
+                .build();
+
+        PlanningResult<String> result = CraftPlannerV2.planDetailed(graph, "X", 1);
+
+        assertTrue(result.plan().feasible());
+        assertEquals(1L, result.plan().usedStock().get("special"));
+        assertTrue(result.plan().usedReusableStock().isEmpty(),
+                "the rejected validator attempt must be completely rolled back");
+        assertEquals(0L, result.plan().firings().getOrDefault(relaxedBad, 0L));
+        assertEquals(1L, result.plan().firings().getOrDefault(good, 0L));
+        assertEquals(2, result.diagnostics().lowWidthAttempts(),
+                "one initial solve plus one support no-good re-solve");
+        assertEquals(2, result.diagnostics().lowWidthSolved());
+        assertEquals(0, result.diagnostics().consumedSearchBudget());
+        assertEquals(1, result.diagnostics().planRuns());
     }
 
     @Test

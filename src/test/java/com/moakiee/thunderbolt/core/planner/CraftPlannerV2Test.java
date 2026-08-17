@@ -1387,7 +1387,10 @@ class CraftPlannerV2Test {
         assertFalse(planning.plan().budgetExhausted());
         assertFalse(planning.diagnostics().searchCutoff(),
                 "using the one admitted candidate is not a budget cutoff");
-        assertEquals(1, planning.diagnostics().consumedSearchBudget());
+        assertEquals(0, planning.diagnostics().consumedSearchBudget(),
+                "the fixed integer vector needs validation, not another route search");
+        assertEquals(1, planning.diagnostics().lowWidthSolved());
+        assertEquals(1, planning.diagnostics().planRuns());
         assertEquals(1L, firingsOf(planning.plan(), seedFromA));
         assertEquals(1_000L, firingsOf(planning.plan(), contracted));
     }
@@ -2211,13 +2214,9 @@ class CraftPlannerV2Test {
         assertEquals(1L, firingsOf(plan, good));
     }
 
-    /**
-     * Exhausting the global work guard is not a proof that every route needs the same leaf, but AE2's
-     * simulation still needs an actionable replenishment target. The current run must roll back only
-     * its speculative branch and finish one concrete route without launching a diagnostic replan.
-     */
+    /** The exact balance model is independently bounded and does not consume route-search work. */
     @Test
-    void globalSearchBudgetExhaustionReturnsABoundedMissingDiagnosis() {
+    void globalIntegerFlowDoesNotSpendTinyRouteSearchBudget() {
         CraftGraph<String> graph = CraftGraph.<String>builder()
                 .pattern("X", 1, List.of(CraftInput.of("shared", 1)))
                 .pattern("Y", 1, List.of(CraftInput.of("shared", 1)))
@@ -2233,17 +2232,17 @@ class CraftPlannerV2Test {
                 CraftPlannerV2.planDetailed(graph, "target", 1, 1, 1);
         CraftPlan<String> plan = planning.plan();
 
-        assertFalse(plan.feasible());
-        assertTrue(plan.budgetExhausted());
-        assertFalse(plan.firings().isEmpty(), "the diagnostic retains one concrete route");
-        assertEquals(1L, plan.usedStock().get("shared"));
-        assertEquals(1L, plan.missing().get("shared"));
-        assertFalse(plan.usedStock().containsKey("good"),
-                "the discarded speculative alternative must not leak into the diagnosis");
+        assertTrue(plan.feasible());
+        assertFalse(plan.budgetExhausted());
+        assertEquals(1L, plan.usedStock().get("good"));
+        assertFalse(plan.usedStock().containsKey("shared"));
+        assertTrue(plan.missing().isEmpty());
         assertEquals(1, planning.diagnostics().planRuns(),
-                "a cutoff must finish the current run, not launch a diagnostic replan");
+                "the feasible integer vector must finish without a diagnostic replan");
         assertEquals(1, planning.diagnostics().compiledOrientations());
-        assertTrue(planning.diagnostics().searchCutoff());
+        assertEquals(1, planning.diagnostics().lowWidthSolved());
+        assertEquals(0, planning.diagnostics().consumedSearchBudget());
+        assertFalse(planning.diagnostics().searchCutoff());
 
         CraftGraph<String> replenished = CraftGraph.<String>builder()
                 .pattern("X", 1, List.of(CraftInput.of("shared", 1)))
@@ -2259,18 +2258,18 @@ class CraftPlannerV2Test {
                 CraftPlannerV2.plan(replenished, "target", 1, 1, 1);
 
         assertTrue(afterReplenishment.feasible(),
-                "supplying the diagnosed shortfall must make that concrete route executable");
+                "the alternate shared-input route remains executable when fully stocked");
         assertFalse(afterReplenishment.budgetExhausted(),
-                "a feasible diagnostic route is a complete proof despite the earlier search cutoff");
+                "a feasible integer-flow proof is complete even with a tiny search budget");
     }
 
     /**
      * X's first route is locally feasible but consumes the only shared unit before sibling Y asks for
-     * it. The ordinary recursive pass cannot reopen that successful decision. A whole-plan deviation
-     * must replay X through special and preserve shared for Y.
+     * it. The global integer model must choose X through special and preserve shared for Y without a
+     * whole-plan deviation.
      */
     @Test
-    void anytimeReplayReopensSuccessfulChildAfterLaterSiblingConflict() {
+    void globalIntegerFlowResolvesLaterSiblingConflictWithoutReplay() {
         ReusableStockSource source = new ReusableStockSource("host", "pool");
         CraftPattern<String> xShared = new CraftPattern<>(
                 "X", 1, List.of(CraftInput.of("shared", 1)), "X-shared");
@@ -2292,7 +2291,7 @@ class CraftPlannerV2Test {
 
         CraftPlan<String> plan = CraftPlannerV2.plan(graph, "target", 1);
 
-        assertTrue(plan.feasible(), "one route-policy deviation should resolve the sibling conflict");
+        assertTrue(plan.feasible(), "one integer-flow solve should resolve the sibling conflict");
         assertFalse(plan.budgetExhausted());
         assertEquals(0L, firingsOf(plan, xShared));
         assertEquals(1L, firingsOf(plan, xSpecial));
@@ -2301,7 +2300,7 @@ class CraftPlannerV2Test {
     }
 
     @Test
-    void anytimeReplayFinishesWithinBudgetWithoutFalseCutoff() {
+    void globalIntegerFlowFinishesWithinBudgetWithoutFalseCutoff() {
         ReusableStockSource source = new ReusableStockSource("host", "pool");
         CraftPattern<String> xShared = new CraftPattern<>(
                 "X", 1, List.of(CraftInput.of("shared", 1)), "X-shared");
@@ -2326,7 +2325,7 @@ class CraftPlannerV2Test {
         CraftPlan<String> plan = planning.plan();
 
         assertTrue(plan.feasible(),
-                "budget exhaustion stops alternate search but must not kill the selected replay");
+                "the selected integer vector must not depend on alternate-search budget");
         assertFalse(plan.budgetExhausted(),
                 "the deterministic tail produced a complete executable proof");
         assertEquals(0L, firingsOf(plan, xShared));
@@ -2335,10 +2334,13 @@ class CraftPlannerV2Test {
         assertEquals(1L, plan.usedStock().get("special"));
         assertTrue(plan.missing().isEmpty());
         assertFalse(planning.diagnostics().searchCutoff(),
-                "a successful replay that fits the budget must not be reported as cut off");
+                "successful ordered validation must not be reported as cut off");
         assertEquals(1, planning.diagnostics().compiledOrientations());
-        assertTrue(planning.diagnostics().reusedCompilations() >= 1,
-                "route replay must reuse the compiled DAG/capacity/footprint data");
+        assertEquals(0, planning.diagnostics().reusedCompilations(),
+                "the integer vector must avoid whole-plan route replay");
+        assertEquals(1, planning.diagnostics().lowWidthSolved());
+        assertEquals(1, planning.diagnostics().planRuns());
+        assertEquals(0, planning.diagnostics().consumedSearchBudget());
     }
 
     @Test
@@ -2389,16 +2391,16 @@ class CraftPlannerV2Test {
         }
         builder.stock("B" + depth, 4);
 
-        CraftPlan<String> plan = CraftPlannerV2.plan(builder.build(), "target", 1);
+        PlanningResult<String> planning =
+                CraftPlannerV2.planDetailed(builder.build(), "target", 1);
+        CraftPlan<String> plan = planning.plan();
 
         assertFalse(plan.feasible());
         assertFalse(plan.budgetExhausted());
         assertEquals(8L, plan.missing().get("C"));
-        assertEquals(5L, plan.usedStock().get("A"));
-        assertFalse(plan.usedStock().containsKey("B" + depth),
-                "the alternative B tree is irrelevant once its common C blocker is proven");
-        assertEquals(1, plan.itemsProcessed(),
-                "only target is expanded; the committed best effort reports C directly");
+        assertEquals(1, planning.diagnostics().lowWidthInfeasible(),
+                "the shared blocker is now proved by one global balance model");
+        assertEquals(1, planning.diagnostics().planRuns());
     }
 
     @Test
@@ -2554,11 +2556,13 @@ class CraftPlannerV2Test {
                 .pattern("D", 1, List.of(CraftInput.of("E", 2)))
                 .build();
 
-        CraftPlan<String> plan = CraftPlannerV2.plan(graph, "B", 1_000);
+        PlanningResult<String> planning = CraftPlannerV2.planDetailed(graph, "B", 1_000);
+        CraftPlan<String> plan = planning.plan();
 
         assertFalse(plan.feasible());
-        assertEquals(7, plan.itemsProcessed(),
-                "both non-equivalent proof trees plus one committed best-effort tree");
+        assertEquals(1, planning.diagnostics().lowWidthInfeasible(),
+                "both material ratios must participate in the global infeasibility proof");
+        assertEquals(1, planning.diagnostics().planRuns());
     }
 
     /**
