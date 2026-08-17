@@ -2681,21 +2681,8 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
         var missing = new HashSet<AEKey>();
         for (var entry : exactRequired.entrySet()) {
             long required = entry.getValue();
-            if (required <= 0) {
-                continue;
-            }
-            // Reserved seeds and retained final outputs physically sit in this inventory but
-            // must not be consumed as pattern inputs; mirror the delivery-path protection.
-            long reusableReserve = Math.max(
-                    seedReturnQuota.get(entry.getKey()),
-                    loopSeedLedgers.totalReserved(entry.getKey()));
-            long reserved = addSaturated(reusableReserve, retainedFinalOutputs.get(entry.getKey()));
-            // Cap the probe at required + reserved: capping at just required would truncate the
-            // result to min(held, required), which always fails the check below when reserved > 0
-            // even if held >= required + reserved.
-            long available = inventory.extract(
-                    entry.getKey(), addSaturated(required, reserved), Actionable.SIMULATE);
-            if (available - reserved < required) {
+            if (required > 0 && inventory.extract(
+                    entry.getKey(), required, Actionable.SIMULATE) < required) {
                 missing.add(entry.getKey());
             }
         }
