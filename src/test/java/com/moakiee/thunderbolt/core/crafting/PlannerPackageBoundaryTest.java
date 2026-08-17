@@ -58,6 +58,31 @@ class PlannerPackageBoundaryTest {
     }
 
     @Test
+    void candidateWaitingChecksOnceAndHandsTheTickBackImmediately() throws Exception {
+        var executor = Files.readString(Path.of(
+                "src/main/java/com/moakiee/thunderbolt/core/crafting/algorithm/"
+                        + "PlanningCandidateExecutor.java"));
+        var mixin = Files.readString(Path.of(
+                "src/main/java/com/moakiee/thunderbolt/mixin/ae2/crafting/"
+                        + "CraftingCalculationMixin.java"));
+
+        assertTrue(executor.contains("if (!result.isDone())"));
+        assertFalse(executor.contains("POLL_MS"));
+        assertFalse(executor.contains("get(POLL_MS"));
+        assertTrue(mixin.contains("this::thunderbolt$pauseUntilNextTick"));
+        assertTrue(mixin.contains("running = false;"));
+        assertTrue(mixin.contains("monitor.notify();"));
+        assertTrue(mixin.contains("while (!running)"));
+        assertFalse(mixin.contains("handlePausing()"));
+        assertTrue(executor.contains("CANDIDATE_THREAD.set(Boolean.TRUE)"));
+        assertTrue(executor.contains("CANDIDATE_THREAD.remove()"));
+        assertTrue(mixin.contains("method = \"handlePausing\""));
+        assertTrue(mixin.contains("PlanningCandidateExecutor.checkpointCandidateThread()"));
+        assertTrue(executor.contains("PlanningCancellation.check()"));
+        assertTrue(mixin.contains("ci.cancel()"));
+    }
+
+    @Test
     void mixinBridgeLivesOutsideTheDeclaredMixinPackage() {
         var source = Path.of("src/main/java/com/moakiee/thunderbolt");
         assertTrue(Files.exists(source.resolve("ae2/crafting/CraftingPlanningControl.java")));

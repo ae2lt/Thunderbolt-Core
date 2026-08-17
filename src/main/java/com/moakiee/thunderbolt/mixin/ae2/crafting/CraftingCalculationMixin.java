@@ -6,6 +6,7 @@ import java.util.concurrent.CancellationException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
+import com.google.common.base.Stopwatch;
 import com.llamalad7.mixinextras.injector.wrapoperation.Operation;
 import com.llamalad7.mixinextras.injector.wrapoperation.WrapOperation;
 import org.jetbrains.annotations.Nullable;
@@ -15,6 +16,7 @@ import org.spongepowered.asm.mixin.Shadow;
 import org.spongepowered.asm.mixin.Unique;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
+import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
 
 import appeng.api.networking.IGrid;
@@ -71,10 +73,18 @@ public abstract class CraftingCalculationMixin implements CraftingPlanningContro
     private boolean simulate;
 
     @Shadow
-    abstract net.minecraft.world.level.Level getLevel();
+    @Final
+    private Object monitor;
 
     @Shadow
-    abstract void handlePausing() throws InterruptedException;
+    @Final
+    private Stopwatch watch;
+
+    @Shadow
+    private boolean running;
+
+    @Shadow
+    abstract net.minecraft.world.level.Level getLevel();
 
     @Unique
     private List<CapturedPlanningChoice> thunderbolt$candidates =
@@ -188,7 +198,7 @@ public abstract class CraftingCalculationMixin implements CraftingPlanningContro
                                 ? thunderbolt$runVanillaCandidate(instance, original, context)
                                 : thunderbolt$runEngineCandidate(
                                         engine, candidateRequest, candidate.capturedInput(), context),
-                        this::thunderbolt$yieldToAe2Scheduler,
+                        this::thunderbolt$pauseUntilNextTick,
                         CraftingCalculationMixin::thunderbolt$discardCandidatePlan);
                 if (execution.status() == PlanningCandidateExecutor.Status.QUARANTINED) {
                     thunderbolt$declinedEngines.incrementAndGet();
@@ -278,6 +288,16 @@ public abstract class CraftingCalculationMixin implements CraftingPlanningContro
             return;
         }
         throw new PlanningCandidateDeclinedException();
+    }
+
+    @Inject(method = "handlePausing", at = @At("HEAD"), cancellable = true, remap = false)
+    private void thunderbolt$keepCandidateOffAe2Scheduler(CallbackInfo ci) {
+        // AE2's monitor protocol has exactly one calculation-thread waiter. Candidate work runs
+        // on a separate thread, so it must use Thunderbolt's cancellation context instead of
+        // becoming a second waiter on monitor and competing with the owning AE2 worker.
+        if (PlanningCandidateExecutor.checkpointCandidateThread()) {
+            ci.cancel();
+        }
     }
 
     @Unique
@@ -383,9 +403,22 @@ public abstract class CraftingCalculationMixin implements CraftingPlanningContro
     }
 
     @Unique
-    private void thunderbolt$yieldToAe2Scheduler() throws InterruptedException {
-        for (int i = 0; i <= 100; i++) {
-            handlePausing();
+    private void thunderbolt$pauseUntilNextTick() throws InterruptedException {
+        synchronized (monitor) {
+            // The real planning work runs on an isolated candidate thread. Waiting for it must not
+            // spend AE2's per-job microsecond budget: publish one incomplete observation, wake the
+            // server thread immediately, and check the result once again on the next simulateFor.
+            running = false;
+            if (watch.isRunning()) {
+                watch.stop();
+            }
+            monitor.notify();
+            while (!running) {
+                monitor.wait();
+            }
+        }
+        if (Thread.interrupted()) {
+            throw new InterruptedException("crafting calculation cancelled");
         }
     }
 

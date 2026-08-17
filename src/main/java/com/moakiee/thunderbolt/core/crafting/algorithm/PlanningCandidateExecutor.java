@@ -4,8 +4,6 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executors;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Consumer;
@@ -21,7 +19,7 @@ import com.moakiee.thunderbolt.core.crafting.planner.PlanningCancellation;
  * the caller detaches and quarantines an invocation that still does not return.
  */
 public final class PlanningCandidateExecutor {
-    private static final long POLL_MS = 1L;
+    private static final ThreadLocal<Boolean> CANDIDATE_THREAD = new ThreadLocal<>();
 
     private static final java.util.concurrent.ExecutorService EXECUTOR =
             Executors.newCachedThreadPool(runnable -> {
@@ -40,6 +38,23 @@ public final class PlanningCandidateExecutor {
     public static boolean isQuarantined(ResourceLocation engineId) {
         var count = QUARANTINED.get(engineId);
         return count != null && count.get() > 0;
+    }
+
+    /** True only while the current thread is running isolated candidate work. */
+    public static boolean isCandidateThread() {
+        return Boolean.TRUE.equals(CANDIDATE_THREAD.get());
+    }
+
+    /**
+     * Runs the isolated candidate's cancellation checkpoint and reports whether AE2's native
+     * calculation-thread scheduler must be bypassed on this thread.
+     */
+    public static boolean checkpointCandidateThread() {
+        if (!isCandidateThread()) {
+            return false;
+        }
+        PlanningCancellation.check();
+        return true;
     }
 
     public static <T> Result<T> execute(
@@ -111,7 +126,13 @@ public final class PlanningCandidateExecutor {
             var monitor = monitorFactory.start(engineId, label, quarantine);
             monitorReady.complete(monitor);
             try (monitor; var ignored = PlanningCancellation.bind(monitor)) {
-                T value = work.run(monitor);
+                T value;
+                CANDIDATE_THREAD.set(Boolean.TRUE);
+                try {
+                    value = work.run(monitor);
+                } finally {
+                    CANDIDATE_THREAD.remove();
+                }
                 try {
                     monitor.acceptReturnedResult();
                 } catch (Throwable failure) {
@@ -142,19 +163,22 @@ public final class PlanningCandidateExecutor {
                 if (Thread.interrupted()) {
                     throw new InterruptedException("crafting calculation cancelled");
                 }
-                try {
-                    T value = result.get(POLL_MS, TimeUnit.MILLISECONDS);
-                    if (Thread.interrupted()) {
-                        throw new InterruptedException("crafting calculation cancelled");
-                    }
-                    return new Result<>(Status.SUCCESS, value, null);
-                } catch (TimeoutException ignored) {
+                if (!result.isDone()) {
                     if (monitor.hardTimedOut()) {
                         monitor.interruptCandidate();
                         quarantine.run();
                         return new Result<>(Status.HARD_TIMEOUT, null, null);
                     }
                     schedulerYield.run();
+                    continue;
+                }
+                try {
+                    // isDone is the per-tick gate: get cannot wait once a CompletableFuture is done.
+                    T value = result.get();
+                    if (Thread.interrupted()) {
+                        throw new InterruptedException("crafting calculation cancelled");
+                    }
+                    return new Result<>(Status.SUCCESS, value, null);
                 } catch (ExecutionException failed) {
                     if (Thread.interrupted()) {
                         throw new InterruptedException("crafting calculation cancelled");
@@ -178,14 +202,16 @@ public final class PlanningCandidateExecutor {
     private static PlanningAttemptMonitor awaitMonitor(
             CompletableFuture<PlanningAttemptMonitor> monitorReady,
             SchedulerYield schedulerYield) throws InterruptedException {
-        while (true) {
-            try {
-                return monitorReady.get(POLL_MS, TimeUnit.MILLISECONDS);
-            } catch (TimeoutException ignored) {
-                schedulerYield.run();
-            } catch (ExecutionException impossible) {
-                throw new IllegalStateException("candidate monitor failed to start", impossible.getCause());
+        while (!monitorReady.isDone()) {
+            if (Thread.interrupted()) {
+                throw new InterruptedException("crafting calculation cancelled");
             }
+            schedulerYield.run();
+        }
+        try {
+            return monitorReady.get();
+        } catch (ExecutionException impossible) {
+            throw new IllegalStateException("candidate monitor failed to start", impossible.getCause());
         }
     }
 

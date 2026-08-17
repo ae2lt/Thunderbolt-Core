@@ -20,6 +20,106 @@ import com.moakiee.thunderbolt.api.crafting.PlanningExitException;
 
 class PlanningCandidateExecutorTest {
     @Test
+    void candidateThreadMarkerIsLimitedToIsolatedWork() throws Exception {
+        var candidateMayFinish = new CountDownLatch(1);
+        var workMarked = new AtomicBoolean();
+        var schedulerMarked = new AtomicBoolean(true);
+
+        assertFalse(PlanningCandidateExecutor.isCandidateThread());
+        var result = PlanningCandidateExecutor.executeForTest(
+                id("candidate_thread_marker"),
+                "candidate thread marker test",
+                context -> {
+                    workMarked.set(PlanningCandidateExecutor.isCandidateThread());
+                    assertTrue(PlanningCandidateExecutor.checkpointCandidateThread());
+                    assertTrue(candidateMayFinish.await(1, TimeUnit.SECONDS));
+                    return 42;
+                },
+                () -> {
+                    schedulerMarked.set(PlanningCandidateExecutor.isCandidateThread());
+                    assertFalse(PlanningCandidateExecutor.checkpointCandidateThread());
+                    candidateMayFinish.countDown();
+                    Thread.yield();
+                },
+                5_000,
+                5_000);
+
+        assertEquals(PlanningCandidateExecutor.Status.SUCCESS, result.status());
+        assertEquals(42, result.value());
+        assertTrue(workMarked.get());
+        assertFalse(schedulerMarked.get());
+        assertFalse(PlanningCandidateExecutor.isCandidateThread());
+    }
+
+    @Test
+    void candidateSchedulerBypassStillHonorsThePlanningTimeout() {
+        var result = org.junit.jupiter.api.Assertions.assertTimeoutPreemptively(
+                Duration.ofSeconds(2),
+                () -> PlanningCandidateExecutor.executeForTest(
+                        id("candidate_scheduler_bypass_timeout"),
+                        "candidate scheduler bypass timeout test",
+                        context -> {
+                            while (true) {
+                                assertTrue(PlanningCandidateExecutor.checkpointCandidateThread());
+                                Thread.onSpinWait();
+                            }
+                        },
+                        Thread::yield,
+                        20,
+                        1_000));
+
+        assertEquals(PlanningCandidateExecutor.Status.SOFT_TIMEOUT, result.status());
+        assertTrue(result.failure() instanceof PlanningExitException);
+    }
+
+    @Test
+    void incompleteCandidateIsCheckedOnlyAfterTheSchedulerResumes() throws Exception {
+        var candidateMayFinish = new CountDownLatch(1);
+        var candidateReturning = new CountDownLatch(1);
+        var firstYield = new CountDownLatch(1);
+        var nextTick = new CountDownLatch(1);
+        var schedulerYields = new AtomicInteger();
+        var outcome = new CompletableFuture<PlanningCandidateExecutor.Result<Integer>>();
+
+        var caller = Thread.ofPlatform().start(() -> {
+            try {
+                outcome.complete(PlanningCandidateExecutor.executeForTest(
+                        id("one_check_per_tick"),
+                        "one check per tick test",
+                        context -> {
+                            assertTrue(candidateMayFinish.await(1, TimeUnit.SECONDS));
+                            candidateReturning.countDown();
+                            return 42;
+                        },
+                        () -> {
+                            schedulerYields.incrementAndGet();
+                            candidateMayFinish.countDown();
+                            firstYield.countDown();
+                            assertTrue(nextTick.await(1, TimeUnit.SECONDS));
+                        },
+                        5_000,
+                        5_000));
+            } catch (Throwable failure) {
+                outcome.completeExceptionally(failure);
+            }
+        });
+
+        assertTrue(firstYield.await(1, TimeUnit.SECONDS));
+        assertTrue(candidateReturning.await(1, TimeUnit.SECONDS));
+        Thread.sleep(25L);
+        assertEquals(1, schedulerYields.get(),
+                "an incomplete result must not be checked again within the same tick");
+
+        nextTick.countDown();
+        var result = outcome.get(1, TimeUnit.SECONDS);
+        assertEquals(PlanningCandidateExecutor.Status.SUCCESS, result.status());
+        assertEquals(42, result.value());
+        assertEquals(1, schedulerYields.get());
+        caller.join(1_000L);
+        assertFalse(caller.isAlive());
+    }
+
+    @Test
     void externalCancellationIsExitInsideAndCancellationOutside() throws Exception {
         var engineId = id("external_cancel");
         var started = new CountDownLatch(1);
