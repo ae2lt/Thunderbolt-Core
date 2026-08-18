@@ -15,17 +15,18 @@ class OptionalMixinSelectorTest {
     }
 
     @Test
-    void skipsNeoEcoTargetsWhenAddonIsMissing() {
-        assertFalse(OptionalMixinSelector.shouldApply("ECOCraftingCpuLogicBatchMixin", ignored -> false));
-        assertFalse(OptionalMixinSelector.shouldApply("ECOCraftingCpuAccessor", ignored -> false));
-        assertFalse(OptionalMixinSelector.shouldApply("NeoEcoPatternBusBatchMixin", ignored -> false));
+    void skipsExtendedAePlusTargetWhenAddonIsMissing() {
+        assertFalse(OptionalMixinSelector.shouldApply(
+                "ExtendedAePlusSuperMatrixBatchMixin",
+                ignored -> false));
     }
 
     @Test
     void appliesOptionalTargetsWhenTheirModIsLoaded() {
         assertTrue(OptionalMixinSelector.shouldApply("AdvCraftingCpuAccessor", "advanced_ae"::equals));
-        assertTrue(OptionalMixinSelector.shouldApply("ECOCraftingCpuLogicBatchMixin", "neoecoae"::equals));
-        assertTrue(OptionalMixinSelector.shouldApply("NeoEcoPatternBusBatchMixin", "neoecoae"::equals));
+        assertTrue(OptionalMixinSelector.shouldApply(
+                "ExtendedAePlusSuperMatrixBatchMixin",
+                "extendedae_plus"::equals));
     }
 
     @Test

@@ -1,4 +1,4 @@
-package com.moakiee.thunderbolt.mixin.compat.neoeco;
+package com.moakiee.thunderbolt.mixin.compat.extendedaeplus;
 
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Pseudo;
@@ -8,19 +8,19 @@ import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.world.level.block.entity.BlockEntity;
 
 import appeng.api.crafting.IPatternDetails;
+import appeng.api.networking.crafting.ICraftingProvider;
 import appeng.api.stacks.KeyCounter;
 
 import com.moakiee.thunderbolt.CoreConfig;
-import com.moakiee.thunderbolt.api.crafting.batch.BatchJobView;
 import com.moakiee.thunderbolt.api.crafting.batch.IBatchCraftingProvider;
-import com.moakiee.thunderbolt.compat.neoeco.NeoEcoPatternBusBatchBridge;
+import com.moakiee.thunderbolt.compat.extendedaeplus.ExtendedAePlusSuperMatrixBatchBridge;
 
-/** Adds Thunderbolt's batch-provider contract to NeoECO's native verified batch bus. */
+/** Adds Thunderbolt batch dispatch only to EAEP's own Super Assembler Matrix provider. */
 @Pseudo
 @Mixin(
-        targets = "cn.dancingsnow.neoecoae.blocks.entity.crafting.ECOCraftingPatternBusBlockEntity",
+        targets = "com.extendedae_plus.content.matrix.supermatrix.SuperAssemblerMatrixBlockEntity",
         remap = false)
-public abstract class NeoEcoPatternBusBatchMixin implements IBatchCraftingProvider {
+public abstract class ExtendedAePlusSuperMatrixBatchMixin implements IBatchCraftingProvider {
     @Unique
     private long thunderbolt$batchLimitRulesVersion = Long.MIN_VALUE;
     @Unique
@@ -28,8 +28,13 @@ public abstract class NeoEcoPatternBusBatchMixin implements IBatchCraftingProvid
 
     @Override
     public long getBatchCapacity(IPatternDetails details) {
-        long capacity = NeoEcoPatternBusBatchBridge.capacity(this, details);
-        return Math.min(capacity, thunderbolt$batchCopyLimit());
+        var self = (ICraftingProvider) (Object) this;
+        if (self.isBusy()) {
+            return 0L;
+        }
+        return Math.min(
+                ExtendedAePlusSuperMatrixBatchBridge.capacity(details),
+                thunderbolt$batchCopyLimit());
     }
 
     @Override
@@ -37,26 +42,15 @@ public abstract class NeoEcoPatternBusBatchMixin implements IBatchCraftingProvid
             IPatternDetails details,
             KeyCounter[] oneCopyTemplate,
             long maxCraft) {
-        return maxCraft;
-    }
-
-    @Override
-    public long pushBatch(
-            IPatternDetails details,
-            KeyCounter[] oneCopyTemplate,
-            long maxCraft,
-            BatchJobView job) {
         long limited = Math.min(maxCraft, thunderbolt$batchCopyLimit());
         if (limited <= 0L) {
             return maxCraft;
         }
-        long limitedLeftover = NeoEcoPatternBusBatchBridge.pushBatch(
-                this,
+        long limitedLeftover = ExtendedAePlusSuperMatrixBatchBridge.pushBatch(
+                (ICraftingProvider) (Object) this,
                 details,
                 oneCopyTemplate,
-                limited,
-                job.level(),
-                job.craftingId());
+                limited);
         long accepted = limited - Math.clamp(limitedLeftover, 0L, limited);
         return maxCraft - accepted;
     }
