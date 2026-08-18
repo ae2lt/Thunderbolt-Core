@@ -10,7 +10,7 @@ version = mod_version
 group = mod_group_id
 
 base {
-    archivesName = project.findProperty("artifact_name") ?: mod_id
+    archivesName = "${project.findProperty('artifact_name') ?: mod_id}-forge-${minecraft_version}"
 }
 
 java.toolchain.languageVersion = JavaLanguageVersion.of(17)
@@ -68,6 +68,8 @@ mixin {
 // transforming classloader, so runClient/runServer cannot read the otherwise valid JSON.
 // Keep the release-jar manifest explicit, while the source manifest covers exploded runs.
 jar {
+    archiveClassifier = 'slim'
+
     manifest {
         attributes 'MixinConfigs': "${mod_id}.mixins.json"
     }
@@ -82,6 +84,8 @@ jar {
 }
 
 tasks.named('jarJar', Jar) {
+    archiveClassifier = ''
+
     from('LICENSE') {
         into 'META-INF'
     }

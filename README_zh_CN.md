@@ -4,7 +4,7 @@
 
 Thunderbolt Core 是 AE2 Lightning Tech 使用的 AE2 优化与底层基础设施模组，也可以单独安装为 AE2 自动合成加速器。
 
-本仓库跟踪上游项目的 **Minecraft Forge 1.20.1 移植版**（`1.20` 分支），并尽力与 [ae2lt/Thunderbolt-Core](https://github.com/ae2lt/Thunderbolt-Core) 的 `main` 分支保持同步。
+本仓库跟踪上游项目的 **Minecraft Forge 1.20.1 移植版**（`1.20.1` 分支），并尽力与 [ae2lt/Thunderbolt-Core](https://github.com/ae2lt/Thunderbolt-Core) 的 `main` 分支保持同步。
 
 ## 环境要求
 
@@ -41,10 +41,10 @@ Thunderbolt Core 是 AE2 Lightning Tech 使用的 AE2 优化与底层基础设�
 .\gradlew.bat publishToMavenLocal
 ```
 
-Maven 坐标：`com.moakiee.thunderbolt:thunderbolt:1.0.7`。
+Maven 坐标：`com.moakiee.thunderbolt:thunderbolt:1.0.6-beta.1`。
 
-本地构建得到的可分发文件是 `build/libs/thunderbolt-1.0.7-all.jar`。
-不带分类后缀的 JAR 不含运行时必需的 MixinExtras 内嵌依赖，只作为开发过程的中间产物。
+本地构建得到的可分发文件是 `build/libs/thunderbolt-forge-1.20.1-1.0.6-beta.1.jar`。
+带 `-slim.jar` 后缀的 JAR 不含运行时必需的 MixinExtras 内嵌依赖，只作为开发过程的中间产物。
 
 问题反馈：[GitHub Issues](https://github.com/ae2lt/Thunderbolt-Core/issues) ·
 许可证：[GNU LGPL 3.0](LICENSE)

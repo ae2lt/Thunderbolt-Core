@@ -6,7 +6,7 @@ Thunderbolt Core is the shared AE2 optimization and infrastructure layer for
 AE2 Lightning Tech. It can also be installed as a standalone AE2 crafting
 accelerator.
 
-This repository tracks the **Minecraft Forge 1.20.1** port (branch `1.20`) of
+This repository tracks the **Minecraft Forge 1.20.1** port (branch `1.20.1`) of
 the upstream project. It is kept in sync with
 [ae2lt/Thunderbolt-Core](https://github.com/ae2lt/Thunderbolt-Core) `main` on a
 best-effort basis.
@@ -50,10 +50,11 @@ server.
 .\gradlew.bat publishToMavenLocal
 ```
 
-Maven coordinate: `com.moakiee.thunderbolt:thunderbolt:1.0.7`.
+Maven coordinate: `com.moakiee.thunderbolt:thunderbolt:1.0.6-beta.1`.
 
-The distributable local build is `build/libs/thunderbolt-1.0.7-all.jar`.
-The unclassified JAR does not contain the required MixinExtras jar-in-jar
+The distributable local build is
+`build/libs/thunderbolt-forge-1.20.1-1.0.6-beta.1.jar`.
+The `-slim.jar` artifact does not contain the required MixinExtras jar-in-jar
 dependency and is intended only as an intermediate development artifact.
 
 Issues: [GitHub Issues](https://github.com/ae2lt/Thunderbolt-Core/issues) ·
