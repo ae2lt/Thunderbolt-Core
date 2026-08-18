@@ -17,6 +17,7 @@ import appeng.api.stacks.AEKey;
 import appeng.api.stacks.AEItemKey;
 import appeng.api.stacks.KeyCounter;
 import appeng.blockentity.crafting.IMolecularAssemblerSupportedPattern;
+import appeng.menu.AutoCraftingMenu;
 import com.moakiee.thunderbolt.ae2.batch.SharedBatchInputs;
 
 public final class MolecularCopyAssembler implements CopyAssembler {
@@ -119,10 +120,10 @@ public final class MolecularCopyAssembler implements CopyAssembler {
             }
         });
 
-        // Forge 1.20.1: CraftingInput does not exist; use TransientCraftingContainer (the
-        // concrete CraftingContainer impl; menu may be null for pure simulation, which is
-        // what AE2's own MolecularAssembler does).
-        var container = new TransientCraftingContainer(null, 3, 3);
+        // 原版 TransientCraftingContainer.setItem 会无条件调用 menu.slotsChanged(container)，
+        // 若 menu 传 null 则必然 NPE；因此沿用 AE2 自身 MolecularAssemblerBlockEntity
+        // 的做法，使用 AutoCraftingMenu 哨兵菜单承载纯模拟的合成网格。
+        var container = new TransientCraftingContainer(new AutoCraftingMenu(), 3, 3);
         for (int i = 0; i < grid.length; i++) {
             container.setItem(i, grid[i]);
         }

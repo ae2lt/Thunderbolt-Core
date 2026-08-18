@@ -95,14 +95,17 @@ public abstract class TimeWheelCraftingCPUMenuMixin extends AEBaseMenu {
         }
     }
 
-    @Inject(method = "m_6877_", at = @At("TAIL")) // CraftingCPUMenu.removed(Player) — SRG name in the release jar
+    @Inject(
+            method = "removed(Lnet/minecraft/world/entity/player/Player;)V",
+            at = @At("TAIL"),
+            remap = true)
     private void thunderbolt$removed(Player player, CallbackInfo ci) {
         if (this.thunderbolt$timeWheelCpu != null) {
             this.thunderbolt$timeWheelCpu.getCraftingLogic().removeListener(cpuChangeListener);
         }
     }
 
-    @Inject(method = "m_38946_", at = @At("HEAD")) // CraftingCPUMenu.broadcastChanges() — SRG name in the release jar
+    @Inject(method = "broadcastChanges()V", at = @At("HEAD"), remap = true)
     private void thunderbolt$broadcastTimeWheelStatus(CallbackInfo ci) {
         if (!isServerSide() || this.thunderbolt$timeWheelCpu == null) {
             return;
@@ -161,7 +164,11 @@ public abstract class TimeWheelCraftingCPUMenuMixin extends AEBaseMenu {
     @Unique
     private static long thunderbolt$remainingProgressUnits(float progress) {
         // Preserve AE2's legacy status scale while using its replacement progress API.
-        return (long) (thunderbolt$PROGRESS_SCALE
+        long remaining = (long) (thunderbolt$PROGRESS_SCALE
                 - (double) progress * thunderbolt$PROGRESS_SCALE);
+        // float 累积误差可能使 progress 略大于 1（remaining 为负）或小于 0
+        // （remaining 超过量程），统一钳制到 [0, PROGRESS_SCALE]，
+        // 避免客户端进度条显示异常。
+        return Math.max(0L, Math.min(thunderbolt$PROGRESS_SCALE, remaining));
     }
 }

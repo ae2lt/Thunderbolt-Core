@@ -13,7 +13,9 @@ import java.util.UUID;
 import java.util.function.BiPredicate;
 import java.util.function.Predicate;
 
+import com.mojang.logging.LogUtils;
 import org.jetbrains.annotations.Nullable;
+import org.slf4j.Logger;
 
 import net.minecraft.nbt.CompoundTag;
 import net.minecraft.nbt.ListTag;
@@ -39,6 +41,7 @@ import com.moakiee.thunderbolt.ae2.overload.pattern.OverloadPatternDetails;
  * extra semantics needed for overload ID_ONLY outputs.
  */
 public final class OverloadCpuState {
+    private static final Logger LOGGER = LogUtils.getLogger();
     private static final String TAG_NEXT_SEQUENCE = "NextSequence";
     private static final String TAG_PENDING = "Pending";
     private static final String TAG_PATTERN_IDENTITY = "PatternIdentity";
@@ -170,11 +173,19 @@ public final class OverloadCpuState {
                 exactExpectedKey,
                 amount,
                 routesToRequester,
-                nextSequence++,
+                takeNextSequence(),
                 reusableSeed != null ? reusableSeed.consumerCredits() : List.of(),
                 reusableSeed != null && reusableSeed.sharedPool());
         pendingByKey.put(key, pending);
         pendingByItemId.computeIfAbsent(itemId, ignored -> new LinkedHashSet<>()).add(key);
+    }
+
+    private long takeNextSequence() {
+        long result = nextSequence;
+        if (nextSequence < Long.MAX_VALUE) {
+            nextSequence++;
+        }
+        return result;
     }
 
     public OverloadClaimResult claimByItemId(ResourceLocation itemId, long amount, boolean mutate) {
@@ -356,8 +367,29 @@ public final class OverloadCpuState {
     }
 
     public static OverloadCpuState fromTag(OverloadCpuOwner owner, CompoundTag tag) {
+        return fromTag(
+                owner,
+                tag,
+                AEKey::fromTagGeneric,
+                (key, itemId) -> key instanceof AEItemKey itemKey && itemKey.getId().equals(itemId));
+    }
+
+    static OverloadCpuState fromTag(
+            OverloadCpuOwner owner,
+            CompoundTag tag,
+            ExactKeyDecoder keyDecoder) {
+        return fromTag(owner, tag, keyDecoder, (key, itemId) -> key.getId().equals(itemId));
+    }
+
+    private static OverloadCpuState fromTag(
+            OverloadCpuOwner owner,
+            CompoundTag tag,
+            ExactKeyDecoder keyDecoder,
+            BiPredicate<AEKey, ResourceLocation> exactKeyMatchesItem) {
         Objects.requireNonNull(owner, "owner");
         Objects.requireNonNull(tag, "tag");
+        Objects.requireNonNull(keyDecoder, "keyDecoder");
+        Objects.requireNonNull(exactKeyMatchesItem, "exactKeyMatchesItem");
 
         var state = new OverloadCpuState(owner);
         state.nextSequence = Math.max(1L, tag.getLong(TAG_NEXT_SEQUENCE));
@@ -365,31 +397,66 @@ public final class OverloadCpuState {
         var pendingList = tag.getList(TAG_PENDING, CompoundTag.TAG_COMPOUND);
         for (int i = 0; i < pendingList.size(); i++) {
             var pendingTag = pendingList.getCompound(i);
-            var patternReference = new OverloadPatternReference(
-                    pendingTag.getString(TAG_PATTERN_IDENTITY),
-                    com.moakiee.thunderbolt.ae2.overload.pattern.SourcePatternSnapshot.fromTag(
-                            pendingTag.getCompound(TAG_SOURCE_PATTERN)));
-            var key = new PendingOverloadOutputKey(
-                    owner.craftingId(),
-                    pendingTag.getString(TAG_PATTERN_IDENTITY),
-                    pendingTag.getInt(TAG_OUTPUT_SLOT));
-            var pending = new PendingOverloadOutput(
-                    key,
-                    owner,
-                    patternReference,
-                    new ResourceLocation(pendingTag.getString(TAG_ITEM_ID)),
-                    loadExactExpectedKey(pendingTag),
-                    pendingTag.getLong(TAG_REMAINING),
-                    pendingTag.getBoolean(TAG_ROUTES_TO_REQUESTER),
-                    pendingTag.getLong(TAG_REGISTERED_ORDER),
-                    readConsumerCredits(pendingTag),
-                    pendingTag.getBoolean(TAG_SHARED_REUSABLE_SEED_POOL));
-            state.pendingByKey.put(key, pending);
-            state.pendingByItemId.computeIfAbsent(pending.itemId(), ignored -> new LinkedHashSet<>()).add(key);
-            state.nextSequence = Math.max(state.nextSequence, pending.registeredOrder() + 1);
+            try {
+                var pending = loadPending(
+                        owner, pendingTag, keyDecoder, exactKeyMatchesItem, i + 1L);
+                if (state.pendingByKey.putIfAbsent(pending.key(), pending) != null) {
+                    LOGGER.warn("Skipping duplicate pending overload entry {} at index {}.",
+                            pending.key(), i);
+                    continue;
+                }
+                state.pendingByItemId
+                        .computeIfAbsent(pending.itemId(), ignored -> new LinkedHashSet<>())
+                        .add(pending.key());
+                long followingSequence = pending.registeredOrder() == Long.MAX_VALUE
+                        ? Long.MAX_VALUE
+                        : pending.registeredOrder() + 1L;
+                state.nextSequence = Math.max(state.nextSequence, followingSequence);
+            } catch (RuntimeException malformed) {
+                LOGGER.warn("Skipping malformed pending overload entry at index {}.", i, malformed);
+            }
         }
 
         return state;
+    }
+
+    private static PendingOverloadOutput loadPending(
+            OverloadCpuOwner owner,
+            CompoundTag pendingTag,
+            ExactKeyDecoder keyDecoder,
+            BiPredicate<AEKey, ResourceLocation> exactKeyMatchesItem,
+            long fallbackRegisteredOrder) {
+        String patternIdentity = pendingTag.getString(TAG_PATTERN_IDENTITY);
+        var patternReference = new OverloadPatternReference(
+                patternIdentity,
+                com.moakiee.thunderbolt.ae2.overload.pattern.SourcePatternSnapshot.fromTag(
+                        pendingTag.getCompound(TAG_SOURCE_PATTERN)));
+        var key = new PendingOverloadOutputKey(
+                owner.craftingId(), patternIdentity, pendingTag.getInt(TAG_OUTPUT_SLOT));
+        var itemId = ResourceLocation.tryParse(pendingTag.getString(TAG_ITEM_ID));
+        if (itemId == null) {
+            throw new IllegalArgumentException("pending overload entry has an invalid item id");
+        }
+        var exactExpectedKey = loadExactExpectedKey(pendingTag, keyDecoder);
+        if (!exactKeyMatchesItem.test(exactExpectedKey, itemId)) {
+            throw new IllegalArgumentException(
+                    "pending overload item id does not match its exact expected key");
+        }
+        long registeredOrder = pendingTag.getLong(TAG_REGISTERED_ORDER);
+        if (registeredOrder <= 0L) {
+            registeredOrder = fallbackRegisteredOrder;
+        }
+        return new PendingOverloadOutput(
+                key,
+                owner,
+                patternReference,
+                itemId,
+                exactExpectedKey,
+                pendingTag.getLong(TAG_REMAINING),
+                pendingTag.getBoolean(TAG_ROUTES_TO_REQUESTER),
+                registeredOrder,
+                readConsumerCredits(pendingTag),
+                pendingTag.getBoolean(TAG_SHARED_REUSABLE_SEED_POOL));
     }
 
     static void writeConsumerCredits(
@@ -432,16 +499,22 @@ public final class OverloadCpuState {
         return List.of();
     }
 
-    private static AEKey loadExactExpectedKey(CompoundTag pendingTag) {
+    private static AEKey loadExactExpectedKey(
+            CompoundTag pendingTag, ExactKeyDecoder keyDecoder) {
         if (!pendingTag.contains(TAG_EXACT_TEMPLATE, CompoundTag.TAG_COMPOUND)) {
             throw new IllegalArgumentException("pending overload entry is missing an exact expected key");
         }
 
-        var key = AEKey.fromTagGeneric(pendingTag.getCompound(TAG_EXACT_TEMPLATE).copy());
+        var key = keyDecoder.decode(pendingTag.getCompound(TAG_EXACT_TEMPLATE).copy());
         if (key == null) {
             throw new IllegalArgumentException("pending overload entry has an invalid exact expected key");
         }
         return key;
+    }
+
+    @FunctionalInterface
+    interface ExactKeyDecoder {
+        @Nullable AEKey decode(CompoundTag tag);
     }
 
     private void removeSatisfied(PendingOverloadOutput pending) {

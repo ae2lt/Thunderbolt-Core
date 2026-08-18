@@ -86,6 +86,7 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
     private static final int MAX_TASK_PROBES_PER_TICK = 262_144;
     private static final int RETRY_DELAY_TICKS = 4;
     private static final int PARKED_TASK_SAFETY_DELAY_TICKS = 32;
+    /** Shared read-only tracker returned when no job is active; initialized only if queried. */
     private static final String TAG_INVENTORY = "inventory";
     private static final String TAG_JOB = "job";
     private static final String TAG_OVERLOAD_STATE = "ae2ltOverloadState";
@@ -140,6 +141,8 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
     private final KeyCounter seedReturnQuota = new KeyCounter();
     private final KeyCounter retainedFinalOutputs = new KeyCounter();
     private final KeyCounter pendingRequesterOutputs = new KeyCounter();
+    private final PendingRequesterOutputWarning pendingRequesterOutputWarning =
+            new PendingRequesterOutputWarning();
     private final LoopSeedLedgerBook loopSeedLedgers = new LoopSeedLedgerBook();
 
     @Nullable
@@ -280,6 +283,7 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
         seedReturnQuota.clear();
         retainedFinalOutputs.clear();
         pendingRequesterOutputs.clear();
+        pendingRequesterOutputWarning.reset();
         for (var entry : seedRequirements) {
             seedReturnQuota.add(entry.getKey(), entry.getLongValue());
         }
@@ -504,6 +508,7 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
                         ordinaryBudget,
                         craftingService,
                         energyService,
+                        level,
                         dispatchSchedule);
                 if (bulk != null) {
                     usedOps += bulk.dispatched();
@@ -537,9 +542,6 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
             endStatusChangeBatch();
         }
 
-        if (job == activeJob && activeJob.virtualCompletionRequested) {
-            finishVirtualCompletionIfRequested(activeJob);
-        }
         if (job == activeJob) {
             flushUnusedRetainedFinalOutputs(activeJob);
         }
@@ -675,9 +677,9 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
                     return DispatchOutcome.RETRY_NO_POWER;
                 }
 
-                var pushResult = tryPushPattern(
+                boolean accepted = tryPushPattern(
                         resolvedProvider, craftingContainer, dispatchSchedule);
-                if (!pushResult.accepted()) {
+                if (!accepted) {
                     continue;
                 }
 
@@ -691,8 +693,6 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
                         remainderLoopCredits);
 
                 consumeTaskCopies(activeJob, details, 1L);
-                requestVirtualCompletionIfReady(
-                        activeJob, pushResult.virtualCraftingEnabled());
                 return DispatchOutcome.PUSHED;
             }
                 return DispatchOutcome.RETRY_SOON;
@@ -706,14 +706,14 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
     }
 
     /**
-     * Fast path for homogeneous (non-overload) patterns. Instead of paying AE2's full per-copy
+     * Fast path for non-overload patterns. Instead of paying AE2's full per-copy
      * extraction (template resolution via {@code getValidItemTemplates}, input extraction and
      * pattern-power computation) once per copy, this extracts every copy it intends to push this
-     * visit in a single {@link ParallelBatchCpuHelper#bulkExtract} call and then hands the
-     * pre-resolved copies to the (non-batch) providers one {@code pushPattern} at a time.
+     * visit in a single {@link ParallelBatchCpuHelper#bulkExtract} call. Substitutions are first
+     * resolved through AE2's native rules, then only that concrete input set is scaled. The
+     * pre-resolved copies are handed to the (non-batch) providers one {@code pushPattern} at a time.
      *
-     * @return the visit result, or {@code null} when the pattern needs AE2's one-copy substitution
-     *         path (overload patterns or non-homogeneous/fuzzy inputs).
+     * @return the visit result, or {@code null} when the pattern needs the one-copy path.
      */
     @Nullable
     private BulkPush pushBulkForTask(TimeWheelJob activeJob,
@@ -722,6 +722,7 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
                                      int maxCopies,
                                      CraftingService craftingService,
                                      IEnergyService energyService,
+                                     Level level,
                                      TickProviderDispatchSchedule dispatchSchedule) {
         if (CraftingPatternDelegates.forProviderLookup(details)
                 instanceof OverloadedProviderOnlyPatternDetails) {
@@ -746,7 +747,7 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
 
         int budget = (int) Math.min(task.value, (long) maxCopies);
         var result = ParallelBatchCpuHelper.bulkExtract(
-                details, inventory, budget, false, reservedSeedStock(details));
+                details, inventory, budget, false, reservedSeedStock(details), level);
         if (result == null) {
             return null;
         }
@@ -775,7 +776,6 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
 
         int dispatched = 0;
         boolean freeProviderRejected = false;
-        boolean lastDispatchedWasVirtual = false;
         try {
             var resolvedProvider = firstProvider;
             while (resolvedProvider != null && dispatched < affordable) {
@@ -784,15 +784,14 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
                     if (pending == null) {
                         pending = ParallelBatchCpuHelper.cloneSingleCopy(result);
                     }
-                    var pushResult = tryPushPattern(
+                    boolean accepted = tryPushPattern(
                             resolvedProvider, pending, dispatchSchedule);
-                    if (!pushResult.accepted()) {
+                    if (!accepted) {
                         // A rejecting provider must not consume the container, so the clone stays
                         // valid and is reused for the next provider instead of re-cloning.
                         freeProviderRejected = true;
                         break;
                     }
-                    lastDispatchedWasVirtual = pushResult.virtualCraftingEnabled();
                     pending = null; // ownership transferred to the provider
                     energyService.extractAEPower(powerOne, Actionable.MODULATE, PowerMultiplier.CONFIG);
                     ParallelBatchCpuHelper.markDispatched(result, 1);
@@ -812,7 +811,6 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
             ParallelBatchCpuHelper.registerExpectedOutputs(jobView, details, result, dispatched);
             recordLoopPatternDispatch(details, dispatched, false);
             consumeTaskCopies(activeJob, details, dispatched);
-            requestVirtualCompletionIfReady(activeJob, lastDispatchedWasVirtual);
             cpu.markDirty();
             // Energy-capped visits back off on the energy cadence; otherwise re-poll immediately
             // (delay 0) so the remaining copies keep filling providers this tick.
@@ -840,31 +838,25 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
         return null;
     }
 
-    private ProviderPushResult tryPushPattern(
+    private boolean tryPushPattern(
             ResolvedProvider resolvedProvider,
             KeyCounter[] inputs,
             TickProviderDispatchSchedule dispatchSchedule) {
         var provider = resolvedProvider.provider();
         try {
-            boolean accepted;
-            try (var ignored =
-                         ExtendedAePlusVirtualCraftingCompat.enterTimeWheelProviderPush()) {
-                accepted = provider.pushPattern(resolvedProvider.pattern(), inputs);
-            }
+            boolean accepted = provider.pushPattern(resolvedProvider.pattern(), inputs);
             if (!accepted) {
                 dispatchSchedule.recordFailure(resolvedProvider.pattern(), provider);
-                return ProviderPushResult.REJECTED;
+                return false;
             }
         } catch (Throwable t) {
             AELog.warn("[ae2lt] ICraftingProvider %s threw during pushPattern; blocking this pattern for the current tick. %s",
                     provider, t);
             dispatchSchedule.recordFailure(resolvedProvider.pattern(), provider);
-            return ProviderPushResult.REJECTED;
+            return false;
         }
         dispatchSchedule.recordSuccess(resolvedProvider.pattern(), provider);
-        return new ProviderPushResult(
-                true,
-                ExtendedAePlusVirtualCraftingCompat.isVirtualCraftingEnabled(provider));
+        return true;
     }
 
     public long insert(AEKey what, long amount, Actionable type) {
@@ -959,6 +951,15 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
     private OverloadInsert acceptOverloadWaitingItem(
             TimeWheelJob activeJob, AEKey what, long amount, Actionable type) {
         if (amount <= 0) return OverloadInsert.EMPTY;
+        // 认领前复查取消：link 已被外部取消、但 tick 尚未转入 soft-cancel 排水阶段时，
+        // 不得再执行 overload 认领（包括 link.insert 与 pendingRequesterOutputs 记账）。
+        // softCancelling 期间 link.isCanceled() 同样为 true，但那是合法的内部回插排水
+        // 路径，必须放行，因此守卫条件必须排除 softCancelling。
+        // 返回 EMPTY 表示不认领任何数量，未接受部分留给调用方按既有取消兜底处理，
+        // 保证已取消 link 的物品不丢失、不重复记账。
+        if (!activeJob.softCancelling && activeJob.link.isCanceled()) {
+            return OverloadInsert.EMPTY;
+        }
         var preview = OverloadCpuStateManager.INSTANCE.claim(
                 this, what, amount, Actionable.SIMULATE,
                 (consumer, expected) -> loopSeedLedgers.acceptsReturnedVariant(
@@ -1171,7 +1172,11 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
     }
 
     private void finishSuccessfulIfReady(TimeWheelJob activeJob) {
-        if (job != activeJob || activeJob.softCancelling) return;
+        // 收尾前复查取消：link 已被外部取消的作业不得以“成功”收尾，
+        // 否则会和请求方的取消语义冲突；交给 tick 循环既有的
+        // beginSoftCancel/cancel 分支接管后续清理。
+        if (job != activeJob || activeJob.softCancelling
+                || activeJob.link.isCanceled()) return;
         // Also repairs persisted jobs written by versions that could leave deferred credits after
         // the final demand had already reached zero.
         capPendingRequesterOutputsToRemaining(activeJob.remainingAmount, null);
@@ -1182,34 +1187,6 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
                 || OverloadCpuStateManager.INSTANCE.hasAnyPending(this)) return;
         finalizeSeedReturnQuota();
         if (!returnReusableSeedsToHost()) return;
-        finishJob(true);
-        cpu.updateOutput(null);
-    }
-
-    private void requestVirtualCompletionIfReady(
-            TimeWheelJob activeJob,
-            boolean virtualCraftingEnabled) {
-        if (ExtendedAePlusVirtualCraftingCompat.shouldRequestCompletion(
-                virtualCraftingEnabled,
-                job == activeJob,
-                activeJob.closedLoopJob,
-                activeJob.softCancelling,
-                activeJob.tasks.isEmpty())) {
-            activeJob.virtualCompletionRequested = true;
-        }
-    }
-
-    private void finishVirtualCompletionIfRequested(TimeWheelJob activeJob) {
-        if (!activeJob.virtualCompletionRequested
-                || !ExtendedAePlusVirtualCraftingCompat.shouldRequestCompletion(
-                        true,
-                        job == activeJob,
-                        activeJob.closedLoopJob,
-                        activeJob.softCancelling,
-                        activeJob.tasks.isEmpty())) {
-            activeJob.virtualCompletionRequested = false;
-            return;
-        }
         finishJob(true);
         cpu.updateOutput(null);
     }
@@ -1298,6 +1275,7 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
         seedReturnQuotaFinalized = false;
         retainedFinalOutputs.clear();
         pendingRequesterOutputs.clear();
+        pendingRequesterOutputWarning.reset();
         clearLoopSeedState();
         patternPowerCache.clear();
         clearTaskWheel();
@@ -1368,6 +1346,7 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
         OverloadCpuStateManager.INSTANCE.clear(this);
         seedReturnQuota.clear();
         pendingRequesterOutputs.clear();
+        pendingRequesterOutputWarning.reset();
         seedReturnQuotaFinalized = false;
         clearLoopSeedState();
         clearTaskWheel();
@@ -1588,10 +1567,14 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
     private void flushPendingRequesterOutputs(TimeWheelJob activeJob) {
         if (activeJob == null || activeJob.link.isStandalone()
                 || activeJob.softCancelling) {
+            pendingRequesterOutputWarning.reset();
             return;
         }
         capPendingRequesterOutputsToRemaining(activeJob.remainingAmount, null);
-        if (pendingRequesterOutputs.isEmpty()) return;
+        if (pendingRequesterOutputs.isEmpty()) {
+            pendingRequesterOutputWarning.reset();
+            return;
+        }
 
         var pending = new ArrayList<GenericStack>();
         for (var entry : pendingRequesterOutputs) {
@@ -1636,7 +1619,8 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
             }
         }
 
-        if (!pendingRequesterOutputs.isEmpty()) {
+        if (pendingRequesterOutputWarning.update(
+                TickHandler.instance().getCurrentTick(), !pendingRequesterOutputs.isEmpty())) {
             cantStoreItems = true;
         }
     }
@@ -1869,6 +1853,7 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
         seedReturnQuota.clear();
         retainedFinalOutputs.clear();
         pendingRequesterOutputs.clear();
+        pendingRequesterOutputWarning.reset();
         seedReturnQuotaFinalized = data.getBoolean(TAG_SEED_RETURN_QUOTA_FINALIZED);
         clearLoopSeedState();
         if (data.contains(TAG_SEED_RETURN_QUOTA, Tag.TAG_LIST)) {
@@ -2068,7 +2053,11 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
     }
 
     public ElapsedTimeTracker getElapsedTimeTracker() {
-        return this.job != null ? this.job.timeTracker : new ElapsedTimeTracker();
+        return this.job != null ? this.job.timeTracker : EmptyTimeTrackerHolder.INSTANCE;
+    }
+
+    private static final class EmptyTimeTrackerHolder {
+        private static final ElapsedTimeTracker INSTANCE = new ElapsedTimeTracker();
     }
 
     public void addListener(Consumer<AEKey> listener) {
@@ -2165,11 +2154,6 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
     }
 
     private record ResolvedProvider(ICraftingProvider provider, IPatternDetails pattern) { }
-
-    private record ProviderPushResult(boolean accepted, boolean virtualCraftingEnabled) {
-        private static final ProviderPushResult REJECTED =
-                new ProviderPushResult(false, false);
-    }
 
     private boolean hasAmbiguousOverloadOutput(IPatternDetails details) {
         return hasAmbiguousOverloadOutput(details, null);
@@ -2697,7 +2681,8 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
         var missing = new HashSet<AEKey>();
         for (var entry : exactRequired.entrySet()) {
             long required = entry.getValue();
-            if (required > 0 && inventory.extract(entry.getKey(), required, Actionable.SIMULATE) < required) {
+            if (required > 0 && inventory.extract(
+                    entry.getKey(), required, Actionable.SIMULATE) < required) {
                 missing.add(entry.getKey());
             }
         }
@@ -2870,7 +2855,8 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
     private void notifyJobOwner(TimeWheelJob activeJob, CraftingJobStatusPacket.Status status) {
         this.lastModifiedOnTick = TickHandler.instance().getCurrentTick();
         var playerId = activeJob.playerId;
-        if (playerId == null || cpu.getLevel() == null || cpu.getLevel().getServer() == null) {
+        if (playerId == null || activeJob.finalOutput == null
+                || cpu.getLevel() == null || cpu.getLevel().getServer() == null) {
             return;
         }
 
@@ -2910,6 +2896,11 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
     }
 
     private double patternPowerFor(IPatternDetails details, KeyCounter[] craftingContainer) {
+        // Fuzzy inputs (multiple candidates) resolve to different actual keys per push, so the
+        // per-pattern cached power can be stale; compute it directly for those patterns.
+        if (!hasOnlyExactInputs(details)) {
+            return CraftingCpuHelper.calculatePatternPower(craftingContainer);
+        }
         var cached = patternPowerCache.get(details);
         if (cached != null) {
             return cached;
@@ -3006,7 +2997,6 @@ public final class Ae2LtTimeWheelCraftingCpuLogic {
         private boolean suspended;
         private boolean softCancelling;
         private boolean closedLoopJob;
-        private boolean virtualCompletionRequested;
 
         private TimeWheelJob(ICraftingPlan plan,
                              Consumer<AEKey> postCraftingDifference,

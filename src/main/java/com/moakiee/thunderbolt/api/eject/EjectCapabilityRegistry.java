@@ -202,11 +202,15 @@ public final class EjectCapabilityRegistry {
     }
 
     private static void addToMap(ResourceKey<Level> dimension, long pos, Direction face, Entry entry) {
-        REGISTRATIONS
+        var entries = REGISTRATIONS
                 .computeIfAbsent(dimension, ignored -> new Long2ObjectOpenHashMap<>())
                 .computeIfAbsent(pos, ignored -> new EnumMap<>(Direction.class))
-                .computeIfAbsent(face, ignored -> new ArrayList<>())
-                .add(entry);
+                .computeIfAbsent(face, ignored -> new ArrayList<>());
+        // Chunk reloads replace the host block-entity instance. Keep the newest weak reference and
+        // ghost object instead of accumulating one equivalent entry on every lifecycle refresh.
+        entries.removeIf(existing -> existing.hostDimension().equals(entry.hostDimension())
+                && existing.hostPos().equals(entry.hostPos()));
+        entries.add(entry);
     }
 
     @Nullable

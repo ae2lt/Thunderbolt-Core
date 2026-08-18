@@ -112,14 +112,28 @@ public final class IndexedStorage {
         }
 
         long newLo = lo[id] + amount;
-        if (newLo < 0) { newLo &= Long.MAX_VALUE; hi[id]++; }
+        if (newLo < 0) {
+            newLo &= Long.MAX_VALUE;
+            if (hi[id] == Long.MAX_VALUE) {
+                newLo = Long.MAX_VALUE;
+            } else {
+                hi[id]++;
+            }
+        }
         lo[id] = newLo;
 
         AEKeyType kt = key.getType();
         if (isNewKey) typeCounts.addTo(kt, 1);
         long sumLo = typeAmountLo.getLong(kt) + amount;
         long sumHi = typeAmountHi.getLong(kt);
-        if (sumLo < 0) { sumLo &= Long.MAX_VALUE; sumHi++; }
+        if (sumLo < 0) {
+            sumLo &= Long.MAX_VALUE;
+            if (sumHi == Long.MAX_VALUE) {
+                sumLo = Long.MAX_VALUE;
+            } else {
+                sumHi++;
+            }
+        }
         typeAmountLo.put(kt, sumLo);
         typeAmountHi.put(kt, sumHi);
 
@@ -163,8 +177,9 @@ public final class IndexedStorage {
         long sumHi = typeAmountHi.getLong(kt);
         if (sumLo < 0) { sumLo &= Long.MAX_VALUE; sumHi--; }
         if (keyRemoved) {
+            // fastutil addTo returns the PREVIOUS value: the last key of a type sees 1 here.
             int remaining = typeCounts.addTo(kt, -1);
-            if (remaining <= 0) {
+            if (remaining <= 1) {
                 typeCounts.removeInt(kt);
                 typeAmountLo.removeLong(kt);
                 typeAmountHi.removeLong(kt);
@@ -227,7 +242,7 @@ public final class IndexedStorage {
         long[] pHi = lastRoot.getLongArray("hi");
 
         int tagLen = alignPow2(nextId);
-        if (pLo.length < nextId) {
+        if (pLo.length < nextId || pHi.length < nextId) {
             pLo = Arrays.copyOf(pLo, tagLen);
             pHi = Arrays.copyOf(pHi, tagLen);
             lastRoot.put("lo", new LongArrayTag(pLo));
@@ -351,11 +366,29 @@ public final class IndexedStorage {
     // ══════════════════════════════════════════════════════════════════════
 
     public void load(CompoundTag root, HolderLookup.Provider registries) {
+        load(root, (tag, ignored) -> AEKey.fromTagGeneric(tag), registries);
+    }
+
+    void load(
+            CompoundTag root,
+            KeyDeserializer keyDeserializer,
+            HolderLookup.Provider registries) {
+        java.util.Objects.requireNonNull(root, "root");
+        java.util.Objects.requireNonNull(keyDeserializer, "keyDeserializer");
         keyToId.clear();
+        Arrays.fill(idToKey, null);
+        Arrays.fill(lo, 0L);
+        Arrays.fill(hi, 0L);
+        Arrays.fill(serializedKey, null);
+        Arrays.fill(inQueue, false);
+        Arrays.fill(isStructDirty, false);
         nextId = 0;
         freeCount = 0;
         totalTypes = 0;
         dirtyCount = 0;
+        needsPersist = false;
+        needsCompact = false;
+        modCount = 0L;
         typeCounts.clear();
         typeAmountLo.clear();
         typeAmountHi.clear();
@@ -364,43 +397,98 @@ public final class IndexedStorage {
         long[] pLo = root.getLongArray("lo");
         long[] pHi = root.getLongArray("hi");
         int size = keys.size();
-        ensureCapacity(size);
+        if (size > 0) ensureCapacity(size - 1);
         nextId = size;
+        boolean repaired = pLo.length < size || pHi.length < size;
+        long[] sum = new long[2];
 
         for (int id = 0; id < size; id++) {
-            inQueue[id] = false;
-            isStructDirty[id] = false;
-
             CompoundTag entry = keys.getCompound(id);
-            if (!entry.contains("key")) {
+            if (!entry.contains("key", Tag.TAG_COMPOUND)) {
                 addFree(id);
                 continue;
             }
-            AEKey key = AEKey.fromTagGeneric(entry.getCompound("key"));
+            AEKey key;
+            try {
+                key = keyDeserializer.fromTag(entry.getCompound("key").copy(), registries);
+            } catch (RuntimeException malformed) {
+                key = null;
+            }
             if (key == null) {
                 addFree(id);
+                repaired = true;
+                continue;
+            }
+
+            long entryLo = id < pLo.length ? pLo[id] : 0L;
+            long entryHi = id < pHi.length ? pHi[id] : 0L;
+            if (entryLo < 0L || entryHi < 0L || (entryLo == 0L && entryHi == 0L)) {
+                addFree(id);
+                repaired = true;
+                continue;
+            }
+
+            int existingId = keyToId.getInt(key);
+            if (existingId != -1) {
+                // Corrupted save contains the same key twice. Saturating-merge this entry's
+                // amount into the existing slot and recycle the duplicate id, so keyToId,
+                // idToKey, totalTypes and typeCounts stay consistent. The normal single-entry
+                // path below is untouched.
+                addSaturated126(hi[existingId], lo[existingId], entryHi, entryLo, sum);
+                hi[existingId] = sum[0];
+                lo[existingId] = sum[1];
+                AEKeyType duplicateType = key.getType();
+                addSaturated126(
+                        typeAmountHi.getLong(duplicateType),
+                        typeAmountLo.getLong(duplicateType),
+                        entryHi,
+                        entryLo,
+                        sum);
+                typeAmountHi.put(duplicateType, sum[0]);
+                typeAmountLo.put(duplicateType, sum[1]);
+                addFree(id);
+                repaired = true;
                 continue;
             }
 
             keyToId.put(key, id);
             idToKey[id] = key;
-            lo[id] = id < pLo.length ? pLo[id] : 0L;
-            hi[id] = id < pHi.length ? pHi[id] : 0L;
-            serializedKey[id] = entry.getCompound("key");
+            lo[id] = entryLo;
+            hi[id] = entryHi;
+            serializedKey[id] = entry.getCompound("key").copy();
             totalTypes++;
 
             AEKeyType kt = key.getType();
             typeCounts.addTo(kt, 1);
-            long sumLo = typeAmountLo.getLong(kt) + lo[id];
-            long sumHi = typeAmountHi.getLong(kt) + hi[id];
-            if (sumLo < 0) { sumLo &= Long.MAX_VALUE; sumHi++; }
-            typeAmountLo.put(kt, sumLo);
-            typeAmountHi.put(kt, sumHi);
+            addSaturated126(
+                    typeAmountHi.getLong(kt), typeAmountLo.getLong(kt), entryHi, entryLo, sum);
+            typeAmountHi.put(kt, sum[0]);
+            typeAmountLo.put(kt, sum[1]);
         }
 
-        if (freeCount > Math.max(totalTypes, 1) * COMPACT_THRESHOLD) {
-            needsCompact = true;
+        needsCompact = repaired || freeCount > Math.max(totalTypes, 1) * COMPACT_THRESHOLD;
+        needsPersist = repaired;
+    }
+
+    private static void addSaturated126(
+            long leftHi, long leftLo, long rightHi, long rightLo, long[] result) {
+        long sumLo = leftLo + rightLo;
+        boolean carry = sumLo < 0L;
+        if (carry) sumLo &= Long.MAX_VALUE;
+
+        long remainingHi = Long.MAX_VALUE - leftHi;
+        if (rightHi > remainingHi || (carry && rightHi == remainingHi)) {
+            result[0] = Long.MAX_VALUE;
+            result[1] = Long.MAX_VALUE;
+            return;
         }
+        result[0] = leftHi + rightHi + (carry ? 1L : 0L);
+        result[1] = sumLo;
+    }
+
+    @FunctionalInterface
+    interface KeyDeserializer {
+        @Nullable AEKey fromTag(CompoundTag tag, HolderLookup.Provider registries);
     }
 
     // ══════════════════════════════════════════════════════════════════════

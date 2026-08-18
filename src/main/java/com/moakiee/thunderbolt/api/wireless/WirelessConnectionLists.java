@@ -3,7 +3,9 @@ package com.moakiee.thunderbolt.api.wireless;
 import java.util.List;
 import java.util.function.Predicate;
 
+import com.mojang.logging.LogUtils;
 import org.jetbrains.annotations.Nullable;
+import org.slf4j.Logger;
 
 import net.minecraft.core.BlockPos;
 import net.minecraft.nbt.CompoundTag;
@@ -14,6 +16,8 @@ import net.minecraft.world.level.Level;
 
 /** Collection, persistence and bounded-pruning helpers for one-to-many wireless endpoints. */
 public final class WirelessConnectionLists {
+    private static final Logger LOGGER = LogUtils.getLogger();
+
     public record PruneResult(int removed, int nextCursor) {}
 
     @FunctionalInterface
@@ -62,8 +66,26 @@ public final class WirelessConnectionLists {
         target.clear();
         if (!data.contains(tagName, Tag.TAG_LIST)) return;
         var list = data.getList(tagName, Tag.TAG_COMPOUND);
-        for (int i = 0; i < list.size() && target.size() < maxConnections; i++) {
-            target.add(reader.read(list.getCompound(i)));
+        int malformed = 0;
+        RuntimeException firstFailure = null;
+        for (int i = 0; i < list.size(); i++) {
+            try {
+                var connection = reader.read(list.getCompound(i));
+                if (connection == null) {
+                    malformed++;
+                    continue;
+                }
+                // Saved data from older builds may contain the same endpoint more than once.
+                // Replacing in place heals it without allowing duplicates to consume the limit.
+                addOrReplace(target, connection, maxConnections);
+            } catch (RuntimeException exception) {
+                malformed++;
+                if (firstFailure == null) firstFailure = exception;
+            }
+        }
+        if (malformed > 0) {
+            LOGGER.warn("Skipped {} malformed wireless connection entr{} in NBT list {}.",
+                    malformed, malformed == 1 ? "y" : "ies", tagName, firstFailure);
         }
     }
 

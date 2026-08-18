@@ -32,8 +32,8 @@
     "AaeExecutingCraftingJobAccessor",
     "AaeElapsedTimeTrackerAccessor",
     "AaeTaskProgressAccessor",
-    "ExtendedAePlusVirtualCompletionSuppressionMixin",
     "ExtendedCraftingCpuServiceMixin",
+    "ExtendedCraftingCpuInsertMixin",
     "TimeWheelCraftingCPUMenuMixin"
   ],
   "client": [

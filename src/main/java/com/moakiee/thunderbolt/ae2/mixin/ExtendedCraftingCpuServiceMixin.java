@@ -46,11 +46,12 @@ import com.moakiee.thunderbolt.ae2.crafting.CraftingCpuSelectionOrder;
 import com.moakiee.thunderbolt.ae2.crafting.DynamicCraftingCpuClusterIndex;
 import com.moakiee.thunderbolt.ae2.crafting.ExtendedCraftingCpuCluster;
 import com.moakiee.thunderbolt.ae2.crafting.ExtendedCraftingCpuClusterProvider;
+import com.moakiee.thunderbolt.ae2.crafting.ExtendedCraftingCpuInsertBridge;
 import com.moakiee.thunderbolt.ae2.crafting.FastCraftingControl;
 import com.moakiee.thunderbolt.ae2.crafting.LoopCraftingPlan;
 
 @Mixin(value = CraftingService.class, remap = false)
-public abstract class ExtendedCraftingCpuServiceMixin {
+public abstract class ExtendedCraftingCpuServiceMixin implements ExtendedCraftingCpuInsertBridge {
     @Unique
     @Nullable
     private DynamicCraftingCpuClusterIndex<IGridNode, ExtendedCraftingCpuCluster>
@@ -170,26 +171,18 @@ public abstract class ExtendedCraftingCpuServiceMixin {
         thunderbolt$refreshExtendedCpuClusters();
     }
 
-    @Inject(
-            method = "insertIntoCpus",
-            // AdvancedAE unconditionally sets the return value from a cancellable RETURN
-            // injector. A later RETURN callback is therefore skipped entirely. Mutating AE2's
-            // local accumulator before IRETURN composes with both AdvancedAE and NeoECO instead.
-            at = @At(value = "RETURN", shift = At.Shift.BY, by = -1))
-    private void thunderbolt$insertIntoExtendedCpuClusters(
-            AEKey what,
-            long amount,
-            Actionable type,
-            CallbackInfoReturnable<Long> cir,
-            @Local(ordinal = 1) LocalLongRef insertedRef) {
-        long inserted = insertedRef.get();
+    @Override
+    public long thunderbolt$insertIntoExtendedCpus(AEKey what, long amount, Actionable mode) {
+        long boundedAmount = Math.max(0L, amount);
+        long inserted = 0L;
         for (var cluster : thunderbolt$getExtendedCpuClusters()) {
-            if (inserted >= amount) {
-                break;
+            if (inserted >= boundedAmount) break;
+            long accepted = cluster.insert(what, boundedAmount - inserted, mode);
+            if (accepted > 0L) {
+                inserted += Math.min(accepted, boundedAmount - inserted);
             }
-            inserted += cluster.insert(what, amount - inserted, type);
         }
-        insertedRef.set(inserted);
+        return inserted;
     }
 
     @Inject(method = "submitJob", at = @At("HEAD"), cancellable = true)
@@ -303,14 +296,25 @@ public abstract class ExtendedCraftingCpuServiceMixin {
         }
     }
 
-    @Inject(method = "getRequestedAmount", at = @At("RETURN"), cancellable = true)
-    private void thunderbolt$getExtendedRequestedAmount(AEKey what, CallbackInfoReturnable<Long> cir) {
-        long requested = cir.getReturnValue();
+    @Inject(
+            method = "getRequestedAmount",
+            // AdvancedAE 1.3.6 also sets and cancels the RETURN callback. Mutate AE2's local
+            // accumulator before it is loaded for LRETURN so AdvancedAE observes this addition
+            // through its captured local instead of either addon discarding the other's value.
+            at = @At(value = "RETURN", shift = At.Shift.BY, by = -1))
+    private void thunderbolt$getExtendedRequestedAmount(
+            AEKey what,
+            CallbackInfoReturnable<Long> ignored,
+            @Local(ordinal = 0) LocalLongRef requestedRef) {
+        long requested = Math.max(0L, requestedRef.get());
         for (var cluster : thunderbolt$getExtendedCpuClusters()) {
             long addition = cluster.getRequestedAmount(what);
+            if (addition <= 0L) {
+                continue;
+            }
             requested = requested >= Long.MAX_VALUE - addition ? Long.MAX_VALUE : requested + addition;
         }
-        cir.setReturnValue(requested);
+        requestedRef.set(requested);
     }
 
     @Inject(method = "hasCpu", at = @At("HEAD"), cancellable = true)

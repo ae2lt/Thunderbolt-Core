@@ -2,6 +2,7 @@ package com.moakiee.thunderbolt.ae2.batch;
 
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Method;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
 
@@ -11,13 +12,19 @@ import net.minecraft.world.level.Level;
 
 import appeng.api.crafting.IPatternDetails;
 import appeng.api.stacks.AEKey;
+import appeng.api.stacks.GenericStack;
 import appeng.api.stacks.KeyCounter;
 import appeng.blockentity.crafting.IMolecularAssemblerSupportedPattern;
 
 import com.moakiee.thunderbolt.ae2.api.crafting.BatchDispatchContext;
 import com.moakiee.thunderbolt.ae2.util.MixinReflectionSupport;
 
-/** Reflection bridge to NeoECO's optional verified batch fast path. */
+/**
+ * Reflection bridge to NeoECO's optional verified batch fast path.
+ * <p>
+ * Reflection targets are locked by {@code NeoEcoBinaryShapeTest}. Both the legacy execution
+ * factory and the Forge 1.20.1 20.x compiled-pattern factory are supported.
+ */
 public final class NeoEcoPatternBusBatchBridge {
     private static final @Nullable Class<?> BUS_CLASS = MixinReflectionSupport.findClassSafe(
             "cn.dancingsnow.neoecoae.blocks.entity.crafting.ECOCraftingPatternBusBlockEntity");
@@ -30,10 +37,16 @@ public final class NeoEcoPatternBusBatchBridge {
     private static final @Nullable Class<?> OFFER_CLASS = MixinReflectionSupport.findClassSafe(
             "cn.dancingsnow.neoecoae.blocks.entity.crafting."
                     + "ECOCraftingPatternBusBlockEntity$BatchFastPathOffer");
+    private static final @Nullable Class<?> COMPILED_PATTERN_CLASS = MixinReflectionSupport.findClassSafe(
+            "cn.dancingsnow.neoecoae.impl.crafting.fastpath.ECOCompiledFastPathPattern");
+    private static final @Nullable Class<?> PATTERN_METADATA_CLASS = MixinReflectionSupport.findClassSafe(
+            "cn.dancingsnow.neoecoae.impl.crafting.fastpath.ECOFastPathPatternMetadata");
+    private static final @Nullable Class<?> FAST_PATH_ELIGIBILITY_CLASS = MixinReflectionSupport.findClassSafe(
+            "cn.dancingsnow.neoecoae.api.me.ECOFastPathEligibility");
 
     private static final @Nullable Method GET_AVAILABLE_THREAD_SLOTS = findMethod(
             BUS_CLASS, "getAvailableThreadSlots");
-    private static final @Nullable Method CREATE_EXECUTION = findMethod(
+    private static final @Nullable Method CREATE_LEGACY_EXECUTION = findMethod(
             EXECUTION_CLASS,
             "create",
             IPatternDetails.class,
@@ -41,6 +54,28 @@ public final class NeoEcoPatternBusBatchBridge {
             KeyCounter.class,
             KeyCounter.class,
             Level.class);
+    private static final @Nullable Method COMPILE_PATTERN = findMethod(
+            COMPILED_PATTERN_CLASS, "compile", IPatternDetails.class);
+    private static final @Nullable Method CAN_BUILD_FAST_PATH = findMethod(
+            COMPILED_PATTERN_CLASS, "canBuildFastPath", List.class);
+    private static final @Nullable Method CREATE_PATTERN_METADATA = findMethod(
+            PATTERN_METADATA_CLASS,
+            "create",
+            COMPILED_PATTERN_CLASS,
+            KeyCounter[].class,
+            Level.class);
+    private static final @Nullable Method CREATE_FORGE_1201_EXECUTION = findMethod(
+            EXECUTION_CLASS,
+            "create",
+            IPatternDetails.class,
+            COMPILED_PATTERN_CLASS,
+            PATTERN_METADATA_CLASS,
+            KeyCounter[].class,
+            List.class,
+            boolean.class,
+            Level.class);
+    private static final @Nullable Method IS_FAST_PATH_GLOBALLY_ENABLED = findMethod(
+            FAST_PATH_ELIGIBILITY_CLASS, "isGloballyEnabled");
     private static final @Nullable Method EXECUTION_FAST_PATH_ELIGIBLE = findMethod(
             EXECUTION_CLASS, "fastPathEligible");
     private static final @Nullable Method EXECUTION_KEY = findMethod(EXECUTION_CLASS, "key");
@@ -65,13 +100,23 @@ public final class NeoEcoPatternBusBatchBridge {
             List.class,
             UUID.class);
 
+    private static final boolean LEGACY_EXECUTION_AVAILABLE = CREATE_LEGACY_EXECUTION != null;
+    private static final boolean FORGE_1201_EXECUTION_AVAILABLE = COMPILED_PATTERN_CLASS != null
+            && PATTERN_METADATA_CLASS != null
+            && FAST_PATH_ELIGIBILITY_CLASS != null
+            && COMPILE_PATTERN != null
+            && CAN_BUILD_FAST_PATH != null
+            && CREATE_PATTERN_METADATA != null
+            && CREATE_FORGE_1201_EXECUTION != null
+            && IS_FAST_PATH_GLOBALLY_ENABLED != null;
+
     private static final boolean AVAILABLE = BUS_CLASS != null
             && EXECUTION_CLASS != null
             && REQUEST_CLASS != null
             && KEY_CLASS != null
             && OFFER_CLASS != null
             && GET_AVAILABLE_THREAD_SLOTS != null
-            && CREATE_EXECUTION != null
+            && (LEGACY_EXECUTION_AVAILABLE || FORGE_1201_EXECUTION_AVAILABLE)
             && EXECUTION_FAST_PATH_ELIGIBLE != null
             && EXECUTION_KEY != null
             && EXECUTION_INPUTS != null
@@ -175,15 +220,66 @@ public final class NeoEcoPatternBusBatchBridge {
             }
         }
 
+        if (FORGE_1201_EXECUTION_AVAILABLE) {
+            var remainingStacks = copyCounter(remainingItems);
+            Object compiledPattern = invoke(
+                    COMPILE_PATTERN,
+                    null,
+                    "compile NeoECO fast-path pattern",
+                    context.details());
+            if (compiledPattern == null) {
+                return null;
+            }
+            boolean globallyEnabled = isTrue(invoke(
+                    IS_FAST_PATH_GLOBALLY_ENABLED,
+                    null,
+                    "query NeoECO fast-path configuration"));
+            boolean canBuildFastPath = globallyEnabled && isTrue(invoke(
+                    CAN_BUILD_FAST_PATH,
+                    compiledPattern,
+                    "validate NeoECO fast-path pattern",
+                    remainingStacks));
+            Object metadata = canBuildFastPath
+                    ? invoke(
+                            CREATE_PATTERN_METADATA,
+                            null,
+                            "create NeoECO fast-path metadata",
+                            compiledPattern,
+                            template,
+                            context.level())
+                    : null;
+            return invoke(
+                    CREATE_FORGE_1201_EXECUTION,
+                    null,
+                    "create NeoECO Forge 1.20.1 extracted pattern execution",
+                    context.details(),
+                    compiledPattern,
+                    metadata,
+                    template,
+                    remainingStacks,
+                    canBuildFastPath,
+                    context.level());
+        }
+
         return invoke(
-                CREATE_EXECUTION,
+                CREATE_LEGACY_EXECUTION,
                 null,
-                "create NeoECO extracted pattern execution",
+                "create legacy NeoECO extracted pattern execution",
                 context.details(),
                 template,
                 outputs,
                 remainingItems,
                 context.level());
+    }
+
+    private static List<GenericStack> copyCounter(KeyCounter counter) {
+        var result = new ArrayList<GenericStack>();
+        for (var entry : counter) {
+            if (entry.getKey() != null && entry.getLongValue() > 0L) {
+                result.add(new GenericStack(entry.getKey(), entry.getLongValue()));
+            }
+        }
+        return List.copyOf(result);
     }
 
     private static long pushVerifiedBatch(

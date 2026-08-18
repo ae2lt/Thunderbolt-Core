@@ -147,7 +147,7 @@ class FastCraftingPlannerPlanConversionTest {
         }
         @Override public Object getPrimaryKey() { return id; }
         @Override public ResourceLocation getId() {
-            return ResourceLocation.fromNamespaceAndPath("thunderbolt_test", id);
+            return new ResourceLocation("thunderbolt_test", id);
         }
         @Override public void writeToPacket(FriendlyByteBuf data) { }
         @Override protected Component computeDisplayName() { return Component.literal(id); }
@@ -161,7 +161,7 @@ class FastCraftingPlannerPlanConversionTest {
 
     private static final class TestKeyType extends AEKeyType {
         private TestKeyType() {
-            super(ResourceLocation.fromNamespaceAndPath("thunderbolt_test", "simulation_key"),
+            super(new ResourceLocation("thunderbolt_test", "simulation_key"),
                     TestKey.class, Component.literal("simulation key"));
         }
         @Override public AEKey loadKeyFromTag(CompoundTag tag) { return null; }

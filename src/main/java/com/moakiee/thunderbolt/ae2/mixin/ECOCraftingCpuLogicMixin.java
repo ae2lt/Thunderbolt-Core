@@ -18,6 +18,7 @@ import com.llamalad7.mixinextras.injector.wrapoperation.Operation;
 import com.llamalad7.mixinextras.injector.wrapoperation.WrapOperation;
 
 import net.minecraft.nbt.CompoundTag;
+import net.minecraft.core.HolderLookup;
 
 import appeng.api.config.Actionable;
 import appeng.api.crafting.IPatternDetails;
@@ -48,6 +49,10 @@ import com.moakiee.thunderbolt.ae2.overload.pattern.OverloadedProviderOnlyPatter
  * {@code ElapsedTimeTracker} classes. All access to those optional types is therefore reflective;
  * Thunderbolt never hard-links NeoECO classes when the addon is absent. ECO also lacks an
  * {@code updateOutput} hook, so the corresponding monitor-update calls are intentionally omitted.
+ * <p>
+ * Supports the legacy published shapes and the Forge 1.20.1 20.x line. Binary targets are
+ * locked by {@code NeoEcoBinaryShapeTest} so an upstream dispatch or persistence drift cannot
+ * silently disable overload accounting.
  */
 @Pseudo
 @Mixin(targets = "cn.dancingsnow.neoecoae.api.me.ECOCraftingCPULogic", remap = false)
@@ -233,11 +238,17 @@ public abstract class ECOCraftingCpuLogicMixin {
     }
 
     @WrapOperation(
-            method = "executeCrafting",
+            method = {
+                    "executeCrafting",
+                    "tryPushSlowPattern"
+            },
             at = @At(
                     value = "INVOKE",
                     target = "Lappeng/api/networking/crafting/ICraftingProvider;pushPattern(Lappeng/api/crafting/IPatternDetails;[Lappeng/api/stacks/KeyCounter;)Z"),
-            remap = false)
+            remap = false,
+            require = 1,
+            expect = 1,
+            allow = 1)
     private boolean ae2lt$registerOverloadExpectedOutputs(ICraftingProvider provider, IPatternDetails details,
                                                           KeyCounter[] inputHolder, Operation<Boolean> original) {
         if (!AE2LT_ECO_AVAILABLE) {
@@ -292,8 +303,25 @@ public abstract class ECOCraftingCpuLogicMixin {
         return pushed;
     }
 
-    @Inject(method = "writeToNBT", at = @At("RETURN"))
-    private void ae2lt$writeOverloadState(CompoundTag data, CallbackInfo ci) {
+    @Inject(
+            method = "writeToNBT(Lnet/minecraft/nbt/CompoundTag;)V",
+            at = @At("RETURN"),
+            require = 0)
+    private void ae2lt$writeLegacyOverloadState(CompoundTag data, CallbackInfo ci) {
+        ae2lt$writeOverloadState(data);
+    }
+
+    @Inject(
+            method = "writeToNBT(Lnet/minecraft/nbt/CompoundTag;Lnet/minecraft/core/HolderLookup$Provider;)V",
+            at = @At("RETURN"),
+            require = 0)
+    private void ae2lt$writeForge1201OverloadState(
+            CompoundTag data, HolderLookup.Provider registries, CallbackInfo ci) {
+        ae2lt$writeOverloadState(data);
+    }
+
+    @Unique
+    private void ae2lt$writeOverloadState(CompoundTag data) {
         if (!AE2LT_ECO_AVAILABLE) return;
         var overloadStateTag = OverloadCpuStateManager.INSTANCE.writeToTag(this);
         if (overloadStateTag != null) {
@@ -303,8 +331,25 @@ public abstract class ECOCraftingCpuLogicMixin {
         }
     }
 
-    @Inject(method = "readFromNBT", at = @At("RETURN"))
-    private void ae2lt$readOverloadState(CompoundTag data, CallbackInfo ci) {
+    @Inject(
+            method = "readFromNBT(Lnet/minecraft/nbt/CompoundTag;)V",
+            at = @At("RETURN"),
+            require = 0)
+    private void ae2lt$readLegacyOverloadState(CompoundTag data, CallbackInfo ci) {
+        ae2lt$readOverloadState(data);
+    }
+
+    @Inject(
+            method = "readFromNBT(Lnet/minecraft/nbt/CompoundTag;Lnet/minecraft/core/HolderLookup$Provider;)V",
+            at = @At("RETURN"),
+            require = 0)
+    private void ae2lt$readForge1201OverloadState(
+            CompoundTag data, HolderLookup.Provider registries, CallbackInfo ci) {
+        ae2lt$readOverloadState(data);
+    }
+
+    @Unique
+    private void ae2lt$readOverloadState(CompoundTag data) {
         if (!AE2LT_ECO_AVAILABLE) return;
         OverloadCpuStateManager.INSTANCE.clear(this);
         var job = ae2lt$getJob();

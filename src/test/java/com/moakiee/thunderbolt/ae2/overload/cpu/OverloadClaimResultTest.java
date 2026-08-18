@@ -67,7 +67,7 @@ class OverloadClaimResultTest {
         private final ResourceLocation id;
 
         private TestKey(String path) {
-            id = ResourceLocation.fromNamespaceAndPath(
+            id = new ResourceLocation(
                     "thunderbolt_test",
                     path);
         }

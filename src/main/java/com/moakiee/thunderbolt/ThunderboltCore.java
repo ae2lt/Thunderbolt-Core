@@ -11,7 +11,9 @@ import net.minecraftforge.event.server.ServerStartingEvent;
 import net.minecraftforge.event.server.ServerStoppedEvent;
 import net.minecraftforge.fml.common.Mod;
 import net.minecraftforge.fml.event.lifecycle.FMLCommonSetupEvent;
+import net.minecraftforge.fml.event.lifecycle.FMLLoadCompleteEvent;
 import net.minecraftforge.fml.javafmlmod.FMLJavaModLoadingContext;
+import org.spongepowered.asm.mixin.MixinEnvironment;
 import org.slf4j.Logger;
 
 /**
@@ -28,9 +30,13 @@ public final class ThunderboltCore {
     public static final Logger LOGGER = LogUtils.getLogger();
 
     public ThunderboltCore() {
+        // No-arg @Mod constructor: the only style accepted by every 1.20.1 loader
+        // (Forge 47.2.x requires no-arg; NeoForge 47.1.x tries no-arg first;
+        // Forge 47.4.x falls back to it). Fetch the bus via the static context.
         var modEventBus = FMLJavaModLoadingContext.get().getModEventBus();
         ThunderboltBlockEntities.TYPES.register(modEventBus);
         modEventBus.addListener(this::onCommonSetup);
+        modEventBus.addListener(this::onLoadComplete);
         MinecraftForge.EVENT_BUS.addListener(this::onServerStarting);
         MinecraftForge.EVENT_BUS.addListener(this::onServerStopped);
         LOGGER.info("[Thunderbolt Core] initialized");
@@ -47,5 +53,14 @@ public final class ThunderboltCore {
 
     private void onCommonSetup(FMLCommonSetupEvent event) {
         event.enqueueWork(() -> StorageCells.addCellHandler(IndexedStorageCellHandler.INSTANCE));
+    }
+
+    private void onLoadComplete(FMLLoadCompleteEvent event) {
+        if (Boolean.getBoolean("thunderbolt.mixinAudit")) {
+            event.enqueueWork(() -> {
+                LOGGER.info("Auditing every selected Thunderbolt Mixin target");
+                MixinEnvironment.getCurrentEnvironment().audit();
+            });
+        }
     }
 }

@@ -9,6 +9,9 @@ import java.util.UUID;
 import java.util.function.Consumer;
 
 import org.jetbrains.annotations.Nullable;
+import org.slf4j.Logger;
+
+import com.mojang.logging.LogUtils;
 
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.HolderLookup;
@@ -42,6 +45,7 @@ import com.moakiee.thunderbolt.ae2.crafting.LoopCraftingPlan;
  * Shared-capacity time-wheel CPU that creates one virtual CPU per crafting job.
  */
 public final class TimeWheelCraftingCpuPool implements ExtendedCraftingCpuCluster {
+    private static final Logger LOGGER = LogUtils.getLogger();
     private static final int PRODUCTIVE_DISPATCH_QUANTUM = 32;
     private static final int DATA_VERSION = 1;
     private static final String TAG_VERSION = "version";
@@ -330,6 +334,9 @@ public final class TimeWheelCraftingCpuPool implements ExtendedCraftingCpuCluste
         }
         if (!cpuList.isEmpty()) {
             tag.put(TAG_CPUS, cpuList);
+        } else {
+            // Callers may reuse a CompoundTag that still contains a previous snapshot.
+            tag.remove(TAG_CPUS);
         }
     }
 
@@ -338,29 +345,55 @@ public final class TimeWheelCraftingCpuPool implements ExtendedCraftingCpuCluste
         remainingStorage = totalStorage;
         cpuListChanged = false;
 
+        if (!tag.contains(TAG_VERSION, Tag.TAG_INT)) {
+            LOGGER.warn("Time-wheel CPU pool data is missing the version marker; "
+                    + "keeping an empty pool instead of loading potentially incompatible data.");
+            return;
+        }
+        int version = tag.getInt(TAG_VERSION);
+        if (version != DATA_VERSION) {
+            LOGGER.warn("Time-wheel CPU pool data version {} is not supported by version {}; "
+                    + "keeping an empty pool instead of guessing a migration.", version, DATA_VERSION);
+            return;
+        }
+
         var cpuList = tag.getList(TAG_CPUS, Tag.TAG_COMPOUND);
+        boolean healed = false;
         for (int i = 0; i < cpuList.size(); i++) {
             var entryTag = cpuList.getCompound(i);
             if (!entryTag.hasUUID(TAG_ID)
                     || !entryTag.contains(TAG_RESERVED_BYTES, Tag.TAG_LONG)
                     || !entryTag.contains(TAG_STATE, Tag.TAG_COMPOUND)) {
+                healed = true;
                 continue;
             }
 
             var id = entryTag.getUUID(TAG_ID);
             if (activeCpus.containsKey(id)) {
-                id = UUID.randomUUID();
+                // A UUID identifies one persisted virtual CPU. Restoring a duplicate under a new
+                // random id would clone its inventory, pending outputs and crafting link.
+                LOGGER.warn("Skipping duplicate time-wheel CPU id {} at saved entry {}.", id, i);
+                healed = true;
+                continue;
             }
             boolean infiniteStorage = hasInfiniteStorage();
             long reservedBytes = infiniteStorage ? 0L : Math.max(0L, entryTag.getLong(TAG_RESERVED_BYTES));
             long cpuStorage = infiniteStorage ? Long.MAX_VALUE : reservedBytes;
             var cpu = new TimeWheelCraftingCPU(
                     host, cpuStorage, sharedCoProcessors, maxCopiesPerTick, unboundedBatch);
-            cpu.readFromNBT(entryTag.getCompound(TAG_STATE), registries);
+            try {
+                cpu.readFromNBT(entryTag.getCompound(TAG_STATE), registries);
+            } catch (RuntimeException exception) {
+                LOGGER.warn("Skipping malformed time-wheel CPU state {} at saved entry {}.",
+                        id, i, exception);
+                healed = true;
+                continue;
+            }
             activeCpus.put(id, new PoolEntry(id, reservedBytes, cpu));
         }
         recalculateRemainingStorage();
         cpuListChanged = !activeCpus.isEmpty();
+        if (healed) host.markCpuDirty();
     }
 
     @Override
@@ -440,7 +473,7 @@ public final class TimeWheelCraftingCpuPool implements ExtendedCraftingCpuCluste
     @Nullable
     @Override
     public Component getName() {
-        return host.getDisplayName();
+        return host.getCpuDisplayName();
     }
 
     @Override

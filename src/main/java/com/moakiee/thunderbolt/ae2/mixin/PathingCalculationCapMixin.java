@@ -6,6 +6,8 @@ import java.util.List;
 import java.util.Queue;
 import java.util.Set;
 
+import com.llamalad7.mixinextras.injector.wrapoperation.Operation;
+import com.llamalad7.mixinextras.injector.wrapoperation.WrapOperation;
 import com.moakiee.thunderbolt.ae2.channel.BorrowedCapacityCalculator;
 import com.moakiee.thunderbolt.ae2.channel.ChannelProviderRegistry;
 import com.moakiee.thunderbolt.ae2.channel.OverloadedChannelOwnerHelper;
@@ -188,6 +190,26 @@ public abstract class PathingCalculationCapMixin {
         BorrowedCapacityCalculator.activeNodeFlow = ae2lt$flowResult.nodeFlow();
         BorrowedCapacityCalculator.activeNetworkNodes = ae2lt$flowResult.networkNodes();
         BorrowedCapacityCalculator.activeConnectionFlow = ae2lt$flowResult.connectionFlow();
+    }
+
+    // ── Phase 3.5: 异常路径的静态状态清理守护 ──
+    //   @Inject 的 TAIL 注入点在 compute() 抛异常时不会执行，静态活跃流
+    //   状态会残留。TAIL 注入本身无法包裹前段代码，因此用 WrapOperation
+    //   包裹 propagateAssignments() 调用——它是 Phase3 设置静态状态之后、
+    //   Phase4 TAIL 清理之前唯一执行的代码段（已通过字节码确认 compute()
+    //   仅有 processQueue 循环 + propagateAssignments + return），在 finally
+    //   中兜底调用 clearActiveData。正常路径上 Phase4 的 TAIL 清理仍会执行，
+    //   clearActiveData 幂等，重复调用无副作用；异常仍照常向上传播。
+
+    @WrapOperation(method = "compute",
+            at = @At(value = "INVOKE",
+                     target = "Lappeng/me/pathfinding/PathingCalculation;propagateAssignments()V"))
+    private void ae2lt$guardPropagateAssignments(PathingCalculation instance, Operation<Void> op) {
+        try {
+            op.call(instance);
+        } finally {
+            BorrowedCapacityCalculator.clearActiveData();
+        }
     }
 
     // ── Phase 4: force-apply max-flow results & cleanup after DFS ──

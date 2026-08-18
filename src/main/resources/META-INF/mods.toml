@@ -13,21 +13,28 @@ ${mod_description}
 
 [[dependencies.${mod_id}]]
     modId="forge"
-    type="required"
+    mandatory=true
     versionRange="${forge_version_range}"
     ordering="NONE"
     side="BOTH"
 
 [[dependencies.${mod_id}]]
     modId="minecraft"
-    type="required"
+    mandatory=true
     versionRange="${minecraft_version_range}"
     ordering="NONE"
     side="BOTH"
 
 [[dependencies.${mod_id}]]
     modId="ae2"
-    type="required"
-    versionRange="[15.4.10,16.0.0)"
+    mandatory=true
+    versionRange="${ae2_version_range}"
+    ordering="AFTER"
+    side="BOTH"
+
+[[dependencies.${mod_id}]]
+    modId="guideme"
+    mandatory=true
+    versionRange="${guideme_version_range}"
     ordering="AFTER"
     side="BOTH"

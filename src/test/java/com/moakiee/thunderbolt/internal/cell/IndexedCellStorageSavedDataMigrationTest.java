@@ -68,4 +68,31 @@ class IndexedCellStorageSavedDataMigrationTest {
 
         assertEquals(1, decoded.get(id).getInt("value"));
     }
+
+    @Test
+    void namespacedLoadSkipsMalformedKeysAndCopiesValidPayloads() {
+        var validId = UUID.randomUUID();
+        var payload = new CompoundTag();
+        payload.putInt("value", 1);
+
+        var validType = new CompoundTag();
+        validType.put(validId.toString(), payload);
+        validType.put("not-a-uuid", new CompoundTag());
+        var stores = new CompoundTag();
+        stores.put("thunderbolt_test:valid", validType);
+        var malformedType = new CompoundTag();
+        malformedType.put(UUID.randomUUID().toString(), new CompoundTag());
+        stores.put("not a valid resource location", malformedType);
+        var encoded = new CompoundTag();
+        encoded.put("Stores", stores);
+
+        var loaded = IndexedCellStorageSavedData.load(encoded);
+        payload.putInt("value", 2);
+        var saved = loaded.save(new CompoundTag()).getCompound("Stores");
+
+        assertFalse(saved.contains("not a valid resource location"));
+        var savedType = saved.getCompound("thunderbolt_test:valid");
+        assertEquals(1, savedType.getCompound(validId.toString()).getInt("value"));
+        assertFalse(savedType.contains("not-a-uuid"));
+    }
 }

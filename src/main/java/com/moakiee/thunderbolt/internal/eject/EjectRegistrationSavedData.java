@@ -4,6 +4,10 @@ import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.Optional;
+
+import com.mojang.logging.LogUtils;
+import org.slf4j.Logger;
 
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
@@ -18,6 +22,7 @@ import net.minecraft.world.level.saveddata.SavedData;
 
 /** Internal persistence for {@code EjectCapabilityRegistry}. */
 public final class EjectRegistrationSavedData extends SavedData {
+    private static final Logger LOGGER = LogUtils.getLogger();
     private static final String DATA_NAME = "thunderbolt_eject_registrations";
     private static final String LEGACY_DATA_NAME = "ae2lt_eject_registrations";
     private static final String TAG_ENTRIES = "Entries";
@@ -72,8 +77,10 @@ public final class EjectRegistrationSavedData extends SavedData {
     }
 
     public void add(PersistentRegistration registration) {
-        entries.add(registration);
-        setDirty();
+        if (!entries.contains(registration)) {
+            entries.add(registration);
+            setDirty();
+        }
     }
 
     public void removeByIntercept(ResourceKey<Level> dimension, BlockPos pos, Direction face) {
@@ -114,16 +121,80 @@ public final class EjectRegistrationSavedData extends SavedData {
         data.legacyMigrationComplete = tag.getBoolean(TAG_LEGACY_MIGRATION_COMPLETE);
         if (!tag.contains(TAG_ENTRIES, Tag.TAG_LIST)) return data;
         var list = tag.getList(TAG_ENTRIES, Tag.TAG_COMPOUND);
+        boolean healed = false;
         for (int i = 0; i < list.size(); i++) {
             var encoded = list.getCompound(i);
-            data.entries.add(new PersistentRegistration(
-                    dimension(encoded.getString(TAG_I_DIM)),
-                    BlockPos.of(encoded.getLong(TAG_I_POS)),
-                    Direction.from3DDataValue(encoded.getInt(TAG_I_FACE)),
-                    dimension(encoded.getString(TAG_P_DIM)),
-                    BlockPos.of(encoded.getLong(TAG_P_POS))));
+            if (!hasRequiredFields(encoded)) {
+                LOGGER.warn("跳过缺少必需字段的 eject 注册条目: {}", encoded);
+                healed = true;
+                continue;
+            }
+            // 畸形维度 id 在 tryParse 处返回 null，此时跳过整条记录并记日志，
+            // 而不是把 null 传入 ResourceKey.create 让整个 SavedData load 抛 NPE。
+            var interceptDimension = tryDimension(encoded.getString(TAG_I_DIM));
+            var hostDimension = tryDimension(encoded.getString(TAG_P_DIM));
+            if (interceptDimension.isEmpty() || hostDimension.isEmpty()) {
+                healed = true;
+                continue;
+            }
+            var interceptPos = BlockPos.of(encoded.getLong(TAG_I_POS));
+            var hostPos = BlockPos.of(encoded.getLong(TAG_P_POS));
+            // 损坏的 long 可能被解出超出原版建筑高度范围的 y（BlockPos.of 本身不抛异常），
+            // 这类坐标在游戏中永远无法命中，统一跳过并记日志。
+            if (!isWithinBuildHeight(interceptPos) || !isWithinBuildHeight(hostPos)) {
+                LOGGER.warn("跳过畸形坐标的 eject 注册条目: {} / {}", interceptPos, hostPos);
+                healed = true;
+                continue;
+            }
+            int rawFace = encoded.getInt(TAG_I_FACE);
+            if (rawFace < 0 || rawFace >= Direction.values().length) {
+                LOGGER.warn("跳过非法方向值的 eject 注册条目: {}", rawFace);
+                healed = true;
+                continue;
+            }
+            var registration = new PersistentRegistration(
+                    interceptDimension.get(),
+                    interceptPos,
+                    Direction.from3DDataValue(rawFace),
+                    hostDimension.get(),
+                    hostPos);
+            if (!data.entries.contains(registration)) {
+                data.entries.add(registration);
+            } else {
+                healed = true;
+            }
         }
+        if (healed) data.setDirty();
         return data;
+    }
+
+    private static boolean hasRequiredFields(CompoundTag tag) {
+        return tag.contains(TAG_I_DIM, Tag.TAG_STRING)
+                && tag.contains(TAG_I_POS, Tag.TAG_LONG)
+                && tag.contains(TAG_I_FACE, Tag.TAG_INT)
+                && tag.contains(TAG_P_DIM, Tag.TAG_STRING)
+                && tag.contains(TAG_P_POS, Tag.TAG_LONG);
+    }
+
+    /**
+     * y 超出原版建筑高度范围视为畸形数据。
+     * 对应原版 LevelHeightMinMax 的 MIN_BUILD_HEIGHT(-2048) / MAX_BUILD_HEIGHT(2048)，
+     * 此处用字面量避免对具体常量位置的依赖。
+     */
+    private static boolean isWithinBuildHeight(BlockPos pos) {
+        return pos.getY() >= -2048 && pos.getY() < 2048;
+    }
+
+    /**
+     * {@link #dimension(String)} 的容错入口：id 无法解析时记 warn 日志并返回空，
+     * 由调用方跳过该条目，避免单条损坏数据拖垮整个 load。
+     */
+    static Optional<ResourceKey<Level>> tryDimension(String id) {
+        if (ResourceLocation.tryParse(id) == null) {
+            LOGGER.warn("跳过畸形的维度 id 条目: {}", id);
+            return Optional.empty();
+        }
+        return Optional.of(dimension(id));
     }
 
     /**
@@ -132,12 +203,16 @@ public final class EjectRegistrationSavedData extends SavedData {
      * bootstrapped, which plain JUnit cannot do, so the key is built via the private factory
      * instead. The registry name ({@code minecraft:dimension}) matches
      * {@code Registries.DIMENSION.location()} exactly, so keys compare equal to runtime ones.
+     *
+     * <p>The factory is private and its reflective lookup must try both names: {@code create}
+     * (dev, mojmap) and {@code m_135790_} (release, srg) — the method is renamed at obfuscation
+     * and the reflective string is never remapped.
      */
     @SuppressWarnings("unchecked")
     static ResourceKey<Level> dimension(String id) {
         try {
             return (ResourceKey<Level>) RESOURCE_KEY_CREATE.invoke(null,
-                    ResourceLocation.fromNamespaceAndPath("minecraft", "dimension"),
+                    new ResourceLocation("minecraft", "dimension"),
                     ResourceLocation.tryParse(id));
         } catch (ReflectiveOperationException e) {
             throw new IllegalStateException("Failed to build dimension key " + id, e);
@@ -147,13 +222,17 @@ public final class EjectRegistrationSavedData extends SavedData {
     private static final Method RESOURCE_KEY_CREATE = reflectResourceKeyCreate();
 
     private static Method reflectResourceKeyCreate() {
-        try {
-            var create = ResourceKey.class.getDeclaredMethod(
-                    "create", ResourceLocation.class, ResourceLocation.class);
-            create.setAccessible(true);
-            return create;
-        } catch (ReflectiveOperationException e) {
-            throw new ExceptionInInitializerError(e);
+        for (String name : new String[]{"create", "m_135790_"}) {
+            try {
+                var create = ResourceKey.class.getDeclaredMethod(
+                        name, ResourceLocation.class, ResourceLocation.class);
+                create.setAccessible(true);
+                return create;
+            } catch (NoSuchMethodException ignored) {
+                // try the other mapping
+            }
         }
+        throw new ExceptionInInitializerError(new NoSuchMethodException(
+                "ResourceKey.create(ResourceLocation, ResourceLocation)"));
     }
 }

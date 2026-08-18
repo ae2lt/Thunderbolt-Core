@@ -15,8 +15,8 @@ import com.moakiee.thunderbolt.ae2.batch.BatchJobView;
 import com.moakiee.thunderbolt.ae2.batch.BatchTaskHandle;
 
 public final class AaeBatchJobView implements BatchJobView, BatchTaskHandle, Iterator<BatchTaskHandle> {
-    // AdvancedAE is an optional addon; the job type is only known at runtime (see the
-    // @Pseudo accessor mixins). Use Object here so this class compiles without AAE on the classpath.
+    // AdvancedAE remains optional at runtime; the job itself stays erased while the Mixin
+    // accessor uses the concrete field type required for descriptor-exact matching.
     private final Object job;
     private Iterator<? extends Map.Entry<IPatternDetails, ?>> rawIter;
     private Map.Entry<IPatternDetails, ?> currentEntry;
