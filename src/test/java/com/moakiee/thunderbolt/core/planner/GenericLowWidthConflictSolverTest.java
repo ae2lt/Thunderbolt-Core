@@ -443,6 +443,58 @@ class GenericLowWidthConflictSolverTest {
     }
 
     @Test
+    void batchReplayDoesNotCaptureIncrementalUnitOutputInTheSameComponent() {
+        CraftPattern<String> batch = new CraftPattern<>(
+                "B",
+                2,
+                List.of(CraftInput.of("shared", 1), CraftInput.of("batch-ticket", 1)),
+                List.of(CraftOutput.of("batch-token", 1)),
+                "batch");
+        CraftPattern<String> deadBatch = new CraftPattern<>(
+                "B", 1, List.of(CraftInput.of("dead-batch", 1)), "dead-batch");
+        CraftPattern<String> unitLeft = new CraftPattern<>(
+                "U",
+                1,
+                List.of(CraftInput.of("shared", 1), CraftInput.of("left-ticket", 1)),
+                List.of(CraftOutput.of("left-token", 1)),
+                "unit-left");
+        CraftPattern<String> unitRight = new CraftPattern<>(
+                "U",
+                1,
+                List.of(CraftInput.of("shared", 1), CraftInput.of("right-ticket", 1)),
+                List.of(CraftOutput.of("right-token", 1)),
+                "unit-right");
+
+        PlanningResult<String> result = CraftPlannerV2.planDetailed(
+                CraftGraph.<String>builder()
+                        .pattern("root", 1, List.of(
+                                CraftInput.of("U", 1),
+                                CraftInput.of("U", 1),
+                                CraftInput.of("B", 1),
+                                CraftInput.of("left-token", 1),
+                                CraftInput.of("right-token", 1),
+                                CraftInput.of("batch-token", 1)))
+                        .pattern(batch)
+                        .pattern(deadBatch)
+                        .pattern(unitLeft)
+                        .pattern(unitRight)
+                        .stock("shared", 3)
+                        .stock("batch-ticket", 1)
+                        .stock("left-ticket", 1)
+                        .stock("right-ticket", 1)
+                        .build(),
+                "root",
+                1);
+
+        assertTrue(result.plan().feasible(), () -> "missing=" + result.plan().missing()
+                + " diagnostics=" + result.diagnostics());
+        assertEquals(1L, result.plan().firings().getOrDefault(batch, 0L));
+        assertEquals(1L, result.plan().firings().getOrDefault(unitLeft, 0L));
+        assertEquals(1L, result.plan().firings().getOrDefault(unitRight, 0L));
+        assertEquals(1, result.diagnostics().lowWidthSolved());
+    }
+
+    @Test
     void returnedCatalystUsesOneActivationReserveInsideGenericFlow() {
         long amount = 1_000_000_000L;
         CraftGraph.Builder<String> builder = CraftGraph.builder();
