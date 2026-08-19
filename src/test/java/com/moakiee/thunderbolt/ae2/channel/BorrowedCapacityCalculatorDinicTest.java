@@ -1,4 +1,4 @@
-package com.moakiee.thunderbolt.ae2.channel;
+package com.moakiee.thunderbolt.core.channel;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 

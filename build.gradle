@@ -192,6 +192,19 @@ test {
     }
 }
 
+tasks.register("referenceCapabilityTest", Test) {
+    description = "Runs the planner capability reference kit and prints its auditable result rows."
+    group = "verification"
+    useJUnitPlatform()
+    filter {
+        includeTestsMatching "com.moakiee.thunderbolt.core.crafting.planner.reference.*"
+    }
+    testLogging {
+        events "passed", "skipped", "failed"
+        showStandardStreams = true
+    }
+}
+
 tasks.register('prepareOptionalModShapeArtifacts', Sync) {
     from configurations.optionalModShapeArtifacts
     into layout.buildDirectory.dir('optional-mod-shapes')

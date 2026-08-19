@@ -1,4 +1,4 @@
-package com.moakiee.thunderbolt.core.planner;
+package com.moakiee.thunderbolt.core.crafting.planner;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;

@@ -38,15 +38,13 @@ class PortMetadataContractTest {
     }
 
     @Test
-    void productionRefmapIncludesInheritedMenuLifecycleMethods() throws IOException {
+    void productionRefmapIncludesTheForgeCapabilityLookup() throws IOException {
         String refmap = Files.readString(GENERATED_REFMAP);
 
         assertTrue(refmap.contains(
-                "\"broadcastChanges()V\": "
-                        + "\"Lappeng/menu/me/crafting/CraftingCPUMenu;m_38946_()V\""));
-        assertTrue(refmap.contains(
-                "\"removed(Lnet/minecraft/world/entity/player/Player;)V\": "
-                        + "\"Lappeng/menu/me/crafting/CraftingCPUMenu;"
-                        + "m_6877_(Lnet/minecraft/world/entity/player/Player;)V\""));
+                "\"getBlockEntity\": "
+                        + "\"Lnet/minecraft/world/level/Level;m_7702_"
+                        + "(Lnet/minecraft/core/BlockPos;)"
+                        + "Lnet/minecraft/world/level/block/entity/BlockEntity;\""));
     }
 }

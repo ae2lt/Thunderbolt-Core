@@ -1,4 +1,4 @@
-package com.moakiee.thunderbolt.internal.eject;
+package com.moakiee.thunderbolt.core.eject;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 

@@ -7,6 +7,8 @@ import appeng.api.networking.crafting.ICraftingPlan;
 import appeng.api.stacks.KeyCounter;
 import appeng.crafting.CraftingPlan;
 
+import com.moakiee.thunderbolt.core.crafting.plan.LoopCraftingPlan;
+
 /** Builds concrete, display-only AE2 plans for integrations that cast the public plan interface. */
 public final class CraftingPlanSummaryAdapter {
     private CraftingPlanSummaryAdapter() {

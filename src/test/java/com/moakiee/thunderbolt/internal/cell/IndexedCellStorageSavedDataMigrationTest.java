@@ -1,4 +1,4 @@
-package com.moakiee.thunderbolt.internal.cell;
+package com.moakiee.thunderbolt.core.storage.cell;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;

@@ -1,4 +1,4 @@
-package com.moakiee.thunderbolt.ae2.batch;
+package com.moakiee.thunderbolt.core.crafting.batch;
 
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;

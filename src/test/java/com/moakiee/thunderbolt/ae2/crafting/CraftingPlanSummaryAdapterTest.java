@@ -13,22 +13,23 @@ import appeng.api.stacks.GenericStack;
 import appeng.api.stacks.KeyCounter;
 import appeng.crafting.CraftingPlan;
 
-import com.moakiee.thunderbolt.ae2.timewheel.TimeWheelPoolRestrictedPattern;
+import com.moakiee.thunderbolt.core.crafting.loop.CraftingCpuRestrictedPattern;
+import com.moakiee.thunderbolt.core.crafting.plan.LoopCraftingPlan;
 
 import org.junit.jupiter.api.Test;
 
 class CraftingPlanSummaryAdapterTest {
+
     @Test
     void preservesNativeCraftingPlanIdentity() {
         var nativePlan = plan(12, true, false);
-
         assertSame(nativePlan, CraftingPlanSummaryAdapter.adapt(nativePlan));
     }
 
     @Test
     void exposesLoopDelegateWithoutReplacingTheLoopPlan() {
         var delegate = plan(24, false, true);
-        TimeWheelPoolRestrictedPattern restriction = ignored -> true;
+        CraftingCpuRestrictedPattern restriction = ignored -> true;
         var loopPlan = new LoopCraftingPlan(
                 delegate, List.of(restriction), Map.of(), Map.of(), List.of());
 

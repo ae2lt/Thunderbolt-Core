@@ -1,4 +1,6 @@
-package com.moakiee.thunderbolt.core.planner;
+package com.moakiee.thunderbolt.core.crafting.planner;
+
+import com.moakiee.thunderbolt.core.crafting.pattern.ReusableStockSource;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -81,60 +83,6 @@ class CraftPlannerV2Test {
         assertEquals(0L, firingsOf(plan, viaDiamond));
         assertEquals(1L, firingsOf(plan, viaIron));
         assertEquals(5L, plan.usedStock().get("iron"));
-    }
-
-    @Test
-    void fuzzySiblingRouteConsumesStockBeforeCraftingTheDeclaredVariant() {
-        Object fuzzyPattern = new Object();
-        CraftPattern<String> fromStockVariant = new CraftPattern<>(
-                "tier3", 1, List.of(CraftInput.of("tier2-with-other-nbt", 1)), fuzzyPattern);
-        CraftPattern<String> fromDeclaredVariant = new CraftPattern<>(
-                "tier3", 1, List.of(CraftInput.of("tier2-declared-nbt", 1)), fuzzyPattern);
-        CraftPattern<String> makeDeclaredVariant = new CraftPattern<>(
-                "tier2-declared-nbt", 1, List.of(CraftInput.of("tier1", 1)), "tier1-to-tier2");
-        CraftGraph<String> graph = CraftGraph.<String>builder()
-                .pattern(fromStockVariant)
-                .pattern(fromDeclaredVariant)
-                .pattern(makeDeclaredVariant)
-                .stock("tier2-with-other-nbt", 1)
-                .stock("tier1", 64)
-                .build();
-
-        CraftPlan<String> plan = CraftPlannerV2.plan(graph, "tier3", 1);
-
-        assertTrue(plan.feasible());
-        assertEquals(1L, firingsOf(plan, fromStockVariant));
-        assertEquals(0L, firingsOf(plan, fromDeclaredVariant));
-        assertEquals(0L, firingsOf(plan, makeDeclaredVariant));
-        assertEquals(1L, plan.usedStock().get("tier2-with-other-nbt"));
-        assertNull(plan.usedStock().get("tier1"));
-    }
-
-    @Test
-    void fuzzySiblingRouteCraftsOnlyTheAmountMissingAfterStock() {
-        Object fuzzyPattern = new Object();
-        CraftPattern<String> fromStockVariant = new CraftPattern<>(
-                "tier3", 1, List.of(CraftInput.of("tier2-with-other-nbt", 1)), fuzzyPattern);
-        CraftPattern<String> fromDeclaredVariant = new CraftPattern<>(
-                "tier3", 1, List.of(CraftInput.of("tier2-declared-nbt", 1)), fuzzyPattern);
-        CraftPattern<String> makeDeclaredVariant = new CraftPattern<>(
-                "tier2-declared-nbt", 1, List.of(CraftInput.of("tier1", 1)), "tier1-to-tier2");
-        CraftGraph<String> graph = CraftGraph.<String>builder()
-                .pattern(fromStockVariant)
-                .pattern(fromDeclaredVariant)
-                .pattern(makeDeclaredVariant)
-                .stock("tier2-with-other-nbt", 1)
-                .stock("tier1", 64)
-                .build();
-
-        CraftPlan<String> plan = CraftPlannerV2.plan(graph, "tier3", 2);
-
-        assertTrue(plan.feasible());
-        assertEquals(1L, firingsOf(plan, fromStockVariant));
-        assertEquals(1L, firingsOf(plan, fromDeclaredVariant));
-        assertEquals(1L, firingsOf(plan, makeDeclaredVariant));
-        assertEquals(1L, plan.usedStock().get("tier2-with-other-nbt"));
-        assertEquals(1L, plan.usedStock().get("tier1"));
     }
 
     /**
@@ -1002,6 +950,228 @@ class CraftPlannerV2Test {
     }
 
     @Test
+    void weightedPositiveFeedbackUsesExactRequestResidueSeed() {
+        for (long amount : List.of(1L, 2L, 3L, 8L, 1_000L)) {
+            long minimumSeed = weightedPositiveMinimumSeed(amount);
+            WeightedPositiveFeedback feedback = weightedPositiveFeedback(minimumSeed);
+
+            CraftPlan<String> plan = CraftPlannerV2.plan(feedback.graph(), "T", amount);
+
+            assertTrue(plan.feasible(), () -> "amount=" + amount + " missing=" + plan.missing());
+            assertEquals(Sat.ceilDiv(3L * amount, 2L),
+                    firingsOf(plan, feedback.makeB()), "amount=" + amount);
+            assertEquals(amount, firingsOf(plan, feedback.makeTarget()), "amount=" + amount);
+            assertEquals(minimumSeed, plan.usedStock().get("A"), "amount=" + amount);
+            assertTrue(plan.missing().isEmpty(), "amount=" + amount);
+        }
+    }
+
+    @Test
+    void weightedPositiveFeedbackReportsOnlyTheMissingExecutableSeed() {
+        for (long amount : List.of(2L, 3L, 8L)) {
+            long minimumSeed = weightedPositiveMinimumSeed(amount);
+            WeightedPositiveFeedback feedback = weightedPositiveFeedback(minimumSeed - 1L);
+
+            CraftPlan<String> plan = CraftPlannerV2.plan(feedback.graph(), "T", amount);
+
+            assertFalse(plan.feasible(), "amount=" + amount);
+            assertEquals(Map.of("A", 1L), plan.missing(), "amount=" + amount);
+            assertEquals(minimumSeed - 1L, plan.usedStock().get("A"), "amount=" + amount);
+        }
+    }
+
+    @Test
+    void weightedPositiveFeedbackSeedCompetesWithSiblingConsumption() {
+        WeightedPositiveFeedback feedback = weightedPositiveFeedback(504L);
+        CraftGraph<String> shortGraph = CraftGraph.<String>builder()
+                .pattern(feedback.makeB())
+                .pattern(feedback.makeTarget())
+                .pattern("side", 1, List.of(CraftInput.of("A", 5)))
+                .pattern("root", 1, List.of(
+                        CraftInput.of("T", 1_000), CraftInput.of("side", 1)))
+                .stock("A", 504)
+                .build();
+        CraftGraph<String> completeGraph = CraftGraph.<String>builder()
+                .pattern(feedback.makeB())
+                .pattern(feedback.makeTarget())
+                .pattern("side", 1, List.of(CraftInput.of("A", 5)))
+                .pattern("root", 1, List.of(
+                        CraftInput.of("T", 1_000), CraftInput.of("side", 1)))
+                .stock("A", 505)
+                .build();
+
+        CraftPlan<String> shortPlan = CraftPlannerV2.plan(shortGraph, "root", 1);
+        CraftPlan<String> completePlan = CraftPlannerV2.plan(completeGraph, "root", 1);
+
+        assertFalse(shortPlan.feasible());
+        assertEquals(Set.of("A"), shortPlan.missing().keySet());
+        assertTrue(shortPlan.missing().get("A") > 0L);
+        assertTrue(completePlan.feasible(), () -> "missing=" + completePlan.missing());
+        assertEquals(505L, completePlan.usedStock().get("A"));
+    }
+
+    @Test
+    void weightedPositiveFeedbackScalesWithoutPerFiringSimulation() {
+        long amount = 1_000_000_000L;
+        long minimumSeed = weightedPositiveMinimumSeed(amount);
+        WeightedPositiveFeedback feedback = weightedPositiveFeedback(minimumSeed);
+
+        CraftPlan<String> plan = assertTimeoutPreemptively(
+                Duration.ofSeconds(1),
+                () -> CraftPlannerV2.plan(feedback.graph(), "T", amount));
+
+        assertTrue(plan.feasible(), () -> "missing=" + plan.missing());
+        assertEquals(1_500_000_000L, firingsOf(plan, feedback.makeB()));
+        assertEquals(amount, firingsOf(plan, feedback.makeTarget()));
+        assertEquals(minimumSeed, plan.usedStock().get("A"));
+    }
+
+    @Test
+    void weightedFeedbackKeepsExternalConsumablesOutsideTheStateCycle() {
+        CraftPattern<String> makeB = new CraftPattern<>(
+                "B", 2, List.of(CraftInput.of("A", 3)), "3A_to_2B");
+        CraftPattern<String> makeTarget = new CraftPattern<>(
+                "T", 1, List.of(CraftInput.of("B", 3), CraftInput.of("raw", 1)),
+                List.of(CraftOutput.of("A", 4)), "3B_raw_to_T_4A");
+        CraftGraph<String> complete = CraftGraph.<String>builder()
+                .pattern(makeB).pattern(makeTarget)
+                .stock("A", 6).stock("raw", 2).build();
+        CraftGraph<String> shortSeed = CraftGraph.<String>builder()
+                .pattern(makeB).pattern(makeTarget)
+                .stock("A", 1).stock("raw", 2).build();
+
+        CraftPlan<String> completePlan = CraftPlannerV2.plan(complete, "T", 2);
+        PlanningResult<String> first = CraftPlannerV2.planDetailed(shortSeed, "T", 2);
+        PlanningResult<String> refilled = CraftPlannerV2.planDetailed(
+                shortSeed.withAdditionalStock(first.plan().missing()), "T", 2);
+
+        assertTrue(completePlan.feasible());
+        assertEquals(Map.of("A", 6L, "raw", 2L), completePlan.usedStock());
+        assertEquals(3L, firingsOf(completePlan, makeB));
+        assertEquals(2L, firingsOf(completePlan, makeTarget));
+        assertFalse(first.plan().feasible());
+        assertEquals(Map.of("A", 5L), first.plan().missing());
+        assertTrue(refilled.plan().feasible(), () -> "missing=" + refilled.plan().missing());
+        assertEquals(1, refilled.diagnostics().planRuns());
+        assertEquals(0, refilled.diagnostics().consumedSearchBudget());
+        assertEquals(0, refilled.diagnostics().consumedResolutionBudget());
+        assertEquals(0, refilled.diagnostics().consumedFallbackBudget());
+    }
+
+    @Test
+    void threeStateWeightedFeedbackRecomputesFromReportedMissingWithoutContext() {
+        CraftPattern<String> makeB = new CraftPattern<>(
+                "B", 1, List.of(CraftInput.of("A", 2)), "2A_to_B");
+        CraftPattern<String> makeC = new CraftPattern<>(
+                "C", 1, List.of(CraftInput.of("B", 3)), "3B_to_C");
+        CraftPattern<String> makeTarget = new CraftPattern<>(
+                "T", 1, List.of(CraftInput.of("C", 2)),
+                List.of(CraftOutput.of("A", 5)), "2C_to_T_5A");
+        CraftGraph<String> graph = CraftGraph.<String>builder()
+                .pattern(makeB).pattern(makeC).pattern(makeTarget)
+                .stock("A", 14).build();
+
+        PlanningResult<String> first = CraftPlannerV2.planDetailed(graph, "T", 2);
+        PlanningResult<String> refilled = assertTimeoutPreemptively(
+                Duration.ofSeconds(1),
+                () -> CraftPlannerV2.planDetailed(
+                        graph.withAdditionalStock(first.plan().missing()), "T", 2));
+
+        assertFalse(first.plan().feasible());
+        assertEquals(Map.of("A", 5L), first.plan().missing());
+        assertTrue(refilled.plan().feasible(), () -> "missing=" + refilled.plan().missing());
+        assertEquals(19L, refilled.plan().usedStock().get("A"));
+        assertEquals(12L, firingsOf(refilled.plan(), makeB));
+        assertEquals(4L, firingsOf(refilled.plan(), makeC));
+        assertEquals(2L, firingsOf(refilled.plan(), makeTarget));
+        assertEquals(1, refilled.diagnostics().planRuns());
+        assertEquals(0, refilled.diagnostics().consumedSearchBudget());
+        assertEquals(0, refilled.diagnostics().consumedResolutionBudget());
+        assertEquals(0, refilled.diagnostics().consumedFallbackBudget());
+    }
+
+    @Test
+    void nonGrowingPetriFallbackRecomputesFromReportedMissingWithoutContext() {
+        CraftPattern<String> split = new CraftPattern<>(
+                "B", 1, List.of(CraftInput.of("A", 2)),
+                List.of(CraftOutput.of("C", 1)), "2A_to_B_C");
+        CraftPattern<String> target = new CraftPattern<>(
+                "T", 1, List.of(CraftInput.of("B", 1), CraftInput.of("C", 1)),
+                List.of(CraftOutput.of("A", 1)), "B_C_to_T_A");
+        CraftGraph<String> graph = CraftGraph.<String>builder()
+                .pattern(split).pattern(target).stock("A", 2).build();
+
+        PlanningResult<String> first = CraftPlannerV2.planDetailed(graph, "T", 2);
+        PlanningResult<String> refilled = assertTimeoutPreemptively(
+                Duration.ofSeconds(1),
+                () -> CraftPlannerV2.planDetailed(
+                        graph.withAdditionalStock(first.plan().missing()), "T", 2));
+
+        assertFalse(first.plan().feasible());
+        assertEquals(Map.of("A", 1L), first.plan().missing());
+        assertTrue(refilled.plan().feasible(), () -> "missing=" + refilled.plan().missing());
+        assertEquals(3L, refilled.plan().usedStock().get("A"));
+        assertEquals(2L, firingsOf(refilled.plan(), split));
+        assertEquals(2L, firingsOf(refilled.plan(), target));
+        assertEquals(1, refilled.diagnostics().planRuns());
+        assertEquals(0, refilled.diagnostics().consumedSearchBudget());
+        assertEquals(0, refilled.diagnostics().consumedFallbackBudget());
+        assertFalse(refilled.plan().budgetExhausted());
+    }
+
+    @Test
+    void nonGrowingPetriFallbackIsBoundedAtBillionScale() {
+        long amount = 1_000_000_000L;
+        CraftPattern<String> split = new CraftPattern<>(
+                "B", 1, List.of(CraftInput.of("A", 2)),
+                List.of(CraftOutput.of("C", 1)), "2A_to_B_C");
+        CraftPattern<String> target = new CraftPattern<>(
+                "T", 1, List.of(CraftInput.of("B", 1), CraftInput.of("C", 1)),
+                List.of(CraftOutput.of("A", 1)), "B_C_to_T_A");
+        CraftGraph<String> graph = CraftGraph.<String>builder()
+                .pattern(split).pattern(target).stock("A", amount).build();
+
+        PlanningResult<String> first = assertTimeoutPreemptively(
+                Duration.ofSeconds(1), () -> CraftPlannerV2.planDetailed(graph, "T", amount));
+        PlanningResult<String> refilled = assertTimeoutPreemptively(
+                Duration.ofSeconds(1),
+                () -> CraftPlannerV2.planDetailed(
+                        graph.withAdditionalStock(first.plan().missing()), "T", amount));
+
+        assertFalse(first.plan().feasible());
+        assertEquals(Set.of("A"), first.plan().missing().keySet());
+        assertTrue(refilled.plan().feasible(), () -> "missing=" + refilled.plan().missing());
+        assertEquals(amount, firingsOf(refilled.plan(), split));
+        assertEquals(amount, firingsOf(refilled.plan(), target));
+        assertEquals(1, refilled.diagnostics().planRuns());
+        assertFalse(refilled.plan().budgetExhausted());
+    }
+
+    private static long weightedPositiveMinimumSeed(long amount) {
+        return Sat.add(Sat.ceilDiv(amount, 2L), 5L);
+    }
+
+    private static WeightedPositiveFeedback weightedPositiveFeedback(long stockA) {
+        CraftPattern<String> makeB = new CraftPattern<>(
+                "B", 2, List.of(CraftInput.of("A", 3)), "3A_to_2B");
+        CraftPattern<String> makeTarget = new CraftPattern<>(
+                "T", 1, List.of(CraftInput.of("B", 3)),
+                List.of(CraftOutput.of("A", 4)), "3B_to_T_4A");
+        CraftGraph<String> graph = CraftGraph.<String>builder()
+                .pattern(makeB)
+                .pattern(makeTarget)
+                .stock("A", stockA)
+                .build();
+        return new WeightedPositiveFeedback(graph, makeB, makeTarget);
+    }
+
+    private record WeightedPositiveFeedback(
+            CraftGraph<String> graph,
+            CraftPattern<String> makeB,
+            CraftPattern<String> makeTarget) {
+    }
+
+    @Test
     void partialFeedbackMayBootstrapFromTheReturnedState() {
         CraftPattern<String> makeB = new CraftPattern<>(
                 "B", 2, List.of(CraftInput.of("A", 2)),
@@ -1052,49 +1222,6 @@ class CraftPlannerV2Test {
         assertEquals(1L, plan.usedStock().get("A"));
         assertEquals(100L, firingsOf(plan, makeB));
         assertEquals(99L, firingsOf(plan, recoverA));
-    }
-
-    @Test
-    void balancedSelfReturnUsesOneBootstrapItemAtBillionScale() {
-        long amount = 1_000_000_000L;
-        CraftPattern<String> pattern = new CraftPattern<>(
-                "B", 1,
-                List.of(CraftInput.of("A", 1), CraftInput.of("C", 1)),
-                List.of(CraftOutput.of("C", 1)),
-                "1A+1C_to_1B+1C");
-        CraftGraph<String> graph = CraftGraph.<String>builder()
-                .pattern(pattern)
-                .stock("A", amount)
-                .stock("C", 1)
-                .build();
-
-        CraftPlan<String> plan = assertTimeoutPreemptively(
-                Duration.ofSeconds(1), () -> CraftPlannerV2.plan(graph, "B", amount));
-
-        assertTrue(plan.feasible(), () -> "missing=" + plan.missing());
-        assertEquals(amount, firingsOf(plan, pattern));
-        assertEquals(amount, plan.usedStock().get("A"));
-        assertEquals(1L, plan.usedStock().get("C"));
-        assertTrue(plan.missing().isEmpty());
-    }
-
-    @Test
-    void balancedSelfReturnCannotBootstrapFromItsOwnOutput() {
-        CraftPattern<String> pattern = new CraftPattern<>(
-                "B", 1,
-                List.of(CraftInput.of("A", 1), CraftInput.of("C", 1)),
-                List.of(CraftOutput.of("C", 1)),
-                "1A+1C_to_1B+1C");
-        CraftGraph<String> graph = CraftGraph.<String>builder()
-                .pattern(pattern)
-                .stock("A", 1_000)
-                .build();
-
-        CraftPlan<String> plan = assertTimeoutPreemptively(
-                Duration.ofSeconds(1), () -> CraftPlannerV2.plan(graph, "B", 1_000));
-
-        assertFalse(plan.feasible());
-        assertEquals(Map.of("C", 1L), plan.missing());
     }
 
     @Test
@@ -1260,7 +1387,10 @@ class CraftPlannerV2Test {
         assertFalse(planning.plan().budgetExhausted());
         assertFalse(planning.diagnostics().searchCutoff(),
                 "using the one admitted candidate is not a budget cutoff");
-        assertEquals(1, planning.diagnostics().consumedSearchBudget());
+        assertEquals(0, planning.diagnostics().consumedSearchBudget(),
+                "the fixed integer vector needs validation, not another route search");
+        assertEquals(1, planning.diagnostics().lowWidthSolved());
+        assertEquals(1, planning.diagnostics().planRuns());
         assertEquals(1L, firingsOf(planning.plan(), seedFromA));
         assertEquals(1_000L, firingsOf(planning.plan(), contracted));
     }
@@ -1810,38 +1940,6 @@ class CraftPlannerV2Test {
     }
 
     @Test
-    void multiStepContainerCycleCraftsOneBootstrapState() {
-        CraftPattern<String> finish = new CraftPattern<>(
-                "result", 1, List.of(CraftInput.consumedReturning("full", 1, "empty")),
-                List.of(CraftOutput.of("empty", 1)), "finish");
-        CraftPattern<String> fill = new CraftPattern<>(
-                "full", 1, List.of(CraftInput.of("dusted", 1)), "fill");
-        CraftPattern<String> dust = new CraftPattern<>(
-                "dusted", 1, List.of(CraftInput.of("empty", 1), CraftInput.of("dust", 2)), "dust");
-        CraftPattern<String> makeEmpty = new CraftPattern<>(
-                "empty", 1, List.of(CraftInput.of("gem", 3)), "makeEmpty");
-        CraftGraph<String> graph = CraftGraph.<String>builder()
-                .pattern(finish)
-                .pattern(fill)
-                .pattern(dust)
-                .pattern(makeEmpty)
-                .stock("dust", 20)
-                .stock("gem", 3)
-                .build();
-
-        CraftPlan<String> plan = CraftPlannerV2.plan(graph, "result", 10);
-
-        assertTrue(plan.feasible(), plan.toString());
-        assertEquals(10L, firingsOf(plan, finish));
-        assertEquals(10L, firingsOf(plan, fill));
-        assertEquals(10L, firingsOf(plan, dust));
-        assertEquals(1L, firingsOf(plan, makeEmpty));
-        assertEquals(20L, plan.usedStock().get("dust"));
-        assertEquals(3L, plan.usedStock().get("gem"));
-        assertTrue(plan.missing().isEmpty());
-    }
-
-    @Test
     void decompressCycleMakesIngotsFromBlockStock() {
         // Same pair, opposite direction: target = ingot, stock = blocks. Now the compress recipe is the
         // back-edge that gets cut, so ingots come from decompressing blocks.
@@ -2116,13 +2214,9 @@ class CraftPlannerV2Test {
         assertEquals(1L, firingsOf(plan, good));
     }
 
-    /**
-     * Exhausting the global work guard is not a proof that every route needs the same leaf, but AE2's
-     * simulation still needs an actionable replenishment target. The current run must roll back only
-     * its speculative branch and finish one concrete route without launching a diagnostic replan.
-     */
+    /** The exact balance model is independently bounded and does not consume route-search work. */
     @Test
-    void globalSearchBudgetExhaustionReturnsABoundedMissingDiagnosis() {
+    void globalIntegerFlowDoesNotSpendTinyRouteSearchBudget() {
         CraftGraph<String> graph = CraftGraph.<String>builder()
                 .pattern("X", 1, List.of(CraftInput.of("shared", 1)))
                 .pattern("Y", 1, List.of(CraftInput.of("shared", 1)))
@@ -2138,17 +2232,17 @@ class CraftPlannerV2Test {
                 CraftPlannerV2.planDetailed(graph, "target", 1, 1, 1);
         CraftPlan<String> plan = planning.plan();
 
-        assertFalse(plan.feasible());
-        assertTrue(plan.budgetExhausted());
-        assertFalse(plan.firings().isEmpty(), "the diagnostic retains one concrete route");
-        assertEquals(1L, plan.usedStock().get("shared"));
-        assertEquals(1L, plan.missing().get("shared"));
-        assertFalse(plan.usedStock().containsKey("good"),
-                "the discarded speculative alternative must not leak into the diagnosis");
+        assertTrue(plan.feasible());
+        assertFalse(plan.budgetExhausted());
+        assertEquals(1L, plan.usedStock().get("good"));
+        assertFalse(plan.usedStock().containsKey("shared"));
+        assertTrue(plan.missing().isEmpty());
         assertEquals(1, planning.diagnostics().planRuns(),
-                "a cutoff must finish the current run, not launch a diagnostic replan");
+                "the feasible integer vector must finish without a diagnostic replan");
         assertEquals(1, planning.diagnostics().compiledOrientations());
-        assertTrue(planning.diagnostics().searchCutoff());
+        assertEquals(1, planning.diagnostics().lowWidthSolved());
+        assertEquals(0, planning.diagnostics().consumedSearchBudget());
+        assertFalse(planning.diagnostics().searchCutoff());
 
         CraftGraph<String> replenished = CraftGraph.<String>builder()
                 .pattern("X", 1, List.of(CraftInput.of("shared", 1)))
@@ -2164,18 +2258,18 @@ class CraftPlannerV2Test {
                 CraftPlannerV2.plan(replenished, "target", 1, 1, 1);
 
         assertTrue(afterReplenishment.feasible(),
-                "supplying the diagnosed shortfall must make that concrete route executable");
+                "the alternate shared-input route remains executable when fully stocked");
         assertFalse(afterReplenishment.budgetExhausted(),
-                "a feasible diagnostic route is a complete proof despite the earlier search cutoff");
+                "a feasible integer-flow proof is complete even with a tiny search budget");
     }
 
     /**
      * X's first route is locally feasible but consumes the only shared unit before sibling Y asks for
-     * it. The ordinary recursive pass cannot reopen that successful decision. A whole-plan deviation
-     * must replay X through special and preserve shared for Y.
+     * it. The global integer model must choose X through special and preserve shared for Y without a
+     * whole-plan deviation.
      */
     @Test
-    void anytimeReplayReopensSuccessfulChildAfterLaterSiblingConflict() {
+    void globalIntegerFlowResolvesLaterSiblingConflictWithoutReplay() {
         ReusableStockSource source = new ReusableStockSource("host", "pool");
         CraftPattern<String> xShared = new CraftPattern<>(
                 "X", 1, List.of(CraftInput.of("shared", 1)), "X-shared");
@@ -2197,7 +2291,7 @@ class CraftPlannerV2Test {
 
         CraftPlan<String> plan = CraftPlannerV2.plan(graph, "target", 1);
 
-        assertTrue(plan.feasible(), "one route-policy deviation should resolve the sibling conflict");
+        assertTrue(plan.feasible(), "one integer-flow solve should resolve the sibling conflict");
         assertFalse(plan.budgetExhausted());
         assertEquals(0L, firingsOf(plan, xShared));
         assertEquals(1L, firingsOf(plan, xSpecial));
@@ -2206,7 +2300,7 @@ class CraftPlannerV2Test {
     }
 
     @Test
-    void anytimeReplayFinishesWithinBudgetWithoutFalseCutoff() {
+    void globalIntegerFlowFinishesWithinBudgetWithoutFalseCutoff() {
         ReusableStockSource source = new ReusableStockSource("host", "pool");
         CraftPattern<String> xShared = new CraftPattern<>(
                 "X", 1, List.of(CraftInput.of("shared", 1)), "X-shared");
@@ -2231,7 +2325,7 @@ class CraftPlannerV2Test {
         CraftPlan<String> plan = planning.plan();
 
         assertTrue(plan.feasible(),
-                "budget exhaustion stops alternate search but must not kill the selected replay");
+                "the selected integer vector must not depend on alternate-search budget");
         assertFalse(plan.budgetExhausted(),
                 "the deterministic tail produced a complete executable proof");
         assertEquals(0L, firingsOf(plan, xShared));
@@ -2240,10 +2334,13 @@ class CraftPlannerV2Test {
         assertEquals(1L, plan.usedStock().get("special"));
         assertTrue(plan.missing().isEmpty());
         assertFalse(planning.diagnostics().searchCutoff(),
-                "a successful replay that fits the budget must not be reported as cut off");
+                "successful ordered validation must not be reported as cut off");
         assertEquals(1, planning.diagnostics().compiledOrientations());
-        assertTrue(planning.diagnostics().reusedCompilations() >= 1,
-                "route replay must reuse the compiled DAG/capacity/footprint data");
+        assertEquals(0, planning.diagnostics().reusedCompilations(),
+                "the integer vector must avoid whole-plan route replay");
+        assertEquals(1, planning.diagnostics().lowWidthSolved());
+        assertEquals(1, planning.diagnostics().planRuns());
+        assertEquals(0, planning.diagnostics().consumedSearchBudget());
     }
 
     @Test
@@ -2294,16 +2391,16 @@ class CraftPlannerV2Test {
         }
         builder.stock("B" + depth, 4);
 
-        CraftPlan<String> plan = CraftPlannerV2.plan(builder.build(), "target", 1);
+        PlanningResult<String> planning =
+                CraftPlannerV2.planDetailed(builder.build(), "target", 1);
+        CraftPlan<String> plan = planning.plan();
 
         assertFalse(plan.feasible());
         assertFalse(plan.budgetExhausted());
         assertEquals(8L, plan.missing().get("C"));
-        assertEquals(5L, plan.usedStock().get("A"));
-        assertFalse(plan.usedStock().containsKey("B" + depth),
-                "the alternative B tree is irrelevant once its common C blocker is proven");
-        assertEquals(1, plan.itemsProcessed(),
-                "only target is expanded; the committed best effort reports C directly");
+        assertEquals(1, planning.diagnostics().lowWidthInfeasible(),
+                "the shared blocker is now proved by one global balance model");
+        assertEquals(1, planning.diagnostics().planRuns());
     }
 
     @Test
@@ -2459,11 +2556,13 @@ class CraftPlannerV2Test {
                 .pattern("D", 1, List.of(CraftInput.of("E", 2)))
                 .build();
 
-        CraftPlan<String> plan = CraftPlannerV2.plan(graph, "B", 1_000);
+        PlanningResult<String> planning = CraftPlannerV2.planDetailed(graph, "B", 1_000);
+        CraftPlan<String> plan = planning.plan();
 
         assertFalse(plan.feasible());
-        assertEquals(7, plan.itemsProcessed(),
-                "both non-equivalent proof trees plus one committed best-effort tree");
+        assertEquals(1, planning.diagnostics().lowWidthInfeasible(),
+                "both material ratios must participate in the global infeasibility proof");
+        assertEquals(1, planning.diagnostics().planRuns());
     }
 
     /**
@@ -2740,9 +2839,10 @@ class CraftPlannerV2Test {
                 }
             }
             List<CraftOutput<String>> byp = new ArrayList<>();
-            if (rnd.nextInt(100) < 30) { // a benign byproduct: extra supply of some deeper item
-                int j = i + 1 + rnd.nextInt(m - i - 1);
-                byp.add(CraftOutput.of("w" + j, 1 + rnd.nextInt(2)));
+            if (rnd.nextInt(100) < 30) {
+                // This test promises a DAG witness. An unused bonus still exercises byproduct mass
+                // balance without accidentally feeding a dependency back into the witness graph.
+                byp.add(CraftOutput.of("bonus" + i, 1 + rnd.nextInt(2)));
             }
             CraftPattern<String> p = new CraftPattern<>("w" + i, outAmt, inputs, byp, "w" + i);
             witnessOf[i] = p;
@@ -2909,5 +3009,134 @@ class CraftPlannerV2Test {
             assertFalse(plan.feasible());
             assertFalse(plan.missing().isEmpty());
         });
+    }
+
+    @Test
+    void fuzzySiblingRouteConsumesStockBeforeCraftingTheDeclaredVariant() {
+        Object fuzzyPattern = new Object();
+        CraftPattern<String> fromStockVariant = new CraftPattern<>(
+                "tier3", 1, List.of(CraftInput.of("tier2-with-other-nbt", 1)), fuzzyPattern);
+        CraftPattern<String> fromDeclaredVariant = new CraftPattern<>(
+                "tier3", 1, List.of(CraftInput.of("tier2-declared-nbt", 1)), fuzzyPattern);
+        CraftPattern<String> makeDeclaredVariant = new CraftPattern<>(
+                "tier2-declared-nbt", 1, List.of(CraftInput.of("tier1", 1)), "tier1-to-tier2");
+        CraftGraph<String> graph = CraftGraph.<String>builder()
+                .pattern(fromStockVariant)
+                .pattern(fromDeclaredVariant)
+                .pattern(makeDeclaredVariant)
+                .stock("tier2-with-other-nbt", 1)
+                .stock("tier1", 64)
+                .build();
+
+        CraftPlan<String> plan = CraftPlannerV2.plan(graph, "tier3", 1);
+
+        assertTrue(plan.feasible());
+        assertEquals(1L, firingsOf(plan, fromStockVariant));
+        assertEquals(0L, firingsOf(plan, fromDeclaredVariant));
+        assertEquals(0L, firingsOf(plan, makeDeclaredVariant));
+        assertEquals(1L, plan.usedStock().get("tier2-with-other-nbt"));
+        assertNull(plan.usedStock().get("tier1"));
+    }
+
+    @Test
+    void fuzzySiblingRouteCraftsOnlyTheAmountMissingAfterStock() {
+        Object fuzzyPattern = new Object();
+        CraftPattern<String> fromStockVariant = new CraftPattern<>(
+                "tier3", 1, List.of(CraftInput.of("tier2-with-other-nbt", 1)), fuzzyPattern);
+        CraftPattern<String> fromDeclaredVariant = new CraftPattern<>(
+                "tier3", 1, List.of(CraftInput.of("tier2-declared-nbt", 1)), fuzzyPattern);
+        CraftPattern<String> makeDeclaredVariant = new CraftPattern<>(
+                "tier2-declared-nbt", 1, List.of(CraftInput.of("tier1", 1)), "tier1-to-tier2");
+        CraftGraph<String> graph = CraftGraph.<String>builder()
+                .pattern(fromStockVariant)
+                .pattern(fromDeclaredVariant)
+                .pattern(makeDeclaredVariant)
+                .stock("tier2-with-other-nbt", 1)
+                .stock("tier1", 64)
+                .build();
+
+        CraftPlan<String> plan = CraftPlannerV2.plan(graph, "tier3", 2);
+
+        assertTrue(plan.feasible());
+        assertEquals(1L, firingsOf(plan, fromStockVariant));
+        assertEquals(1L, firingsOf(plan, fromDeclaredVariant));
+        assertEquals(1L, firingsOf(plan, makeDeclaredVariant));
+        assertEquals(1L, plan.usedStock().get("tier2-with-other-nbt"));
+        assertEquals(1L, plan.usedStock().get("tier1"));
+    }
+
+    @Test
+    void balancedSelfReturnUsesOneBootstrapItemAtBillionScale() {
+        long amount = 1_000_000_000L;
+        CraftPattern<String> pattern = new CraftPattern<>(
+                "B", 1,
+                List.of(CraftInput.of("A", 1), CraftInput.of("C", 1)),
+                List.of(CraftOutput.of("C", 1)),
+                "1A+1C_to_1B+1C");
+        CraftGraph<String> graph = CraftGraph.<String>builder()
+                .pattern(pattern)
+                .stock("A", amount)
+                .stock("C", 1)
+                .build();
+
+        CraftPlan<String> plan = assertTimeoutPreemptively(
+                Duration.ofSeconds(1), () -> CraftPlannerV2.plan(graph, "B", amount));
+
+        assertTrue(plan.feasible(), () -> "missing=" + plan.missing());
+        assertEquals(amount, firingsOf(plan, pattern));
+        assertEquals(amount, plan.usedStock().get("A"));
+        assertEquals(1L, plan.usedStock().get("C"));
+        assertTrue(plan.missing().isEmpty());
+    }
+
+    @Test
+    void balancedSelfReturnCannotBootstrapFromItsOwnOutput() {
+        CraftPattern<String> pattern = new CraftPattern<>(
+                "B", 1,
+                List.of(CraftInput.of("A", 1), CraftInput.of("C", 1)),
+                List.of(CraftOutput.of("C", 1)),
+                "1A+1C_to_1B+1C");
+        CraftGraph<String> graph = CraftGraph.<String>builder()
+                .pattern(pattern)
+                .stock("A", 1_000)
+                .build();
+
+        CraftPlan<String> plan = assertTimeoutPreemptively(
+                Duration.ofSeconds(1), () -> CraftPlannerV2.plan(graph, "B", 1_000));
+
+        assertFalse(plan.feasible());
+        assertEquals(Map.of("C", 1L), plan.missing());
+    }
+
+    @Test
+    void multiStepContainerCycleCraftsOneBootstrapState() {
+        CraftPattern<String> finish = new CraftPattern<>(
+                "result", 1, List.of(CraftInput.consumedReturning("full", 1, "empty")),
+                List.of(CraftOutput.of("empty", 1)), "finish");
+        CraftPattern<String> fill = new CraftPattern<>(
+                "full", 1, List.of(CraftInput.of("dusted", 1)), "fill");
+        CraftPattern<String> dust = new CraftPattern<>(
+                "dusted", 1, List.of(CraftInput.of("empty", 1), CraftInput.of("dust", 2)), "dust");
+        CraftPattern<String> makeEmpty = new CraftPattern<>(
+                "empty", 1, List.of(CraftInput.of("gem", 3)), "makeEmpty");
+        CraftGraph<String> graph = CraftGraph.<String>builder()
+                .pattern(finish)
+                .pattern(fill)
+                .pattern(dust)
+                .pattern(makeEmpty)
+                .stock("dust", 20)
+                .stock("gem", 3)
+                .build();
+
+        CraftPlan<String> plan = CraftPlannerV2.plan(graph, "result", 10);
+
+        assertTrue(plan.feasible(), plan.toString());
+        assertEquals(10L, firingsOf(plan, finish));
+        assertEquals(10L, firingsOf(plan, fill));
+        assertEquals(10L, firingsOf(plan, dust));
+        assertEquals(1L, firingsOf(plan, makeEmpty));
+        assertEquals(20L, plan.usedStock().get("dust"));
+        assertEquals(3L, plan.usedStock().get("gem"));
+        assertTrue(plan.missing().isEmpty());
     }
 }
