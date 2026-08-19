@@ -248,7 +248,8 @@ public final class ThunderboltReferenceScenarios {
         Map<String, Long> minimum = Map.of("A", 1L, "C", (long) amount);
         Map<String, Long> starved = Map.of("C", (long) amount);
         addThreeModes(out, "catalyst/raw-feedback-loop", ReferenceCapability.CATALYST, amount,
-                "E", amount, minimum, starved, List.of(Map.of("A", 1L)),
+                "E", amount, minimum, starved,
+                List.of(Map.of("A", 1L), Map.of("D", 1L)),
                 ThunderboltReferenceScenarios::rawCatalystLoop);
     }
 

@@ -21,7 +21,9 @@ import java.util.Set;
  * plus a bounded residual. This covers balanced raw catalysts such as
  * {@code A -> 2B; 2B + C -> E + D; D -> A} and lossy feedback such as
  * {@code 3A -> 2B; 2B -> D + 2A}, without admitting gain loops such as {@code A -> 2A}.
- * More complicated locally non-growing SCCs use a bounded canonical replay that may overstate the
+ * More complicated SCCs are admitted only after finding a positive integer place potential
+ * {@code w} for which {@code w * C_t <= 0} for every internal transition. They use a bounded
+ * canonical replay that extracts repeatable seed/loss prefixes in closed form; it may overstate the
  * initial marking but never reports an unexecutable firing multiset as ready.
  */
 final class ConservativeFeedbackAnalysis<K> {
@@ -32,6 +34,15 @@ final class ConservativeFeedbackAnalysis<K> {
     private static final int MAX_FALLBACK_STARTS = 16;
     private static final int MAX_FALLBACK_REPLAY_STEPS = 4_096;
     private static final int MAX_FALLBACK_PATTERN_PROBES = 65_536;
+    private static final int MAX_POTENTIAL_STATES = 32;
+    private static final int MAX_POTENTIAL_PATTERNS = 64;
+    // Weight magnitude is not a work dimension: the exact relaxation branches on coordinates, not
+    // on every integer in their domain. Keep the full positive-long range and bound only model shape
+    // and branch count, so large recipe ratios do not silently lose this certificate.
+    private static final long MAX_POTENTIAL_WEIGHT = Long.MAX_VALUE;
+    private static final int MAX_POTENTIAL_INTEGER_NODES = 512;
+    private static final long MAX_POTENTIAL_TABLEAU_CELLS = 16_384L;
+    private static final long MAX_POTENTIAL_CELL_WORK = 16_777_216L;
 
     /** Prefix marking and net change of one deterministic execution block. */
     record ScheduleOption<K>(Map<K, BigInteger> required, Map<K, BigInteger> delta) {
@@ -65,11 +76,13 @@ final class ConservativeFeedbackAnalysis<K> {
     /** Any proven non-growing ordinary SCC that is not a strict marked cycle. */
     record FallbackComponent<K>(Set<K> states,
                                 List<K> stateOrder,
-                                List<CraftPattern<K>> patterns) {
+                                List<CraftPattern<K>> patterns,
+                                Map<K, Long> placePotential) {
         FallbackComponent {
             states = Set.copyOf(states);
             stateOrder = List.copyOf(stateOrder);
             patterns = List.copyOf(patterns);
+            placePotential = Map.copyOf(placePotential);
         }
     }
 
@@ -83,6 +96,18 @@ final class ConservativeFeedbackAnalysis<K> {
 
     record Transition<K>(CraftPattern<K> pattern, K input, long inputAmount,
                          K output, long outputAmount) {
+    }
+
+    /** A concrete scheduler marking used to recognize a repeatable execution prefix. */
+    private record FallbackReplayState<K>(int cursor, Map<K, BigInteger> balance) {
+    }
+
+    /** Remaining firings and accumulated initial-stock charge at one replay marking. */
+    private record FallbackCheckpoint<K>(long[] remaining, Map<K, BigInteger> required) {
+        FallbackCheckpoint {
+            remaining = remaining.clone();
+            required = Map.copyOf(required);
+        }
     }
 
     private ConservativeFeedbackAnalysis() {
@@ -101,7 +126,7 @@ final class ConservativeFeedbackAnalysis<K> {
             nodes.addAll(outputs);
             for (CraftInput<K> input : pattern.inputs()) {
                 nodes.add(input.key());
-                if (!isOrdinary(input)) continue;
+                if (!isConsumedArc(input)) continue;
                 LinkedHashSet<K> adjacent = mutableAdjacency.computeIfAbsent(
                         input.key(), ignored -> new LinkedHashSet<>());
                 adjacent.addAll(outputs);
@@ -157,8 +182,15 @@ final class ConservativeFeedbackAnalysis<K> {
         return List.copyOf(outputs);
     }
 
-    private static <K> boolean isOrdinary(CraftInput<K> input) {
-        return !input.returned()
+    /** A Petri pre-arc. A container remainder is represented as a matching post-arc below. */
+    private static <K> boolean isConsumedArc(CraftInput<K> input) {
+        return !input.returned() && input.reusableStockSource() == null;
+    }
+
+    /** An unchanged, graph-owned catalyst is a Petri read arc rather than material flow. */
+    private static <K> boolean isReadArc(CraftInput<K> input) {
+        return input.returned()
+                && input.uses() == CraftInput.INFINITE_USES
                 && input.remainder() == null
                 && input.reusableStockSource() == null;
     }
@@ -174,7 +206,7 @@ final class ConservativeFeedbackAnalysis<K> {
             boolean invalidInternalInput = false;
             for (CraftInput<K> input : pattern.inputs()) {
                 if (!states.contains(input.key())) continue;
-                if (!isOrdinary(input)) {
+                if (!isConsumedArc(input)) {
                     invalidInternalInput = true;
                     break;
                 }
@@ -193,7 +225,6 @@ final class ConservativeFeedbackAnalysis<K> {
                     return null;
                 }
             }
-
             // An acyclic producer may inject the first state and a sink may consume the final state.
             // Neither is a transition of the feedback machine itself.
             if (inputs.isEmpty() && !outputs.isEmpty()) {
@@ -260,9 +291,12 @@ final class ConservativeFeedbackAnalysis<K> {
     }
 
     /**
-     * Fallback for ordinary Petri SCCs whose unit-token potential proves every internal transition
-     * locally non-growing. Local-growth transitions stay with the contracted gain-loop path or the
-     * existing decline behavior.
+     * Fallback for ordinary Petri SCCs with a positive integer place potential. The proof is
+     * {@code sum(weight[input] * consumed) >= sum(weight[output] * produced)} for every internal
+     * transition. This strictly generalizes the old unit-token test: for example
+     * {@code 2A -> 3B + C} is conservative under {@code w(A)=2,w(B)=w(C)=1} even though its raw item
+     * count grows. A returned infinite-use catalyst is a read arc and participates in enabling, but
+     * not in the state equation.
      */
     private static <K> FallbackComponent<K> classifyFallback(
             Set<K> states,
@@ -270,30 +304,126 @@ final class ConservativeFeedbackAnalysis<K> {
             Map<K, Integer> itemRank) {
         List<CraftPattern<K>> internalPatterns = new ArrayList<>();
         for (CraftPattern<K> pattern : patterns) {
-            BigInteger internalInput = BigInteger.ZERO;
-            BigInteger internalOutput = BigInteger.ZERO;
+            boolean hasConsumedInput = false;
+            boolean hasReadInput = false;
+            boolean hasOutput = states.contains(pattern.output());
             for (CraftInput<K> input : pattern.inputs()) {
                 if (!states.contains(input.key())) continue;
-                if (!isOrdinary(input)) return null;
-                internalInput = internalInput.add(BigInteger.valueOf(input.amount()));
-            }
-            if (states.contains(pattern.output())) {
-                internalOutput = internalOutput.add(BigInteger.valueOf(pattern.outputAmount()));
-            }
-            for (CraftOutput<K> output : pattern.byproducts()) {
-                if (states.contains(output.key())) {
-                    internalOutput = internalOutput.add(BigInteger.valueOf(output.amount()));
+                if (isConsumedArc(input)) {
+                    hasConsumedInput = true;
+                } else if (isReadArc(input)) {
+                    hasReadInput = true;
+                } else {
+                    return null;
                 }
             }
-            if (internalInput.signum() == 0 || internalOutput.signum() == 0) continue;
-            if (internalOutput.compareTo(internalInput) > 0) return null;
+            for (CraftOutput<K> output : pattern.byproducts()) {
+                hasOutput |= states.contains(output.key());
+            }
+            if (!hasOutput || (!hasConsumedInput && !hasReadInput)) continue;
+            // A read arc cannot pay for newly produced state. Such a transition is a catalytic gain
+            // source and belongs to the positive-feedback path, not this conservative certificate.
+            if (!hasConsumedInput) return null;
             internalPatterns.add(pattern);
         }
         if (internalPatterns.isEmpty()) return null;
         List<K> stateOrder = new ArrayList<>(states);
         stateOrder.sort(java.util.Comparator.comparingInt(
                 state -> itemRank.getOrDefault(state, Integer.MAX_VALUE)));
-        return new FallbackComponent<>(states, stateOrder, internalPatterns);
+        Map<K, Long> potential = positiveNonGrowingPotential(stateOrder, internalPatterns);
+        if (potential == null) return null;
+        return new FallbackComponent<>(states, stateOrder, internalPatterns, potential);
+    }
+
+    /**
+     * Finds a bounded positive integer solution of {@code w * C_t <= 0}. Writing
+     * {@code w_i = u_i + 1} turns positivity into the solver's native non-negative domain and each
+     * transition into one exact integer inequality. Failure is conservative: a large or difficult
+     * SCC is simply not certified by this path.
+     */
+    private static <K> Map<K, Long> positiveNonGrowingPotential(
+            List<K> states, List<CraftPattern<K>> patterns) {
+        if (states.size() > MAX_POTENTIAL_STATES || patterns.size() > MAX_POTENTIAL_PATTERNS) {
+            return null;
+        }
+        Map<K, Integer> stateIndex = new HashMap<>();
+        for (int state = 0; state < states.size(); state++) {
+            stateIndex.put(states.get(state), state);
+        }
+        Set<K> stateSet = Set.copyOf(states);
+        List<BoundedIntegerLinearSolver.Constraint> constraints = new ArrayList<>(patterns.size());
+        boolean unitPotential = true;
+        for (CraftPattern<K> pattern : patterns) {
+            BigInteger[] difference = new BigInteger[states.size()];
+            java.util.Arrays.fill(difference, BigInteger.ZERO);
+            for (Map.Entry<K, BigInteger> input : fallbackInputs(pattern, stateSet).entrySet()) {
+                int index = stateIndex.get(input.getKey());
+                difference[index] = difference[index].add(input.getValue());
+            }
+            for (Map.Entry<K, BigInteger> output : fallbackOutputs(pattern, stateSet).entrySet()) {
+                int index = stateIndex.get(output.getKey());
+                difference[index] = difference[index].subtract(output.getValue());
+            }
+
+            BigInteger unitDifference = BigInteger.ZERO;
+            long[] coefficients = new long[states.size()];
+            for (int state = 0; state < states.size(); state++) {
+                BigInteger coefficient = difference[state];
+                if (coefficient.bitLength() > 63) return null;
+                coefficients[state] = coefficient.longValueExact();
+                unitDifference = unitDifference.add(coefficient);
+            }
+            if (unitDifference.signum() < 0) unitPotential = false;
+            BigInteger minimum = unitDifference.negate();
+            if (minimum.bitLength() > 63) return null;
+            constraints.add(new BoundedIntegerLinearSolver.Constraint(
+                    coefficients, minimum.longValueExact()));
+        }
+        if (unitPotential) {
+            Map<K, Long> result = new LinkedHashMap<>();
+            for (K state : states) result.put(state, 1L);
+            return Map.copyOf(result);
+        }
+
+        // Do not partition the planning deadline per SCC. This proof may use all time remaining in
+        // the one enclosing planning attempt; later work observes the same shared wall-clock budget.
+        long availableNanos = PlanningCancellation.remainingNanos(Long.MAX_VALUE);
+        if (availableNanos <= 0L) return null;
+        BoundedIntegerLinearSolver.Result solved = BoundedIntegerLinearSolver.solve(
+                states.size(),
+                constraints,
+                MAX_POTENTIAL_WEIGHT - 1L,
+                MAX_POTENTIAL_INTEGER_NODES,
+                BoundedIntegerLinearSolver.WorkBudget.wallClockBounded(
+                        MAX_POTENTIAL_TABLEAU_CELLS,
+                        MAX_POTENTIAL_CELL_WORK,
+                        availableNanos));
+        if (!solved.solved()) return null;
+        long[] offsets = solved.values();
+        Map<K, Long> result = new LinkedHashMap<>();
+        for (int state = 0; state < states.size(); state++) {
+            result.put(states.get(state), Math.addExact(offsets[state], 1L));
+        }
+        return weightedNonGrowing(result, patterns) ? Map.copyOf(result) : null;
+    }
+
+    private static <K> boolean weightedNonGrowing(
+            Map<K, Long> potential, List<CraftPattern<K>> patterns) {
+        Set<K> states = potential.keySet();
+        for (CraftPattern<K> pattern : patterns) {
+            BigInteger consumed = BigInteger.ZERO;
+            BigInteger produced = BigInteger.ZERO;
+            for (Map.Entry<K, BigInteger> input : fallbackInputs(pattern, states).entrySet()) {
+                consumed = consumed.add(input.getValue()
+                        .multiply(BigInteger.valueOf(potential.get(input.getKey()))));
+            }
+            for (Map.Entry<K, BigInteger> output : fallbackOutputs(pattern, states).entrySet()) {
+                produced = produced.add(output.getValue()
+                        .multiply(BigInteger.valueOf(potential.get(output.getKey()))));
+            }
+            if (produced.compareTo(consumed) > 0) return false;
+        }
+        return true;
     }
 
     /**
@@ -471,6 +601,7 @@ final class ConservativeFeedbackAnalysis<K> {
         }
         Map<K, BigInteger> balance = new HashMap<>();
         Map<K, BigInteger> required = new LinkedHashMap<>();
+        Map<FallbackReplayState<K>, FallbackCheckpoint<K>> checkpoints = new HashMap<>();
         int cursor = start;
         int steps = 0;
         boolean seeded = false;
@@ -487,19 +618,35 @@ final class ConservativeFeedbackAnalysis<K> {
             }
             if (selected < 0) {
                 selected = seeded
-                        ? bestFallbackCut(states, patterns, remaining, balance, required, start)
+                        ? bestFallbackCut(states, patterns, remaining, balance, required, cursor)
                         : nextRemaining(remaining, start);
                 topUpFallback(patterns.get(selected), states, BigInteger.ONE,
                         balance, required, false);
                 seeded = true;
                 cursor = selected;
+                // Keep earlier checkpoints: returning to the same physical marking proves that the
+                // intervening prefix can repeat. Any additional top-up is tracked in the checkpoint
+                // and charged linearly while fast-forwarding.
+                continue;
+            }
+
+            FallbackReplayState<K> replayState = fallbackReplayState(states, balance, cursor);
+            FallbackCheckpoint<K> previous = checkpoints.put(
+                    replayState, new FallbackCheckpoint<>(remaining, required));
+            if (previous != null
+                    && fastForwardRepeatedPrefix(previous, remaining, required)) {
+                checkpoints.put(
+                        replayState, new FallbackCheckpoint<>(remaining, required));
                 continue;
             }
 
             CraftPattern<K> pattern = patterns.get(selected);
-            long batch = fallbackBatch(pattern, states, balance, remaining[selected]);
-            fireFallback(pattern, states, BigInteger.valueOf(batch), balance);
-            remaining[selected] -= batch;
+            // Fire one transition until a complete marking/cursor period is observed. Once found,
+            // fastForwardRepeatedPrefix skips an arbitrary request-size number of repetitions in
+            // closed form. This avoids greedy batching one branch of a join and then demanding the
+            // other branch's entire billion-scale input up front.
+            fireFallback(pattern, states, BigInteger.ONE, balance);
+            remaining[selected]--;
             cursor = (selected + 1) % patterns.size();
         }
 
@@ -517,6 +664,62 @@ final class ConservativeFeedbackAnalysis<K> {
             }
         }
         return new ScheduleOption<>(required, fallbackDelta(states, patterns, fired));
+    }
+
+    private static <K> FallbackReplayState<K> fallbackReplayState(
+            Set<K> states, Map<K, BigInteger> balance, int cursor) {
+        Map<K, BigInteger> marking = new HashMap<>();
+        for (K state : states) {
+            BigInteger amount = balance.getOrDefault(state, BigInteger.ZERO);
+            if (amount.signum() != 0) marking.put(state, amount);
+        }
+        return new FallbackReplayState<>(cursor, Map.copyOf(marking));
+    }
+
+    /**
+     * Repeats a previously observed execution prefix in closed form. Equal replay states prove that
+     * the same firing block and any top-ups inside it return to the same physical marking. The firing
+     * vector therefore scales independently of the request, while the observed top-up delta is charged
+     * linearly as additional initial stock.
+     *
+     * <p>When a prefix contains a top-up, one final block is left for ordinary replay. The observed
+     * period restores its starting marking by topping up for the <em>next</em> block; charging that
+     * restoration after the last firing would overstate the required initial marking by one loss.</p>
+     */
+    private static <K> boolean fastForwardRepeatedPrefix(
+            FallbackCheckpoint<K> previous,
+            long[] remaining,
+            Map<K, BigInteger> required) {
+        long repetitions = Long.MAX_VALUE;
+        boolean progressed = false;
+        for (int i = 0; i < remaining.length; i++) {
+            long blockFirings = previous.remaining()[i] - remaining[i];
+            if (blockFirings < 0L) return false;
+            if (blockFirings == 0L) continue;
+            progressed = true;
+            repetitions = Math.min(repetitions, remaining[i] / blockFirings);
+        }
+        if (!progressed || repetitions <= 0L || repetitions == Long.MAX_VALUE) return false;
+
+        Map<K, BigInteger> topUpPerPrefix = new LinkedHashMap<>();
+        for (Map.Entry<K, BigInteger> entry : required.entrySet()) {
+            BigInteger delta = entry.getValue().subtract(
+                    previous.required().getOrDefault(entry.getKey(), BigInteger.ZERO));
+            if (delta.signum() < 0) return false;
+            if (delta.signum() > 0) topUpPerPrefix.put(entry.getKey(), delta);
+        }
+        if (!topUpPerPrefix.isEmpty() && --repetitions <= 0L) return false;
+
+        for (int i = 0; i < remaining.length; i++) {
+            long blockFirings = previous.remaining()[i] - remaining[i];
+            remaining[i] -= blockFirings * repetitions;
+        }
+        BigInteger skipped = BigInteger.valueOf(repetitions);
+        for (Map.Entry<K, BigInteger> entry : topUpPerPrefix.entrySet()) {
+            required.merge(
+                    entry.getKey(), entry.getValue().multiply(skipped), BigInteger::add);
+        }
+        return true;
     }
 
     /** Prefer one refill material, then the smallest one-firing top-up, with stable rotation ties. */
@@ -538,7 +741,7 @@ final class ConservativeFeedbackAnalysis<K> {
             int kinds = 0;
             BigInteger total = BigInteger.ZERO;
             for (Map.Entry<K, BigInteger> input
-                    : fallbackInputs(patterns.get(index), states).entrySet()) {
+                    : fallbackOneFiringRequirements(patterns.get(index), states).entrySet()) {
                 BigInteger shortage = input.getValue().subtract(
                         amount(balance, input.getKey())).max(BigInteger.ZERO);
                 if (shortage.signum() > 0) {
@@ -571,32 +774,11 @@ final class ConservativeFeedbackAnalysis<K> {
 
     private static <K> boolean fallbackEnabled(
             CraftPattern<K> pattern, Set<K> states, Map<K, BigInteger> balance) {
-        Map<K, BigInteger> inputs = fallbackInputs(pattern, states);
-        for (Map.Entry<K, BigInteger> input : inputs.entrySet()) {
+        for (Map.Entry<K, BigInteger> input
+                : fallbackOneFiringRequirements(pattern, states).entrySet()) {
             if (amount(balance, input.getKey()).compareTo(input.getValue()) < 0) return false;
         }
         return true;
-    }
-
-    /** Maximum count that can be fired sequentially without another external top-up. */
-    private static <K> long fallbackBatch(
-            CraftPattern<K> pattern,
-            Set<K> states,
-            Map<K, BigInteger> balance,
-            long remaining) {
-        BigInteger limit = BigInteger.valueOf(remaining);
-        Map<K, BigInteger> inputs = fallbackInputs(pattern, states);
-        Map<K, BigInteger> outputs = fallbackOutputs(pattern, states);
-        for (Map.Entry<K, BigInteger> input : inputs.entrySet()) {
-            BigInteger loss = input.getValue().subtract(
-                    outputs.getOrDefault(input.getKey(), BigInteger.ZERO));
-            if (loss.signum() <= 0) continue;
-            BigInteger availableAfterFirst = amount(balance, input.getKey())
-                    .subtract(input.getValue());
-            BigInteger count = BigInteger.ONE.add(availableAfterFirst.divide(loss));
-            limit = limit.min(count);
-        }
-        return Math.max(1L, limit.longValueExact());
     }
 
     private static <K> void topUpFallback(
@@ -607,20 +789,25 @@ final class ConservativeFeedbackAnalysis<K> {
             Map<K, BigInteger> required,
             boolean sequentialBlock) {
         Map<K, BigInteger> inputs = fallbackInputs(pattern, states);
+        Map<K, BigInteger> reads = fallbackReadInputs(pattern, states);
         Map<K, BigInteger> outputs = fallbackOutputs(pattern, states);
-        for (Map.Entry<K, BigInteger> input : inputs.entrySet()) {
+        Set<K> requiredStates = new LinkedHashSet<>(inputs.keySet());
+        requiredStates.addAll(reads.keySet());
+        for (K state : requiredStates) {
+            BigInteger consumed = inputs.getOrDefault(state, BigInteger.ZERO);
+            BigInteger read = reads.getOrDefault(state, BigInteger.ZERO);
             BigInteger demand;
             if (sequentialBlock) {
-                BigInteger loss = input.getValue().subtract(
-                        outputs.getOrDefault(input.getKey(), BigInteger.ZERO)).max(BigInteger.ZERO);
-                demand = input.getValue().add(loss.multiply(times.subtract(BigInteger.ONE)));
+                BigInteger loss = consumed.subtract(
+                        outputs.getOrDefault(state, BigInteger.ZERO)).max(BigInteger.ZERO);
+                demand = consumed.add(read).add(loss.multiply(times.subtract(BigInteger.ONE)));
             } else {
-                demand = input.getValue().multiply(times);
+                demand = consumed.add(read).multiply(times);
             }
-            BigInteger shortage = demand.subtract(amount(balance, input.getKey()));
+            BigInteger shortage = demand.subtract(amount(balance, state));
             if (shortage.signum() <= 0) continue;
-            balance.merge(input.getKey(), shortage, BigInteger::add);
-            required.merge(input.getKey(), shortage, BigInteger::add);
+            balance.merge(state, shortage, BigInteger::add);
+            required.merge(state, shortage, BigInteger::add);
         }
     }
 
@@ -659,9 +846,29 @@ final class ConservativeFeedbackAnalysis<K> {
             CraftPattern<K> pattern, Set<K> states) {
         Map<K, BigInteger> result = new LinkedHashMap<>();
         for (CraftInput<K> input : pattern.inputs()) {
-            if (states.contains(input.key())) {
+            if (states.contains(input.key()) && isConsumedArc(input)) {
                 result.merge(input.key(), BigInteger.valueOf(input.amount()), BigInteger::add);
             }
+        }
+        return result;
+    }
+
+    private static <K> Map<K, BigInteger> fallbackReadInputs(
+            CraftPattern<K> pattern, Set<K> states) {
+        Map<K, BigInteger> result = new LinkedHashMap<>();
+        for (CraftInput<K> input : pattern.inputs()) {
+            if (states.contains(input.key()) && isReadArc(input)) {
+                result.merge(input.key(), BigInteger.valueOf(input.amount()), BigInteger::add);
+            }
+        }
+        return result;
+    }
+
+    private static <K> Map<K, BigInteger> fallbackOneFiringRequirements(
+            CraftPattern<K> pattern, Set<K> states) {
+        Map<K, BigInteger> result = fallbackInputs(pattern, states);
+        for (Map.Entry<K, BigInteger> read : fallbackReadInputs(pattern, states).entrySet()) {
+            result.merge(read.getKey(), read.getValue(), BigInteger::add);
         }
         return result;
     }
@@ -685,24 +892,36 @@ final class ConservativeFeedbackAnalysis<K> {
         BigInteger total = BigInteger.ZERO;
         for (long count : counts) total = total.add(BigInteger.valueOf(count));
         boolean exact = total.compareTo(BigInteger.valueOf(MAX_PRIMITIVE_ROUND_FIRINGS)) <= 0;
-        List<ScheduleOption<K>> result = new ArrayList<>(cycle.size());
+        List<ScheduleOption<K>> result = new ArrayList<>(cycle.size() * 2);
         Set<Map<K, BigInteger>> seen = new HashSet<>();
         for (int start = 0; start < cycle.size(); start++) {
             PlanningCancellation.check();
-            ScheduleOption<K> option = exact
-                    ? replayUnitFirings(cycle, counts, start, total.intValueExact())
-                    : replayGroupedFirings(cycle, counts, start);
-            if (seen.add(option.required())) result.add(option);
+            if (exact) {
+                ScheduleOption<K> canonical = replayUnitFirings(
+                        cycle, counts, start, total.intValueExact(), false);
+                if (seen.add(canonical.required())) result.add(canonical);
+                ScheduleOption<K> interleaved = replayUnitFirings(
+                        cycle, counts, start, total.intValueExact(), true);
+                if (seen.add(interleaved.required())) result.add(interleaved);
+            } else {
+                ScheduleOption<K> option = replayGroupedFirings(cycle, counts, start);
+                if (seen.add(option.required())) result.add(option);
+            }
         }
         return result;
     }
 
     private static <K> ScheduleOption<K> replayUnitFirings(
-            List<Transition<K>> cycle, long[] counts, int start, int total) {
+            List<Transition<K>> cycle,
+            long[] counts,
+            int start,
+            int total,
+            boolean minimizeLaterTopUps) {
         long[] remaining = counts.clone();
         Map<K, BigInteger> balance = new HashMap<>();
         Map<K, BigInteger> required = new LinkedHashMap<>();
         int cursor = start;
+        boolean seeded = false;
         for (int step = 0; step < total; step++) {
             PlanningCancellation.check();
             int selected = -1;
@@ -717,10 +936,28 @@ final class ConservativeFeedbackAnalysis<K> {
                 }
             }
             if (selected < 0) {
-                // A rotation denotes one canonical seed state. Keep topping up that state while its
-                // transition remains; only after it is exhausted may a residual require another cut.
-                if (remaining[start] > 0L) {
+                // Keep the original one-state canonical rotations: they are important for lossy
+                // feedback whose retained state should stay on one material. Also emit a second
+                // family that, after the first seed, tops up the smallest concrete shortage. The
+                // latter proves weighted residual interleavings such as A->B, B->A, A->B without
+                // replacing the established canonical choices used by V2.
+                if (remaining[start] > 0L && (!minimizeLaterTopUps || !seeded)) {
                     selected = start;
+                } else if (minimizeLaterTopUps) {
+                    BigInteger smallestShortage = null;
+                    for (int offset = 0; offset < cycle.size(); offset++) {
+                        int index = (cursor + offset) % cycle.size();
+                        if (remaining[index] <= 0L) continue;
+                        Transition<K> transition = cycle.get(index);
+                        BigInteger shortage = BigInteger.valueOf(transition.inputAmount())
+                                .subtract(amount(balance, transition.input()))
+                                .max(BigInteger.ZERO);
+                        if (smallestShortage == null
+                                || shortage.compareTo(smallestShortage) < 0) {
+                            selected = index;
+                            smallestShortage = shortage;
+                        }
+                    }
                 } else {
                     for (int offset = 0; offset < cycle.size(); offset++) {
                         int index = (cursor + offset) % cycle.size();
@@ -732,6 +969,7 @@ final class ConservativeFeedbackAnalysis<K> {
                 }
                 if (selected < 0) throw new IllegalStateException("firing count underflow");
                 topUpFor(cycle.get(selected), BigInteger.ONE, balance, required);
+                seeded = true;
             }
             fire(cycle.get(selected), BigInteger.ONE, balance);
             remaining[selected]--;

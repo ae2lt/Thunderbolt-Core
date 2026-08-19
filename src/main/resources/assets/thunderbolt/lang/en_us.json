@@ -11,6 +11,7 @@
   "gui.thunderbolt.algorithm_provider.algorithm_priority.unknown": "Declared algorithm priority: unknown algorithm",
   "algorithm.thunderbolt.ae2_vanilla": "AE2 Native Planner",
   "algorithm.thunderbolt.v2": "Thunderbolt V2 Planner",
+  "algorithm.thunderbolt.cp_sat": "Thunderbolt CP-SAT Planner (Experimental)",
   "algorithm.thunderbolt.all_failed": "All Failed",
   "gui.thunderbolt.crafting_plan.algorithm": "%1$s [%2$s]"
 }

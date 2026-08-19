@@ -1,7 +1,12 @@
 package com.moakiee.thunderbolt.core.crafting.planner;
 
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 
 /**
  * A single crafting pattern (recipe) in the planner's view: it produces {@code outputAmount} of
@@ -36,8 +41,32 @@ public final class CraftPattern<K> {
         }
         this.outputAmount = outputAmount;
         this.inputs = List.copyOf(inputs);
-        this.byproducts = List.copyOf(byproducts);
+        this.byproducts = normalizeByproducts(this.inputs, byproducts);
         this.source = source;
+    }
+
+    /**
+     * Canonicalizes a consumed container's remainder into the ordinary byproduct list.
+     *
+     * <p>Older graph exporters already appended that output explicitly, while direct graph callers
+     * often supplied only {@link CraftInput#remainder()}. An explicitly declared output for the same
+     * key therefore wins for compatibility; otherwise all remainder amounts for that key are merged
+     * and appended once. The input keeps its remainder metadata solely for bootstrap/order proofs.</p>
+     */
+    private static <K> List<CraftOutput<K>> normalizeByproducts(
+            List<CraftInput<K>> inputs, List<CraftOutput<K>> declared) {
+        List<CraftOutput<K>> result = new ArrayList<>(declared);
+        Set<K> explicitKeys = new LinkedHashSet<>();
+        for (CraftOutput<K> output : declared) explicitKeys.add(output.key());
+        Map<K, Long> inferred = new LinkedHashMap<>();
+        for (CraftInput<K> input : inputs) {
+            K remainder = input.remainder();
+            if (remainder != null && !explicitKeys.contains(remainder)) {
+                inferred.merge(remainder, input.amount(), Sat::add);
+            }
+        }
+        inferred.forEach((key, amount) -> result.add(CraftOutput.of(key, amount)));
+        return List.copyOf(result);
     }
 
     public K output() {

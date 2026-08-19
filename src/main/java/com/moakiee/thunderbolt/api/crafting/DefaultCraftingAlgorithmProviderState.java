@@ -1,5 +1,8 @@
 package com.moakiee.thunderbolt.api.crafting;
 
+import java.util.Collection;
+import java.util.LinkedHashSet;
+import java.util.List;
 import java.util.Objects;
 
 import net.minecraft.nbt.CompoundTag;
@@ -16,13 +19,29 @@ public final class DefaultCraftingAlgorithmProviderState
     private static final String TAG_PRIORITY = "Priority";
 
     private final ResourceLocation providedAlgorithm;
+    private final List<ResourceLocation> providedAlgorithms;
     private final CraftingAlgorithmSelection defaultSelection;
     private final Runnable changedCallback;
     private CraftingAlgorithmSelection selection;
 
     public DefaultCraftingAlgorithmProviderState(
             ResourceLocation defaultAlgorithm, int defaultPriority, Runnable changedCallback) {
+        this(defaultAlgorithm, List.of(defaultAlgorithm), defaultPriority, changedCallback);
+    }
+
+    public DefaultCraftingAlgorithmProviderState(
+            ResourceLocation defaultAlgorithm,
+            Collection<ResourceLocation> providedAlgorithms,
+            int defaultPriority,
+            Runnable changedCallback) {
         this.providedAlgorithm = Objects.requireNonNull(defaultAlgorithm, "defaultAlgorithm");
+        Objects.requireNonNull(providedAlgorithms, "providedAlgorithms");
+        var normalizedProvidedAlgorithms = new LinkedHashSet<ResourceLocation>();
+        normalizedProvidedAlgorithms.add(this.providedAlgorithm);
+        for (var algorithm : providedAlgorithms) {
+            normalizedProvidedAlgorithms.add(Objects.requireNonNull(algorithm, "providedAlgorithm"));
+        }
+        this.providedAlgorithms = List.copyOf(normalizedProvidedAlgorithms);
         this.defaultSelection = new CraftingAlgorithmSelection(providedAlgorithm, defaultPriority);
         this.selection = defaultSelection;
         this.changedCallback = Objects.requireNonNull(changedCallback, "changedCallback");
@@ -31,6 +50,11 @@ public final class DefaultCraftingAlgorithmProviderState
     @Override
     public ResourceLocation getProvidedAlgorithm() {
         return providedAlgorithm;
+    }
+
+    @Override
+    public List<ResourceLocation> getProvidedAlgorithms() {
+        return providedAlgorithms;
     }
 
     @Override

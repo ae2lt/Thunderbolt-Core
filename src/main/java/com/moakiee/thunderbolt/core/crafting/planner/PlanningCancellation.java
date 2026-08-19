@@ -40,6 +40,18 @@ public final class PlanningCancellation {
         }
     }
 
+    /** Remaining candidate time, capped for a bounded native solver call. */
+    static long remainingNanos(long capNanos) {
+        long boundedCap = Math.max(0L, capNanos);
+        var context = CURRENT.get();
+        if (context == null) {
+            return boundedCap;
+        }
+        context.checkpoint();
+        long remaining = context.deadlineNanos() - System.nanoTime();
+        return Math.max(0L, Math.min(boundedCap, remaining));
+    }
+
     public static Scope bind(PlanningAttemptContext context) {
         var previous = CURRENT.get();
         CURRENT.set(context);

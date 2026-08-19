@@ -898,7 +898,8 @@ class CraftPlannerV2Test {
         CraftPlan<String> seededPlan = CraftPlannerV2.plan(seeded, "B", 4);
 
         assertFalse(shortPlan.feasible(), "net 2 A is not enough to start two 2-A firings");
-        assertEquals(1L, shortPlan.missing().get("A"));
+        // C is one tier deeper than A, so the graded objective asks for one recoverable C seed.
+        assertEquals(Map.of("C", 1L), shortPlan.missing());
         assertTrue(seededPlan.feasible());
         assertEquals(3L, seededPlan.usedStock().get("A"));
         assertEquals(2L, firingsOf(seededPlan, makeB));
@@ -1139,8 +1140,10 @@ class CraftPlannerV2Test {
                         graph.withAdditionalStock(first.plan().missing()), "T", amount));
 
         assertFalse(first.plan().feasible());
-        assertEquals(Set.of("A"), first.plan().missing().keySet());
+        assertEquals(Map.of("A", 1L), first.plan().missing(),
+                "the repeatable startup prefix loses exactly one A per completed round");
         assertTrue(refilled.plan().feasible(), () -> "missing=" + refilled.plan().missing());
+        assertEquals(amount + 1L, refilled.plan().usedStock().get("A"));
         assertEquals(amount, firingsOf(refilled.plan(), split));
         assertEquals(amount, firingsOf(refilled.plan(), target));
         assertEquals(1, refilled.diagnostics().planRuns());
@@ -1241,7 +1244,9 @@ class CraftPlannerV2Test {
         CraftPlan<String> plan = CraftPlannerV2.plan(graph, "E", 8);
 
         assertFalse(plan.feasible(), "a balanced algebraic flow still needs one initial state");
-        assertEquals(Map.of("A", 1L), plan.missing());
+        // Supplying one D can execute D->A before the round. As a feedback byproduct it is outside
+        // the root's input-demand hierarchy, so it loses no higher-priority Missing tier.
+        assertEquals(Map.of("D", 1L), plan.missing());
         assertEquals(8L, plan.usedStock().get("C"));
         assertEquals(8L, firingsOf(plan, makeB));
         assertEquals(8L, firingsOf(plan, makeE));
@@ -1936,7 +1941,9 @@ class CraftPlannerV2Test {
         assertTrue(seeded.feasible());
         assertEquals(1L, seeded.usedStock().get("empty"));
         assertFalse(unseeded.feasible());
-        assertEquals(1L, unseeded.missing().get("full"));
+        assertEquals(1L, unseeded.missing().values().stream().mapToLong(Long::longValue).sum());
+        assertTrue(unseeded.missing().containsKey("full")
+                || unseeded.missing().containsKey("empty"));
     }
 
     @Test

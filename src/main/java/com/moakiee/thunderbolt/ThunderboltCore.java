@@ -9,17 +9,22 @@ import appeng.api.storage.StorageCells;
 import net.minecraftforge.common.MinecraftForge;
 import net.minecraftforge.event.server.ServerStartingEvent;
 import net.minecraftforge.event.server.ServerStoppedEvent;
+import net.minecraftforge.fml.ModLoadingContext;
 import net.minecraftforge.fml.common.Mod;
+import net.minecraftforge.fml.config.ModConfig;
 import net.minecraftforge.fml.event.lifecycle.FMLCommonSetupEvent;
 import net.minecraftforge.fml.event.lifecycle.FMLLoadCompleteEvent;
 import net.minecraftforge.fml.javafmlmod.FMLJavaModLoadingContext;
+import net.minecraftforge.fml.loading.FMLPaths;
 import org.spongepowered.asm.mixin.MixinEnvironment;
 
 import com.moakiee.thunderbolt.api.crafting.CraftingPlanningEngines;
 import com.moakiee.thunderbolt.api.crafting.ICraftingPlanningService;
 import com.moakiee.thunderbolt.api.eject.EjectCapabilityRegistry;
+import com.moakiee.thunderbolt.config.ThunderboltCommonConfig;
 import com.moakiee.thunderbolt.core.crafting.algorithm.CraftingPlanningService;
 import com.moakiee.thunderbolt.core.crafting.algorithm.ThunderboltMenus;
+import com.moakiee.thunderbolt.core.crafting.planner.CpSatPlanningEngine;
 import com.moakiee.thunderbolt.core.crafting.planner.ThunderboltV2PlanningEngine;
 import com.moakiee.thunderbolt.core.eject.EjectEndpointIndex;
 import com.moakiee.thunderbolt.core.eject.ThunderboltBlockEntities;
@@ -42,6 +47,8 @@ public final class ThunderboltCore {
         ThunderboltMenus.TYPES.register(modEventBus);
         modEventBus.addListener(this::onCommonSetup);
         modEventBus.addListener(this::onLoadComplete);
+        ModLoadingContext.get().registerConfig(
+                ModConfig.Type.COMMON, ThunderboltCommonConfig.SPEC, "thunderbolt-common.toml");
         MinecraftForge.EVENT_BUS.addListener(this::onServerStarting);
         MinecraftForge.EVENT_BUS.addListener(this::onServerStopped);
         LOGGER.info("[Thunderbolt Core] initialized");
@@ -62,6 +69,23 @@ public final class ThunderboltCore {
             GridServices.register(ICraftingPlanningService.class, CraftingPlanningService.class);
             CraftingPlanningEngines.register(
                     ThunderboltV2PlanningEngine.INSTANCE, 1_000, false);
+            if (ThunderboltCommonConfig.enableCpSatPlanner()) {
+                LOGGER.info("[Thunderbolt Core] CP-SAT enabled; preparing native runtime");
+                var cacheRoot = FMLPaths.GAMEDIR.get()
+                        .resolve(".cache")
+                        .resolve(MODID)
+                        .resolve("cp-sat");
+                if (CpSatPlanningEngine.INSTANCE.initialize(cacheRoot)) {
+                    CraftingPlanningEngines.register(
+                            CpSatPlanningEngine.INSTANCE, 900, false);
+                    LOGGER.info("[Thunderbolt Core] CP-SAT planner ready");
+                } else {
+                    LOGGER.warn(
+                            "[Thunderbolt Core] CP-SAT native runtime unavailable; "
+                                    + "continuing without the CP-SAT planner",
+                            CpSatPlanningEngine.INSTANCE.availabilityFailure());
+                }
+            }
         });
     }
 

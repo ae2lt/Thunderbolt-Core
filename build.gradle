@@ -21,6 +21,10 @@ tasks.withType(JavaCompile).configureEach {
     options.encoding = 'UTF-8'
 }
 
+def thunderboltDevGameDirectory = providers.gradleProperty('thunderboltDevGameDirectory')
+        .getOrElse('')
+        .trim()
+
 minecraft {
     mappings channel: 'official', version: minecraft_version
     copyIdeResources = true
@@ -54,6 +58,11 @@ minecraft {
             property 'forge.logging.console.level', 'debug'
             args '--mod', mod_id, '--all', '--output', file('src/generated/resources/'), '--existing', file('src/main/resources/')
             mods { "${mod_id}" { source sourceSets.main } }
+        }
+        configureEach {
+            if (!thunderboltDevGameDirectory.isEmpty()) {
+                workingDirectory project.file(thunderboltDevGameDirectory)
+            }
         }
     }
 }
@@ -128,10 +137,25 @@ configurations {
         canBeResolved = true
         transitive = false
     }
+    cpSatEmbedded {
+        canBeConsumed = false
+        canBeResolved = true
+    }
 }
 
 dependencies {
     minecraft "net.minecraftforge:forge:${minecraft_version}-${forge_version}"
+
+    // CP-SAT is opt-in. Bundle only the small, platform-neutral Java API and protobuf runtime;
+    // the matching native runtime is downloaded and verified at game startup when enabled.
+    compileOnly "com.google.ortools:ortools-java:${ortools_version}"
+    cpSatEmbedded("com.google.ortools:ortools-java:${ortools_version}") {
+        transitive = false
+    }
+    cpSatEmbedded("com.google.protobuf:protobuf-java:4.33.1") {
+        transitive = false
+    }
+    testImplementation "com.google.ortools:ortools-java:${ortools_version}"
 
     // MixinExtras (@WrapOperation/@Local) is built into NeoForge but NOT Forge — required explicitly.
     // mixinextras-forge is a jar-in-jar shell (classes live in META-INF/jars/MixinExtras-0.4.1.jar),
@@ -217,6 +241,9 @@ processResources {
     // targets exactly like the published jar.
     dependsOn compileJava
     from(layout.buildDirectory.file("tmp/compileJava/${mod_id}.refmap.json"))
+    from(configurations.cpSatEmbedded) {
+        into 'META-INF/thunderbolt/cp-sat'
+    }
 
     var replaceProperties = [
         minecraft_version      : minecraft_version,
