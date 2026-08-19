@@ -1,4 +1,4 @@
-package com.moakiee.thunderbolt.ae2.mixin;
+package com.moakiee.thunderbolt.mixin.ae2.crafting;
 
 import com.llamalad7.mixinextras.injector.wrapoperation.Operation;
 import com.llamalad7.mixinextras.injector.wrapoperation.WrapOperation;
