@@ -107,6 +107,24 @@ final class CycleAnalysis<K> {
         return kindOf(key).mayReorient() || directlyReorientable.contains(key);
     }
 
+    /**
+     * Whether every reachable cyclic SCC is a ratio-conservative conversion SCC whose external
+     * inputs can be represented by ordinary balances or catalyst-presence constraints.
+     *
+     * <p>This deliberately excludes lossy/gainful and stateful cycles. Callers still perform a
+     * narrower pattern-level check before admitting unchanged catalysts; acyclic nodes surrounding
+     * the admitted SCCs are harmless.</p>
+     */
+    boolean hasOnlyRankableConversionCycles() {
+        boolean foundCycle = false;
+        for (Kind kind : kindByMember.values()) {
+            if (kind == Kind.ACYCLIC) continue;
+            foundCycle = true;
+            if (kind != Kind.PURE_CONVERSION && kind != Kind.CATALYZED_CONVERSION) return false;
+        }
+        return foundCycle;
+    }
+
     private record Ratio(long numerator, long denominator) {
         Ratio reciprocal() {
             return new Ratio(denominator, numerator);

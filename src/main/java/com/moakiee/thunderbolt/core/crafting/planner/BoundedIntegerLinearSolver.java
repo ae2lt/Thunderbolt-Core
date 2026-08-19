@@ -528,6 +528,7 @@ final class BoundedIntegerLinearSolver {
         private static final ThreadMXBean THREADS = ManagementFactory.getThreadMXBean();
 
         private final boolean unlimited;
+        private final boolean wallClock;
         private final long maxTableauCells;
         private long remainingCellWork;
         private long startedNanos = Long.MIN_VALUE;
@@ -537,17 +538,20 @@ final class BoundedIntegerLinearSolver {
 
         private WorkBudget(
                 boolean unlimited,
+                boolean wallClock,
                 long maxTableauCells,
                 long cellWork,
                 long maxNanos) {
             this.unlimited = unlimited;
+            this.wallClock = wallClock;
             this.maxTableauCells = maxTableauCells;
             this.remainingCellWork = cellWork;
             this.maxNanos = maxNanos;
         }
 
         static WorkBudget unlimited() {
-            return new WorkBudget(true, Long.MAX_VALUE, Long.MAX_VALUE, Long.MAX_VALUE);
+            return new WorkBudget(
+                    true, false, Long.MAX_VALUE, Long.MAX_VALUE, Long.MAX_VALUE);
         }
 
         static WorkBudget bounded(
@@ -556,6 +560,20 @@ final class BoundedIntegerLinearSolver {
                 long maxNanos) {
             return new WorkBudget(
                     false,
+                    false,
+                    Math.max(1L, maxTableauCells),
+                    Math.max(1L, cellWork),
+                    Math.max(1L, maxNanos));
+        }
+
+        /** Wall-clock variant for a user-visible local latency envelope. */
+        static WorkBudget wallClockBounded(
+                long maxTableauCells,
+                long cellWork,
+                long maxNanos) {
+            return new WorkBudget(
+                    false,
+                    true,
                     Math.max(1L, maxTableauCells),
                     Math.max(1L, cellWork),
                     Math.max(1L, maxNanos));
@@ -619,9 +637,9 @@ final class BoundedIntegerLinearSolver {
             return now - startedNanos >= maxNanos;
         }
 
-        /** CPU time avoids treating scheduler/GC pauses as solver work; cell count remains primary. */
-        private static long workClockNanos() {
-            if (THREADS.isCurrentThreadCpuTimeSupported()) {
+        /** CPU time is the default; latency-sensitive callers may explicitly select wall time. */
+        private long workClockNanos() {
+            if (!wallClock && THREADS.isCurrentThreadCpuTimeSupported()) {
                 long cpu = THREADS.getCurrentThreadCpuTime();
                 if (cpu >= 0L) {
                     return cpu;

@@ -13,6 +13,10 @@ base {
 
 java.toolchain.languageVersion = JavaLanguageVersion.of(21)
 
+def thunderboltDevGameDirectory = providers.gradleProperty('thunderboltDevGameDirectory')
+        .getOrElse('')
+        .trim()
+
 neoForge {
     version = project.neo_version
 
@@ -28,6 +32,9 @@ neoForge {
             systemProperty 'neoforge.enabledGameTestNamespaces', project.mod_id
         }
         configureEach {
+            if (!thunderboltDevGameDirectory.isEmpty()) {
+                gameDirectory = project.file(thunderboltDevGameDirectory)
+            }
             systemProperty 'forge.logging.markers', 'REGISTRIES'
             logLevel = org.slf4j.event.Level.DEBUG
         }
@@ -51,11 +58,34 @@ repositories {
     }
 }
 
+configurations {
+    cpSatEmbedded
+}
+
+def enableAe2DevRuntime = providers.gradleProperty('thunderboltEnableAe2DevRuntime')
+        .getOrElse('false')
+        .toBoolean()
+
 dependencies {
+    // CP-SAT is opt-in. Bundle only the small, platform-neutral Java API and protobuf runtime;
+    // the matching native runtime is downloaded and verified at game startup when enabled.
+    compileOnly "com.google.ortools:ortools-java:${ortools_version}"
+    cpSatEmbedded("com.google.ortools:ortools-java:${ortools_version}") {
+        transitive = false
+    }
+    cpSatEmbedded("com.google.protobuf:protobuf-java:4.33.1") {
+        transitive = false
+    }
+    testImplementation "com.google.ortools:ortools-java:${ortools_version}"
+
     // AE2 — publicly available on CurseForge maven. compileOnly: this layer patches AE2 via
     // mixins; AE2 is provided by the modpack at runtime. The pure planner core under
     // `crafting.core` has NO AE2 dependency and is unit-tested standalone.
     compileOnly "curse.maven:applied-energistics-2-223794:7027323"
+    if (enableAe2DevRuntime) {
+        runtimeOnly "curse.maven:applied-energistics-2-223794:7027323"
+        runtimeOnly "org.appliedenergistics:guideme:21.1.15"
+    }
 
     // AdvancedAE (+ its compile-time companions) — the lib hosts the batch-CPU mixin/accessors that
     // target AAE's crafting CPU. compileOnly: AAE is provided by the modpack at runtime when present;
@@ -72,6 +102,12 @@ dependencies {
     // AE2 API types exercised directly by unit tests (e.g. ByteTracker's AEKeyType);
     // compileOnly deps are absent from the test runtime classpath otherwise.
     testRuntimeOnly "curse.maven:applied-energistics-2-223794:7027323"
+}
+
+tasks.named('processResources') {
+    from(configurations.cpSatEmbedded) {
+        into 'META-INF/thunderbolt/cp-sat'
+    }
 }
 
 // Tests that exercise SavedData/codecs need the same generated Minecraft/NeoForge classes as main.

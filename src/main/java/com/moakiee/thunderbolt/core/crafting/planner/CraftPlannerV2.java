@@ -16,7 +16,6 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.PriorityQueue;
 import java.util.Set;
-import java.util.concurrent.TimeUnit;
 import java.util.function.ToLongFunction;
 
 /**
@@ -100,10 +99,7 @@ public final class CraftPlannerV2<K> {
             Long.getLong("thunderbolt.maxLowWidthTableauCells", 16_384L));
     private static final long MAX_LOW_WIDTH_CELL_WORK = Math.max(
             MAX_LOW_WIDTH_TABLEAU_CELLS,
-            Long.getLong("thunderbolt.maxLowWidthCellWork", 1_048_576L));
-    private static final long MAX_LOW_WIDTH_SOLVER_NANOS = TimeUnit.MILLISECONDS.toNanos(Math.max(
-            1L,
-            Long.getLong("thunderbolt.maxLowWidthMillis", 250L)));
+            Long.getLong("thunderbolt.maxLowWidthCellWork", 2_097_152L));
     /** Optional byproduct-order analysis is abandoned before a huge fan-out can dominate planning. */
     private static final long MAX_BYPRODUCT_SCHEDULE_WORK = Math.max(
             1_024L,
@@ -112,7 +108,7 @@ public final class CraftPlannerV2<K> {
      * Maximum number of alternate roots tried for a proven conservative conversion SCC. This is a
      * fixed bound, so cycle orientation remains linear in graph size rather than enumerating cuts.
      */
-    static final int MAX_CONVERSION_ORIENTATION_RETRIES = 4;
+    static final int MAX_CONVERSION_ORIENTATION_RETRIES = 16;
 
     /**
      * Stack-overflow safety net for the bounded fallback search. {@link #obtain} recurses once per
@@ -168,10 +164,10 @@ public final class CraftPlannerV2<K> {
                 int fallbackLimit) {
             validateOwner(candidateGraph, candidateTarget);
             if (lowWidthWorkBudget == null) {
-                lowWidthWorkBudget = BoundedIntegerLinearSolver.WorkBudget.bounded(
+                lowWidthWorkBudget = BoundedIntegerLinearSolver.WorkBudget.wallClockBounded(
                         MAX_LOW_WIDTH_TABLEAU_CELLS,
                         MAX_LOW_WIDTH_CELL_WORK,
-                        MAX_LOW_WIDTH_SOLVER_NANOS);
+                        PlanningCancellation.remainingNanos(Long.MAX_VALUE));
                 searchWorkBudget = new SharedCounterBudget(searchLimit);
                 resolutionWorkBudget = new SharedCounterBudget(resolutionLimit);
                 fallbackWorkBudget = new SharedCounterBudget(fallbackLimit);
@@ -204,6 +200,8 @@ public final class CraftPlannerV2<K> {
     /** Shared by every local component, cut-orientation retry, and quantity probe in one session. */
     private final BoundedIntegerLinearSolver.WorkBudget lowWidthWorkBudget;
     private final DiagnosticsCollector diagnostics;
+    /** Root-distance tiers used by every exact component in the current run. */
+    private Map<K, Integer> objectiveDistances = Map.of();
     /** Immutable graph analysis shared by every quantity probe with the same cycle orientation. */
     private PreparedGraph<K> preparedGraph;
     /** Active producer-before-byproduct-row order for linear and aggregate sweeps in this run. */
@@ -448,6 +446,7 @@ public final class CraftPlannerV2<K> {
                     true);
             return new PlanningResult<>(boundedMissing, diagnostics.finish(started, null));
         }
+        Map<K, Integer> objectiveDistances = shortestInputDistances(graph, target);
         SearchBudget budget = new SearchBudget(
                 searchWorkBudget, session.searchWorkBudget, diagnostics);
         BoundedIntegerLinearSolver.WorkBudget lowWidthWorkBudget = session.lowWidthWorkBudget;
@@ -469,6 +468,7 @@ public final class CraftPlannerV2<K> {
                         budget,
                         lowWidthWorkBudget,
                         diagnostics);
+        firstPlanner.objectiveDistances = objectiveDistances;
         CraftPlan<K> first = firstPlanner.run(target, amount, firstOrientation);
         preparedByOrientation.put(firstOrientation, firstPlanner.preparedGraph);
         if (first.feasible()) {
@@ -535,6 +535,7 @@ public final class CraftPlannerV2<K> {
                             budget,
                             lowWidthWorkBudget,
                             diagnostics);
+            planner.objectiveDistances = objectiveDistances;
             CraftPlan<K> candidate = planner.run(target, amount, orientation);
             preparedByOrientation.putIfAbsent(orientation, planner.preparedGraph);
             if (candidate.feasible()) {
@@ -542,10 +543,11 @@ public final class CraftPlannerV2<K> {
             }
             if (candidate.budgetExhausted()) {
                 return finish(
-                        markBudgetExhausted(betterIncompletePlan(bestIncomplete, candidate)),
+                        markBudgetExhausted(betterPlan(
+                                bestIncomplete, candidate, objectiveDistances)),
                         diagnostics, budget, started);
             }
-            bestIncomplete = betterIncompletePlan(bestIncomplete, candidate);
+            bestIncomplete = betterPlan(bestIncomplete, candidate, objectiveDistances);
             diagnostics.recordFrontierSize(frontier.size());
         }
         return finish(bestIncomplete, diagnostics, budget, started);
@@ -620,30 +622,93 @@ public final class CraftPlannerV2<K> {
     }
 
     /**
-     * Prefer a diagnosis that asks the player to replenish fewer kinds, then fewer total units.
-     * Quantities across item types are only a heuristic tie-breaker; every retained plan remains a
-     * concrete, mass-balanced simulation candidate.
+     * Exact planner preference: missing first, then stock use, then recipe executions. Missing and
+     * stock are compared as vectors indexed by shortest dependency distance from the requested
+     * root. Missing is minimized near-to-far, while stock use is minimized far-to-near: the latter
+     * prefers consuming an already-made near-root item over consuming deeper ingredients to remake
+     * it, without rewarding a recipe merely for consuming more units. This avoids overflow-prone
+     * scalar weights and makes the priority independent of request magnitude.
      */
-    private static <K> CraftPlan<K> betterIncompletePlan(
-            CraftPlan<K> current, CraftPlan<K> candidate) {
-        int byKinds = Integer.compare(candidate.missing().size(), current.missing().size());
-        if (byKinds < 0) {
-            return candidate;
-        }
-        if (byKinds > 0) {
-            return current;
-        }
-        long currentTotal = missingTotal(current);
-        long candidateTotal = missingTotal(candidate);
-        return candidateTotal < currentTotal ? candidate : current;
+    private static <K> CraftPlan<K> betterPlan(
+            CraftPlan<K> current,
+            CraftPlan<K> candidate,
+            Map<K, Integer> distances) {
+        int comparison = compareGraded(
+                gradedAmounts(candidate.missing(), Map.of(), distances),
+                gradedAmounts(current.missing(), Map.of(), distances),
+                false);
+        if (comparison < 0) return candidate;
+        if (comparison > 0) return current;
+
+        comparison = compareGraded(
+                gradedAmounts(candidate.usedStock(), candidate.usedReusableStock(), distances),
+                gradedAmounts(current.usedStock(), current.usedReusableStock(), distances),
+                true);
+        if (comparison < 0) return candidate;
+        if (comparison > 0) return current;
+
+        long candidateExecutions = executionTotal(candidate);
+        long currentExecutions = executionTotal(current);
+        return candidateExecutions < currentExecutions ? candidate : current;
     }
 
-    private static <K> long missingTotal(CraftPlan<K> plan) {
-        long total = 0L;
-        for (long amount : plan.missing().values()) {
-            total = Sat.add(total, amount);
+    private static <K> java.util.NavigableMap<Integer, Long> gradedAmounts(
+            Map<K, Long> ordinary,
+            Map<ReusableStockUsageKey<K>, Long> reusable,
+            Map<K, Integer> distances) {
+        java.util.NavigableMap<Integer, Long> tiers = new java.util.TreeMap<>();
+        for (Map.Entry<K, Long> entry : ordinary.entrySet()) {
+            int distance = distances.getOrDefault(entry.getKey(), Integer.MAX_VALUE);
+            tiers.merge(distance, entry.getValue(), Sat::add);
         }
+        for (Map.Entry<ReusableStockUsageKey<K>, Long> entry : reusable.entrySet()) {
+            int distance = distances.getOrDefault(entry.getKey().key(), Integer.MAX_VALUE);
+            tiers.merge(distance, entry.getValue(), Sat::add);
+        }
+        return tiers;
+    }
+
+    private static int compareGraded(
+            java.util.NavigableMap<Integer, Long> left,
+            java.util.NavigableMap<Integer, Long> right,
+            boolean deepestFirst) {
+        java.util.NavigableSet<Integer> tiers = new java.util.TreeSet<>(left.keySet());
+        tiers.addAll(right.keySet());
+        Iterable<Integer> orderedTiers = deepestFirst ? tiers.descendingSet() : tiers;
+        for (int tier : orderedTiers) {
+            int comparison = Long.compare(
+                    left.getOrDefault(tier, 0L), right.getOrDefault(tier, 0L));
+            if (comparison != 0) return comparison;
+        }
+        return 0;
+    }
+
+    private static long executionTotal(CraftPlan<?> plan) {
+        long total = 0L;
+        for (long executions : plan.firings().values()) total = Sat.add(total, executions);
         return total;
+    }
+
+    private static <K> Map<K, Integer> shortestInputDistances(CraftGraph<K> graph, K target) {
+        Map<K, Integer> distances = new LinkedHashMap<>();
+        Deque<K> queue = new ArrayDeque<>();
+        distances.put(target, 0);
+        queue.addLast(target);
+        while (!queue.isEmpty()) {
+            PlanningCancellation.check();
+            K output = queue.removeFirst();
+            int nextDistance = distances.get(output) + 1;
+            for (CraftPattern<K> pattern : graph.patternsFor(output)) {
+                for (CraftInput<K> input : pattern.inputs()) {
+                    Integer previous = distances.get(input.key());
+                    if (previous == null || nextDistance < previous) {
+                        distances.put(input.key(), nextDistance);
+                        queue.addLast(input.key());
+                    }
+                }
+            }
+        }
+        return Map.copyOf(distances);
     }
 
     private static <K> CraftPlan<K> markBudgetExhausted(CraftPlan<K> plan) {
@@ -664,6 +729,9 @@ public final class CraftPlannerV2<K> {
         diagnostics.recordPlanRun();
         if (amount <= 0) {
             return new CraftPlan<>(true, true, Map.of(), Map.of(), Map.of(), Map.of(), Map.of(), 0, false);
+        }
+        if (objectiveDistances.isEmpty()) {
+            objectiveDistances = shortestInputDistances(graph, target);
         }
 
         List<K> order;
@@ -696,16 +764,22 @@ public final class CraftPlannerV2<K> {
                     ConservativeFeedbackAnalysis.analyzeAll(order, patternsByOutput);
             conservativeFeedbackComponents = feedbackAnalysis.components();
             canonicalFeedbackFallbackComponents = feedbackAnalysis.fallbacks();
+            boolean requiresCraftableFeedbackOrder = false;
             for (ConservativeFeedbackAnalysis.Component<K> component
                     : conservativeFeedbackComponents) {
                 if (component.hasExternalProducer()) {
                     craftableConservativeFeedbackPatterns.addAll(component.patterns());
+                    boolean containerFeedback = component.patterns().stream()
+                            .flatMap(pattern -> pattern.inputs().stream())
+                            .anyMatch(input -> input.remainder() != null);
+                    requiresCraftableFeedbackOrder |= !containerFeedback;
                 }
             }
-            if (!craftableConservativeFeedbackPatterns.isEmpty()) {
-                // A valid seed may itself be craftable by an acyclic producer. Ordered validation must
-                // get a chance to build it before bootstrap validation; the aggregate flow alone can
-                // cancel the transition's input against its own returned output.
+            if (requiresCraftableFeedbackOrder) {
+                // A general feedback seed made by an acyclic producer still needs ordered validation:
+                // aggregate balance may cancel its input against its own later output. A container
+                // remainder is the narrow exception because fireLinear withholds one returned batch
+                // and the conservative prefix postcondition validates the exact startup marking.
                 requiresSeedOrderedPlanning = true;
             }
             indexLinearContainerBootstrapReserves();
@@ -1229,13 +1303,13 @@ public final class CraftPlannerV2<K> {
                 states, componentPatterns, fired);
         Map<K, BigInteger> externalDemand = externalFeedbackDemand(
                 states, componentPatterns, fired, target, targetAmount);
+        Map<K, Integer> distances = shortestInputDistances(graph, target);
         FeedbackRequirement<K> best = null;
         for (ConservativeFeedbackAnalysis.ScheduleOption<K> option : options) {
             Map<K, Long> amounts = new LinkedHashMap<>();
-            int missingKinds = 0;
             int firstRank = Integer.MAX_VALUE;
-            long missingTotal = 0L;
-            long stockUsed = 0L;
+            java.util.NavigableMap<Integer, Long> missingByDistance = new java.util.TreeMap<>();
+            java.util.NavigableMap<Integer, Long> usedByDistance = new java.util.TreeMap<>();
             for (int rank = 0; rank < stateOrder.size(); rank++) {
                 K key = stateOrder.get(rank);
                 BigInteger supply = externalSupply.getOrDefault(key, BigInteger.ZERO);
@@ -1251,15 +1325,38 @@ public final class CraftPlannerV2<K> {
                 }
                 long stock = graph.stock(key);
                 long shortage = Math.max(0L, required - stock);
-                if (shortage > 0L) missingKinds++;
-                missingTotal = Sat.add(missingTotal, shortage);
-                stockUsed = Sat.add(stockUsed, Math.min(required, stock));
+                int distance = distances.getOrDefault(key, Integer.MAX_VALUE);
+                if (shortage > 0L) {
+                    missingByDistance.merge(distance, shortage, Sat::add);
+                }
+                long stockUsed = Math.min(required, stock);
+                if (stockUsed > 0L) {
+                    usedByDistance.merge(distance, stockUsed, Sat::add);
+                }
             }
             FeedbackRequirement<K> candidate = new FeedbackRequirement<>(
-                    amounts, missingKinds, missingTotal, stockUsed, firstRank);
+                    amounts,
+                    java.util.Collections.unmodifiableNavigableMap(missingByDistance),
+                    java.util.Collections.unmodifiableNavigableMap(usedByDistance),
+                    firstRank);
             if (candidate.betterThan(best)) best = candidate;
         }
         return best == null ? null : best.amounts();
+    }
+
+    private static int compareFeedbackRequirement(
+            FeedbackRequirement<?> left, FeedbackRequirement<?> right) {
+        int comparison = compareGraded(
+                left.missingByDistance(), right.missingByDistance(), false);
+        if (comparison != 0) return comparison;
+        comparison = compareGraded(left.usedByDistance(), right.usedByDistance(), true);
+        if (comparison != 0) return comparison;
+        // Rotations of one fixed feedback firing vector have identical execution counts. Prefer
+        // the smaller concrete startup marking only after every declared objective tier ties; this
+        // also avoids choosing an unnecessarily stateful read-arc rotation.
+        comparison = Integer.compare(left.amounts().size(), right.amounts().size());
+        if (comparison != 0) return comparison;
+        return Integer.compare(left.firstRank(), right.firstRank());
     }
 
     private void replaceFeedbackAccounting(
@@ -1279,17 +1376,12 @@ public final class CraftPlannerV2<K> {
 
     private record FeedbackRequirement<K>(
             Map<K, Long> amounts,
-            int missingKinds,
-            long missingTotal,
-            long stockUsed,
+            java.util.NavigableMap<Integer, Long> missingByDistance,
+            java.util.NavigableMap<Integer, Long> usedByDistance,
             int firstRank) {
         boolean betterThan(FeedbackRequirement<K> other) {
             if (other == null) return true;
-            if (missingKinds != other.missingKinds) return missingKinds < other.missingKinds;
-            if (amounts.size() != other.amounts.size()) return amounts.size() < other.amounts.size();
-            if (missingTotal != other.missingTotal) return missingTotal < other.missingTotal;
-            if (stockUsed != other.stockUsed) return stockUsed > other.stockUsed;
-            return firstRank < other.firstRank;
+            return compareFeedbackRequirement(this, other) < 0;
         }
     }
 
@@ -1355,11 +1447,6 @@ public final class CraftPlannerV2<K> {
             for (CraftOutput<K> output : pattern.byproducts()) {
                 if (states.contains(output.key())) {
                     mergeProduct(result, output.key(), output.amount(), times);
-                }
-            }
-            for (CraftInput<K> input : pattern.inputs()) {
-                if (input.remainder() != null && states.contains(input.remainder())) {
-                    mergeProduct(result, input.remainder(), input.amount(), times);
                 }
             }
         }

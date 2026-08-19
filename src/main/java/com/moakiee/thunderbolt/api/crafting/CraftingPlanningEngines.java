@@ -1,8 +1,10 @@
 package com.moakiee.thunderbolt.api.crafting;
 
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Comparator;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -88,15 +90,34 @@ public final class CraftingPlanningEngines {
 
     /** Public algorithms plus the one private algorithm owned by a provider node. */
     public static List<ResourceLocation> selectableFor(ResourceLocation providedAlgorithm) {
-        Objects.requireNonNull(providedAlgorithm, "providedAlgorithm");
+        return selectableFor(List.of(Objects.requireNonNull(providedAlgorithm, "providedAlgorithm")));
+    }
+
+    /** Public algorithms plus all registered private algorithms owned by a provider node. */
+    public static List<ResourceLocation> selectableFor(
+            Collection<ResourceLocation> providedAlgorithms) {
+        Objects.requireNonNull(providedAlgorithms, "providedAlgorithms");
+        var provided = new LinkedHashSet<ResourceLocation>();
+        for (var algorithm : providedAlgorithms) {
+            provided.add(Objects.requireNonNull(algorithm, "providedAlgorithm"));
+        }
+        if (provided.isEmpty()) {
+            throw new IllegalArgumentException("A crafting algorithm provider must own an algorithm");
+        }
         var result = new ArrayList<ResourceLocation>(ordered.size() + 1);
         for (var descriptor : ordered) {
-            if (descriptor.publicAlgorithm() || descriptor.id().equals(providedAlgorithm)) {
+            if (descriptor.publicAlgorithm() || provided.contains(descriptor.id())) {
                 result.add(descriptor.id());
             }
         }
-        if (!VANILLA_ID.equals(providedAlgorithm) && !result.contains(providedAlgorithm)) {
-            result.addFirst(providedAlgorithm);
+        // Preserve the legacy single-provider behavior: its primary ID remains visible while its
+        // implementation is temporarily unavailable. Additional IDs from a multi-provider are
+        // shown only after registration, so optional algorithms disabled by config stay hidden.
+        if (provided.size() == 1) {
+            var primary = provided.getFirst();
+            if (!VANILLA_ID.equals(primary) && !result.contains(primary)) {
+                result.addFirst(primary);
+            }
         }
         result.add(VANILLA_ID);
         return List.copyOf(result);

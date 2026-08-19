@@ -3,7 +3,7 @@
 ## 文档状态
 
 - 状态：已在 `feature/generic-conflict-solver` 工作树实现，尚未合并。
-- 适用模块：`CraftPlannerV2`、`FastCraftingPlanner`、`ReusableStockMatcher`、`PlanningDiagnostics`。
+- 适用模块：`CraftPlannerV2`、`CpSatPlanningEngine`、`CpSatRankedFlowSolver`、`FastCraftingPlanner`、`ReusableStockMatcher`、`PlanningDiagnostics`。
 - 本实现不改变 AE2 的合成执行语义，也不修改 AE2 自身的计算线程池。局部精确路径不支持时会回到原有分配修复和有界递归；整张可达图超过统一安全上限时则直接返回保守 Missing，不再进入 AE2 的高成本模拟器。
 
 ## 目标与约束
@@ -47,11 +47,11 @@ AE2 的 `CRAFT_LESS` 会先尝试完整数量，再按二进制位探测较小�
 
 - AE2 库存/样板只导出成一张 `CraftGraph`；后续数量探测复用它；
 - 每种切环定向的 `PreparedGraph`、可达工作量和副产物稳定顺序只编译一次；
-- 精确有理数单元、CPU 时间、搜索、状态解析和确定性 fallback 预算由所有数量探测共同消费；
+- 精确有理数单元、搜索、状态解析和确定性 fallback 预算由所有数量探测共同消费，并统一服从 attempt 墙钟；
 - calculation 返回后立即丢弃 session，不跨请求缓存库存或样板；
 - session 绑定创建它的线程，误跨线程使用会直接拒绝；不同 calculation 各有独立 session，仍可并行。
 
-因此 `Q` 的位数仍可能决定 AE2 发起多少次便宜的数量验证，但不能把 250 ms 精确预算或整图编译成本乘上 `log Q`。例如完整请求 1024 不可行、库存最多支持 1023 时，第一次重探测耗完精确预算后，后续 768…1023 只复用已编译图并走安全回放。
+因此 `Q` 的位数仍可能决定 AE2 发起多少次便宜的数量验证，但不能把结构工作预算或整图编译成本乘上 `log Q`。例如完整请求 1024 不可行、库存最多支持 1023 时，第一次重探测耗完精确工作预算后，后续 768…1023 只复用已编译图并走安全回放；所有探测始终位于同一个 3 s attempt 墙钟内。
 
 ## 实际算法流程
 
@@ -197,7 +197,7 @@ A*x >= b, 0 <= x <= Sat.SAT, x 为整数
 3. 若某坐标为分数，在 `floor/ceil` 两侧做 branch-and-bound；
 4. 整个求解共享分支节点和 simplex pivot 预算；
 5. 每次创建 tableau 前按 `rows * columns` 做准入，并对实际扫描、pivot 和坐标最小化累计有理数单元工作量；
-6. 同一次 calculation 的所有数量探测、局部分量及路线重放共享同一个单调 CPU 时间/工作预算，不能通过拆成许多小矩阵或重复 `CRAFT_LESS` 探测刷新；
+6. 同一次 planning attempt 的所有数量探测、局部分量及路线重放共享路由层的墙钟截止点和同一个结构工作预算，不能通过拆成许多小矩阵或重复 `CRAFT_LESS` 探测刷新；
 7. 只有分支前沿完整耗尽才能返回 `INFEASIBLE`；
 8. 任一预算耗尽返回 `BUDGET_EXHAUSTED`，随后走原规划器，绝不冒充不可行证明。
 
@@ -211,13 +211,15 @@ separatorWidth <= 12
 整数分支节点     <= 64
 全求解 pivot     <= min(1024, max(64, 4*(变量数 + 含上界的约束数)))
 单张 tableau     <= 16384 个有理数单元
-整次 calculation 精确工作 <= 1048576 个有理数单元操作
-整次 calculation 精确 CPU 时间 <= 250 ms
+整次 calculation 精确工作 <= 2097152 个有理数单元操作
+局部求解不另切时间片；服从整次 planning attempt 的剩余墙钟（默认总计 3 s）
 ```
 
 进入求解器之前还会按 `items + patterns + inputEdges + items*patterns` 向现有全局搜索预算收费；最后一项覆盖稠密矩阵初始化成本。显式配置的小预算仍然可以禁止任意分量的这条路径，预算不足的分量单独回退，不影响已经求解的兄弟分量。
 
-tableau 单元数在分配二维数组和转换全部 `BigInteger` 系数之前检查。单张矩阵过大只拒绝该分量，不消耗其他小分量的机会；累计单元工作和 250 ms 期限由整个 calculation 共享。计时在第一次真正进入精确工作时惰性启动，优先使用当前线程 CPU 时间，调度等待和 GC 停顿不会被误算成求解时间；不支持线程 CPU 计时的 JVM 才回退到单调墙钟。期限在有理数扫描和 pivot 内按固定工作间隔检查，避免一个已经进入的 branch-and-bound 节点独占数秒。三个生产默认值分别可通过 `thunderbolt.maxLowWidthTableauCells`、`thunderbolt.maxLowWidthCellWork`、`thunderbolt.maxLowWidthMillis` 调整。
+tableau 单元数在分配二维数组和转换全部 `BigInteger` 系数之前检查。单张矩阵过大只拒绝该分量，不消耗其他小分量的机会；累计单元工作由整个 calculation 共享。求解循环同时执行候选上下文的截止检查：V2 内建精确核、独立 CP-SAT 引擎、SCC 证明都读取各自候选 attempt 的剩余墙钟，不各自取得 100/250 ms 的新配额。默认总墙钟由 `thunderbolt.planningTimeoutMs=3000` 控制；tableau 形状和工作量仍分别可由 `thunderbolt.maxLowWidthTableauCells`、`thunderbolt.maxLowWidthCellWork` 调整。
+
+V2 的低宽局部核仍是内建 `BoundedIntegerLinearSolver`，不装载或调用 CP-SAT。V2 的分量比较继续采用“分级 Missing、分级 used、执行次数”的既有语义；CP-SAT 的整图目标在下节单独定义，两者不共享 session、整数后端或诊断状态。
 
 ### 7. 外层安全上限
 
@@ -237,6 +239,8 @@ reusable route × physical variant   <= 262144 (thunderbolt.maxReusableMatchPair
 
 这些是生产安全边界，不是 Fib、物品名或固定层数特判。它们允许极端构造出现假阴性；共同的不变量是：任何超限路径都不能返回未经完整库存/执行校验的 `feasible=true`。
 
+反馈 SCC 的加权非增益位势证明单独限制为最多 32 个状态、64 个内部样板和 512 个整数分支节点；这些是模型形状/工作上限，与请求数量和权重大小无关。32/64 双向素数比例环的本机热态复测为 p50 约 68–70 ms、max 约 70–72 ms，因此 100 ms 是性能目标，不是 cutoff。十亿级长系数压力样本约 154–174 ms，仍可继续使用整次 attempt 的剩余墙钟；33 状态或 65 样板则在整数搜索前保守拒绝。
+
 ### 8. 解回放和二次校验
 
 整数解不会直接作为最终结果。普通已解分量的执行次数先合并成固定向量，再按同一稳定拓扑序回放完整请求；未解的宽分量或预算截止分量仍使用原动态容量分配。回放重新计算：
@@ -252,9 +256,62 @@ reusable route × physical variant   <= 262144 (thunderbolt.maxReusableMatchPair
 
 含启动或其他顺序状态的已解分量不经过上述普通线性接受路径，而是把整数向量作为配额交给现有递归执行器。执行器先处理含无限 returned seed 的宏；如果它需要无环替代样板或已证明的单步反馈 converter 制造启动种子，这些启动执行也会从同一固定配额中扣除，不能在主需求之外凭空多执行。真实 host 借用继续走全局模糊匹配。候选若无法启动，规划器回滚整个候选执行状态，只解除所有要求严格回放的分量，再运行一次原有有界递归；普通精确兄弟不需要重算。
 
+### 9. 独立 CP-SAT 整图模型
+
+配置开启后注册的是独立 `CpSatPlanningEngine`。它只借用 `FastCraftingPlanner` 的 AE2 图导出和计划格式转换，不创建 `CraftPlannerV2.PlanningSession`，也不把 CP-SAT 作为 V2 的局部整数后端。CP-SAT 模型返回 `UNSUPPORTED/UNKNOWN/INVALID` 时该引擎直接 `DECLINE`；多规划器路由随后是否尝试 V2，是候选之间的正常顺序回退，不是 CP-SAT 内部回退或混合求解。
+
+对纯转换或带外部耗材/只读催化剂的守恒转换 SCC，`CpSatRankedFlowSolver` 建立无时间展开的 Bool + group-rank 模型：
+
+```text
+x[p] >= 0                                      样板 p 的 long firing 数
+active[p] <=> x[p] > 0                         是否选择该样板
+active[p] => rank[group(input)] < rank[group(out)]
+stock[i] + Σ(produce-consume)*x >= demand[i]    精确终态物料平衡
+```
+
+未取得更强证明的物品各自占一个 group，严格 rank 仍使被选择的支持成为 DAG。同时通过 `CycleAnalysis` 精确比例守恒证明和 `ConservativeFeedbackAnalysis` 严格 marked-cycle 证明的转换 SCC 可以共享一个 group；因此 `3A -> 9B; 3B -> A` 这类非单位但等价的转换可以在同一解中同时使用两个方向。多入边、多出边和损耗环不能冒充这种零净转换环，而是进入后述 Petri 宏证明；正增益或未取得非增益证明的活动环仍不放宽。
+
+同 group 不再靠终态平衡猜测可执行性。CP-SAT 先选择 long firing vector；独立重放再把固定向量分成闭式 primitive round 和有界 residual。小 residual 逐 firing 选择已启用转换；发生死锁时显式补入所需最少状态，因此能证明 `A->B, B->A, A->B` 这种必须交错、不能按“每种样板一整块”执行的前缀。大比例或复杂非增长 SCC 使用同一加权位势证明和闭式 canonical prefix，不按请求量建立时间层。每个候选前缀都含精确 `required[state]` 与 `delta[state]`，由独立的 CP-SAT one-hot 选择后真实扣取；任何输入前缀、催化存在量或目标扣除失败都会作废。额外启动缺口会进入最终 Missing，补齐后再次规划必须能执行。
+
+守恒严格环还提供原始零净变化 firing 向量 `primitive[p]`。完整一轮对内部状态净变化为零、对外部普通输入只会额外消耗，所以从任意全部满足 `x[p] >= primitive[p]` 的候选中减去一轮，所有物料下界和同一启动前缀仍成立，且 `Σx` 严格下降。模型据此直接加入：
+
+```text
+OR(p in cycle, x[p] < primitive[p])
+```
+
+这把“无意义重复转一整圈”作为已证明的支配约束消掉。CP-SAT 的整图目标使用严格词典序：先按“物品沿输入需求边到请求根的最短距离”从近到远逐层最小化 Missing，再最小化 `Σx[p]`，最后最小化全部实际初始库存占用。可证明 `Missing=0` 时先在克隆模型上一次证明零缺口并同时求执行次数，避免深 Fib 为每个空 Missing 层重复求解。每一级最优值都会固定为等式，只有得到 `OPTIMAL` 才接受；辅助 activation、rank、有限耐久批数和催化储备不计入执行次数。
+
+无限 returned 催化物是存在量而不是流量，另加：
+
+```text
+active[p] => stock[c] + Σproduce[c]*x >= catalystAmount[p,c]
+```
+
+它不乘 `x[p]`、不被扣除，同一催化物可跨样板共享。若同一物品又被普通消耗，只有当所有 catalytic read 都位于同一个已证明反馈宏且该物品是宏状态时才准入：宏先在状态 group 执行，环外普通消费者由 rank 强制排在其后。其他“先催化再消耗”情况仍保守拒绝。有限耐久使用整数变量 `toolBatches = ceil(x[p] / uses)` 并按 `amount * toolBatches` 进入余额；生产适配层遇到同物品逐级损坏时先建立 `DurabilityChain`，把各损坏态库存折成 carrier use 数，完整工具配方则产生一整条链的 use 数，所以 CP-SAT 既能消耗现有残余耐久，也能沿工具主产物配方补造下一件。互不重叠的 host 私有 fuzzy seed 路线以独立物理库存池进入存在量和最终借用明细；物理候选在两个逻辑池之间重叠时仍保守拒绝，避免尚未编码完整二分匹配时双花库存。
+
+`CraftInput.remainder` 不再是特殊的第二套产物流：建立 `CraftPattern` 时会把它规范化成普通副产物 post-arc；旧导出器已经显式声明同键副产物时只保留一次，避免容器翻倍。输入上的 remainder 字段仅保留给 SCC/启动顺序识别。于是 `full -> target + empty; empty + water -> full` 与其他守恒副产物反馈使用同一余额、加权非增益证明和前缀重放；无任何 full/empty 启动态时报告一个真实 seed，补齐该 Missing 后可执行。
+
+普通副产物直接进入 `produced[p][item]` 余额，并额外约束样板 anchor rank 早于其他输出 rank，保证副产物消费者不会排到生产者之前。对 `ConservativeFeedbackAnalysis` 已证明的非增长 SCC——包括 weighted lossy、分支/汇合副产物和内部 returned-catalyst read arc——所有内部状态共用一个 group，但不把请求量展开为时间层：
+
+1. 整图 CP-SAT 先独立求出完整 long firing vector；
+2. 若本次实际启用的 SCC 边已经是 DAG，直接按活动边拓扑重放，不收取未启用反向边的启动储备；
+3. 若活动边仍成环，证明器把固定 firing vector 分解为闭式 primitive round 加有界 residual，或用已证明加权非增益位势生成保守但可执行的 canonical prefix；
+4. 每个 prefix 形成一行 `required[state]` 和 `delta[state]`，独立 CP-SAT 用 ExactlyOne Bool 选择一行，排序仍遵循分级 Missing、总 used；固定 firing vector 的执行次数天然相同；
+5. 回放先真实扣取选中启动 marking，再只处理宏的环外输入/输出，最后放回 `required + delta` 内部状态。额外启动缺口会并入 Missing，补齐后重新规划必须可执行。
+
+普通副产物余额还受“主产物需求证明”约束。对主产物批量 `q[p]`，活动样板至少要有 `q[p]*x[p]-(q[p]-1)` 个主产物被目标、其他样板的普通/耐久输入或共享催化存在量真正需要；只允许最后一批自然向上取整的余量被丢弃。这样不能为了多拿副产物而额外执行一次主产物无人需要的样板，同时 `4P+B` 为 `1P+1B` 正常执行一批仍合法。该约束直接写成 firing/activation 的线性式，不增加另一个 long 域辅助变量。
+
+因此反馈宏没有调用 V2，也没有把 CP-SAT firing vector 交给 V2 补全；它只复用独立的 Petri/SCC 证明工具。未证明非增长的活动环仍只能由严格 rank 选择无环方向，`INFEASIBLE/UNKNOWN` 也不会被提升为这类更一般状态网的不可达证明。
+
+OR-Tools 要求全模型所有整数域及线性式范围可安全放入有符号 int64；实现先按 firing 变量数均分域预算，再按每个样板最大化学计量系数继续收紧，使一条包含所有 firing 的物料/主产物行仍不溢出。rank 图默认边界为 256 个物料、192 个样板，不设独立求解毫秒数；每次调用和反馈 prefix one-hot 都使用 CP-SAT 候选 planning attempt 当时的全部剩余墙钟。`SOLVED` 后仍做独立回放：按返回 group-rank和已选 Petri prefix，逐批扣除普通/有限耐久输入、检查催化存在量、分配 host 私有借用、加入产物并最后扣除目标；任何不一致都使 CP-SAT 候选 `DECLINE`。
+
+旧的 Reservoir 阶段模型已移出生产路径。它虽然表达了前缀非负，但只得到“每阶段任意拆分数量 + 终态余额”，没有把 TB 已知的单批执行、方向互斥和拓扑次序直接交给求解器，导致大量阶段拆分对称；8 层交叠转换环会耗尽 30 s，而同一实例的 Bool + rank 只有几十个变量。
+
 ## Missing 路线选择
 
 可行计划始终优先于任何 Missing 非空的计划。
+
+V2 跨切环定向的全局比较使用“分级 Missing 最小 > 分级 used 最小 > 执行次数最小”；独立 CP-SAT 使用“分级 Missing 最小 > 执行次数最小 > 总 used 最小”。两套目标互不调用，也不把一个求解器的中间计划交给另一个继续求解。
 
 当所有兄弟样板都无法覆盖剩余需求时，当前实现只对它们“直接共享的普通输入”做展示投影。对每种共享输入分别比较：
 
@@ -303,8 +360,8 @@ R2: X(i-2) + X(i-3) -> Xi
 - `P_i/R_i/A_i`：第 `i` 个进入精确模型分量的样板变量、物品约束和启动/储备辅助变量数量；
 - `B_n`：每个分量的整数分支节点预算，当前最多 64；
 - `B_p`：每个分量整棵 branch-and-bound 树共享的 simplex pivot 预算，当前最多 1024；
-- `B_c`：一次 calculation 共享的有理数单元工作预算，默认 1048576；
-- `T_e`：一次 calculation 共享的精确求解 CPU 时间，默认 250 ms；
+- `B_c`：一次 calculation 共享的有理数单元工作预算，默认 2097152；
+- `T_a`：一次 planning attempt 的总墙钟，默认 3 s；各求解阶段只读取剩余值，不做固定分配；
 - `L`：AE2 对同一 calculation 发起的数量探测次数；`long` 数量下 `L<=64`；
 - `Q`：请求数量。
 
@@ -322,7 +379,7 @@ R2: X(i-2) + X(i-3) -> Xi
 分量发现、边界与乐观容量       O(V+E+Y)（并查集附带反 Ackermann 因子）
 矩阵构造                       sum O((P_i + A_i) * R_i + E_i + 启动约束数)
 精确求解                       每分量受 B_n、B_p、P_i<=96、R_i<=128、tableau<=16384 限制
-全部精确分量                   合计受 B_c 和 T_e 限制
+全部精确分量                   合计受 B_c 和 T_a 限制
 数量相关算术                   依赖 O(log Q) 位数，不出现 O(Q) 循环
 ```
 
@@ -368,14 +425,14 @@ R2: X(i-2) + X(i-3) -> Xi
 
 - 宽度或矩阵超过门限；
 - 全局搜索预算不足；
-- tableau 单元、累计有理数工作、250 ms 期限、整数节点或 pivot 预算耗尽；
+- tableau 单元、累计有理数工作、attempt 墙钟、整数节点或 pivot 预算耗尽；
 - 精确算术、矩阵构造或回放发现不支持状态；
 - core 层局部分量仍含未归一化的有限耐久 returned input；
 - 启动储备、真实模糊宿主分配、容器/副产物顺序无法执行矩阵候选。
 
 图导出、整图可达工作或 reusable 匹配超过外层上限时不会进入上述“局部分量无损回退”，而是直接保守报缺；副产物调度超限则仅放弃提前信用。两者都属于 Policy A：允许刻意极端实例假阴性，不允许假阳性。所有数量探测共用预算，后一个探测看到预算已耗尽也按同一规则退化，不能刷新重算。
 
-已解普通分量在混合线性回放和 allocation repair 中保持固定；若仍进入最终有界递归，递归路径也只消费该分量已证明的剩余样板次数配额，回滚时配额随 trail 一起恢复。含普通无环副产物的向量只有在完整混合回放直接得到可行计划时才会被接受，否则在递归前解除固定。含种子、host、容器或顺序不安全副产物的候选必须经严格递归回放；失败时只解除这些有状态分量并重试，独立普通分量保持固定。未解分量继续执行现有动态分配、allocation repair 和有界递归。切环仍由现有定向和有限重试负责，不引入通用 SCC 求解。只有经过完整回放的 `SOLVED` 结果，或在当前语义/切环定向下成立的严格 `INFEASIBLE` 证明，才会提前结束该次尝试。
+已解普通分量在混合线性回放和 allocation repair 中保持固定；若仍进入最终有界递归，递归路径也只消费该分量已证明的剩余样板次数配额，回滚时配额随 trail 一起恢复。含普通无环副产物的向量只有在完整混合回放直接得到可行计划时才会被接受，否则在递归前解除固定。含种子、host、容器或顺序不安全副产物的候选必须经严格递归回放；失败时只解除这些有状态分量并重试，独立普通分量保持固定。以上全部属于 V2 自身。独立 CP-SAT 引擎只接受自身 Bool + rank/余额模型并经自身回放验证的 `SOLVED`；超出准入、超时、模型无效或回放失败一律 `DECLINE`，不进入 V2 内部路径。
 
 ## 验收覆盖
 

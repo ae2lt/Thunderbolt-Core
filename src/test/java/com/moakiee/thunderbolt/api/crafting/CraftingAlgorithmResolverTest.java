@@ -102,16 +102,20 @@ class CraftingAlgorithmResolverTest {
     }
 
     @Test
-    void providerCanSelectOnlyItsOwnAlgorithmOrAPublicAlgorithm() {
+    void providerCanSelectItsOwnedAlgorithmsOrAPublicAlgorithm() {
         var state = new DefaultCraftingAlgorithmProviderState(
-                PRIVATE_HIGH, 0, () -> { });
+                PRIVATE_HIGH, List.of(PRIVATE_HIGH, PRIVATE_LOW), 0, () -> { });
 
-        state.setSelection(new CraftingAlgorithmSelection(PUBLIC_LOW, 9));
+        state.setSelection(new CraftingAlgorithmSelection(PUBLIC_LOW, 8));
+        assertEquals(new CraftingAlgorithmSelection(PUBLIC_LOW, 8), state.snapshot());
+
+        state.setSelection(new CraftingAlgorithmSelection(PRIVATE_LOW, 9));
 
         assertEquals(PRIVATE_HIGH, state.getProvidedAlgorithm());
-        assertEquals(new CraftingAlgorithmSelection(PUBLIC_LOW, 9), state.snapshot());
+        assertEquals(List.of(PRIVATE_HIGH, PRIVATE_LOW), state.getProvidedAlgorithms());
+        assertEquals(new CraftingAlgorithmSelection(PRIVATE_LOW, 9), state.snapshot());
         assertThrows(IllegalArgumentException.class, () -> state.setSelection(
-                new CraftingAlgorithmSelection(PRIVATE_LOW, 9)));
+                new CraftingAlgorithmSelection(id("another_private"), 9)));
     }
 
     @Test
@@ -124,6 +128,21 @@ class CraftingAlgorithmResolverTest {
                 PUBLIC_LOW,
                 CraftingPlanningEngines.VANILLA_ID), selectable);
         assertFalse(selectable.contains(PRIVATE_HIGH));
+    }
+
+    @Test
+    void providerMenuChoicesIncludeEveryOwnedPrivateAlgorithm() {
+        var unavailableOptional = id("unavailable_optional");
+        var selectable = CraftingPlanningEngines.selectableFor(
+                List.of(PRIVATE_HIGH, PRIVATE_LOW, unavailableOptional));
+
+        assertEquals(List.of(
+                PUBLIC_HIGH,
+                PRIVATE_HIGH,
+                PRIVATE_LOW,
+                PUBLIC_LOW,
+                CraftingPlanningEngines.VANILLA_ID), selectable);
+        assertFalse(selectable.contains(unavailableOptional));
     }
 
     @Test

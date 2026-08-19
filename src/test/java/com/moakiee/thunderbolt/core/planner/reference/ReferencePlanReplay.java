@@ -132,9 +132,6 @@ final class ReferencePlanReplay {
                     && (!input.returned() || input.uses() != CraftInput.INFINITE_USES)) {
                 consume(inventory, graph, input.key(), input.unitsFor(times));
             }
-            if (input.remainder() != null) {
-                insert(inventory, graph, input.remainder(), Sat.mul(input.amount(), times));
-            }
         }
         insert(inventory, graph, pattern.output(), Sat.mul(pattern.outputAmount(), times));
         for (CraftOutput<String> output : pattern.byproducts()) {

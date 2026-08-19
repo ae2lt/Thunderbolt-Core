@@ -114,6 +114,20 @@ class PlannerPackageBoundaryTest {
         assertFalse(Files.exists(crafting.resolve("algorithm/ThunderboltV2PlanningEngine.java")));
     }
 
+    @Test
+    void cpSatEngineIsNotAV2IntegerBackend() throws Exception {
+        var planner = Path.of("src/main/java/com/moakiee/thunderbolt/core/crafting/planner");
+        var engine = Files.readString(planner.resolve("CpSatPlanningEngine.java"));
+        var solver = Files.readString(planner.resolve("CpSatRankedFlowSolver.java"));
+        var runtime = Files.readString(planner.resolve("CpSatRuntime.java"));
+
+        assertTrue(engine.contains("FastCraftingPlanner.CalculationSession.cpSat()"));
+        assertFalse(engine.contains("CraftPlannerV2"));
+        assertFalse(solver.contains("CraftPlannerV2"));
+        assertFalse(runtime.contains("CraftPlannerV2"));
+        assertFalse(solver.contains("IntegerFlowBackend"));
+    }
+
     private static void assertSourcesDoNotContain(
             Path root, String forbidden, String message) throws Exception {
         try (var files = Files.walk(root)) {

@@ -9,7 +9,7 @@ Thunderbolt 把算法实现、节点选择和一次计算的候选链分成三�
   ID + 实现 + 算法优先级 + 是否公开
 
 Grid 节点提供器
-  当前选择的算法 ID + 玩家优先级
+  提供的私有算法 ID 集合 + 当前选择的算法 ID + 玩家优先级
 
 CraftingCalculation 快照
   当前 Grid 的公开算法和在线提供器选择
@@ -52,11 +52,15 @@ CraftingPlanningEngines.allIds();
 
 ## 3. 最小提供器 API
 
-一个 Grid 节点固定提供一个私有算法，并在“自己的算法 + 所有公开算法”中选择当前算法：
+一个 Grid 节点固定提供一个或多个私有算法，并在“自己的算法 + 所有公开算法”中选择当前算法：
 
 ```java
 public interface CraftingAlgorithmProvider extends IGridNodeService {
     ResourceLocation getProvidedAlgorithm();
+
+    default List<ResourceLocation> getProvidedAlgorithms() {
+        return List.of(getProvidedAlgorithm());
+    }
 
     ResourceLocation getSelectedAlgorithm();
 
@@ -64,10 +68,12 @@ public interface CraftingAlgorithmProvider extends IGridNodeService {
 }
 ```
 
-`getProvidedAlgorithm()` 是节点自身提供且不会随 GUI 选择改变的算法。提供器可以选择
-公开算法，包括 Vanilla；含义是为该公开算法赋予这个节点配置的玩家优先级，而不是
-注册第二份算法实现。提供器不能选择其他节点拥有的私有算法，默认 GUI 与 Grid 解析
-都会校验这一限制。
+`getProvidedAlgorithm()` 保留为主算法和兼容回退；旧实现无需修改，默认仍只提供这一个
+算法。需要提供多个私有算法的节点覆盖 `getProvidedAlgorithms()`，并把主算法放在第一项。
+这组所有权不会随 GUI 选择改变。提供器也可以选择公开算法，包括 Vanilla；含义是为该
+公开算法赋予这个节点配置的玩家优先级，而不是注册第二份算法实现。提供器不能选择其他
+节点拥有的私有算法，默认 GUI 与 Grid 解析都会校验这一限制。尚未注册的附加私有算法不
+进入菜单，因此配置关闭的可选后端不会显示为可选项。
 
 同一算法由多个节点选择时只生成一个候选项，玩家优先级取这些节点中的最大值。
 
@@ -145,6 +151,9 @@ Thunderbolt 提供可直接复用的状态对象：
 private final DefaultCraftingAlgorithmProviderState algorithmProvider =
         new DefaultCraftingAlgorithmProviderState(
                 ThunderboltV2PlanningEngine.ID,
+                List.of(
+                        ThunderboltV2PlanningEngine.ID,
+                        CpSatPlanningEngine.ID),
                 0,
                 this::setChanged);
 ```
@@ -165,6 +174,14 @@ tag.put("ThunderboltAlgorithmProvider", algorithmTag);
 algorithmProvider.readFromNBT(
         tag.getCompound("ThunderboltAlgorithmProvider"));
 ```
+
+`thunderbolt:v2` 与 `thunderbolt:cp_sat` 是两个完整候选，不是同一规划器的两个整数后端。
+V2 session 只运行 V2；CP-SAT session 直接导出 `CraftGraph`、建立 OR-Tools 模型并独立回放，
+不会创建或调用 `CraftPlannerV2`。CP-SAT 已直接编码普通副产物以及经加权非增益证明的反馈
+SCC；容器 remainder 规范化为普通副产物，耐久损坏由图导出层折成 carrier use 链。对未
+证明的活动反馈或重叠 host 匹配返回 `DECLINE`。路由器随后从头尝试
+下一个候选，不能把 CP-SAT 的 firing 向量交给 V2 继续补全，也不能把 V2 的成功结果记为
+CP-SAT。
 
 编码字段只有：
 
@@ -192,12 +209,12 @@ CraftingAlgorithmProviderMenu.open(
 
 默认界面支持：
 
-- 在所有已注册算法和 Vanilla 之间切换；
+- 在节点提供的已注册私有算法、所有公开算法和 Vanilla 之间切换；
 - 公开/需要提供器状态显示；
 - 玩家优先级 `-10/-1/0/+1/+10` 调整；
 - 服务端通过 container button 立即验证并写回；
 - 优先级限制在 `[-1_000_000, 1_000_000]`，避免溢出；
-- 当前 NBT 中未知的算法 ID仍显示在列表中，不静默丢失。
+- 当前 NBT 中未知的算法 ID 不会被删除；其实现重新注册后会恢复为可选项。
 
 默认 GUI 是可选辅助层，不是 `CraftingAlgorithmProvider` 的依赖。
 

@@ -100,7 +100,7 @@ public final class CraftingAlgorithmProviderMenu extends AEBaseMenu implements I
 
     private static List<ResourceLocation> selectableAlgorithms(
             CraftingAlgorithmProviderMenuHost host) {
-        return CraftingPlanningEngines.selectableFor(host.getProvidedAlgorithm());
+        return CraftingPlanningEngines.selectableFor(host.getProvidedAlgorithms());
     }
 
     private static int selectedIndex(

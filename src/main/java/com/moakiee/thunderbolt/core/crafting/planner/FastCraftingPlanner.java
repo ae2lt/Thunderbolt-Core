@@ -41,8 +41,7 @@ import com.moakiee.thunderbolt.core.crafting.support.CraftingPatternDelegates;
 
 /**
  * Bridges one of AE2's per-amount crafting attempts ({@code CraftingCalculation#runCraftAttempt})
- * to the {@link com.moakiee.thunderbolt.core.crafting.planner.CraftPlannerV2} fast path, producing
- * AE2-compatible {@link CraftingPlan}s.
+ * to a Thunderbolt graph solver, producing AE2-compatible {@link CraftingPlan}s.
  *
  * <p>This is Thunderbolt's single production fast-planner entry. Ordinary AE2 patterns, overload
  * patterns and contracted closed-loop patterns all enter through this adapter; capability interfaces
@@ -146,6 +145,11 @@ public final class FastCraftingPlanner {
      * core planner shares its exact and fallback work budgets across {@code CRAFT_LESS} probes.
      */
     public static final class CalculationSession {
+        private enum SolverKind {
+            V2,
+            CP_SAT
+        }
+
         private ICraftingService craftingService;
         private CraftingSimulationState networkInv;
         private Level level;
@@ -153,10 +157,23 @@ public final class FastCraftingPlanner {
         private CraftingStockPolicy reservedStock;
         private Thread owner;
         private CompiledGraph compiledGraph;
-        private final CraftPlannerV2.PlanningSession<AEKey> plannerSession =
-                new CraftPlannerV2.PlanningSession<>();
+        private final SolverKind solverKind;
+        @Nullable
+        private final CraftPlannerV2.PlanningSession<AEKey> plannerSession;
 
         public CalculationSession() {
+            this(SolverKind.V2);
+        }
+
+        private CalculationSession(SolverKind solverKind) {
+            this.solverKind = solverKind;
+            this.plannerSession = solverKind == SolverKind.V2
+                    ? new CraftPlannerV2.PlanningSession<>()
+                    : null;
+        }
+
+        public static CalculationSession cpSat() {
+            return new CalculationSession(SolverKind.CP_SAT);
         }
 
         private void bind(
@@ -275,9 +292,21 @@ public final class FastCraftingPlanner {
         }
 
         PlanningCancellation.report(PLANNING_DIAGNOSTIC);
-        PlanningResult<AEKey> planning = CraftPlannerV2.planDetailed(
-                compiled.graph, output, amount, session.plannerSession);
-        CraftPlan<AEKey> plan = planning.plan();
+        CraftPlan<AEKey> plan;
+        if (session.solverKind == CalculationSession.SolverKind.CP_SAT) {
+            CpSatRankedFlowSolver.Result<AEKey> solved =
+                    CpSatRankedFlowSolver.solve(compiled.graph, output, amount);
+            if (solved.status() != CpSatRankedFlowSolver.Status.SOLVED
+                    || solved.plan() == null) {
+                return FastAttempt.decline();
+            }
+            plan = solved.plan();
+        } else {
+            PlanningResult<AEKey> planning = CraftPlannerV2.planDetailed(
+                    compiled.graph, output, amount,
+                    Objects.requireNonNull(session.plannerSession));
+            plan = planning.plan();
+        }
         if (!plan.supported()) {
             return FastAttempt.decline();
         }

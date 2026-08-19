@@ -40,7 +40,7 @@ public final class CraftingPlanningService implements ICraftingPlanningService, 
                 if (!provider.canSelectAlgorithm(selection.algorithmId())) {
                     ThunderboltCore.LOGGER.warn(
                             "[Thunderbolt Core] ignored algorithm {} selected by provider for {}",
-                            selection.algorithmId(), provider.getProvidedAlgorithm());
+                            selection.algorithmId(), provider.getProvidedAlgorithms());
                     continue;
                 }
                 selections.add(selection);
