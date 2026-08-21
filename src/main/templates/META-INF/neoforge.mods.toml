@@ -34,3 +34,11 @@ ${mod_description}
     versionRange="[19.2.17,19.3)"
     ordering="AFTER"
     side="BOTH"
+
+[[dependencies.${mod_id}]]
+    modId="data_energistics"
+    type="incompatible"
+    reason="Data Energistics modifies shared AE2 internals in ways that cannot be safely isolated from Thunderbolt."
+    versionRange="*"
+    ordering="NONE"
+    side="BOTH"
