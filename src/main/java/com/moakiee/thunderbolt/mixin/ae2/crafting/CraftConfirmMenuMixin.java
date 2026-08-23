@@ -67,7 +67,7 @@ public abstract class CraftConfirmMenuMixin implements CraftingAlgorithmNameMenu
                         level, requester, what, amount, strategy));
     }
 
-    @Inject(method = "broadcastChanges", at = @At("HEAD"))
+    @Inject(method = "broadcastChanges", at = @At("HEAD"), remap = true)
     private void thunderbolt$syncAlgorithmName(CallbackInfo ci) {
         var selected = CraftingAlgorithmCalculationStatus.selected(job);
         if (selected != null) {
@@ -75,7 +75,7 @@ public abstract class CraftConfirmMenuMixin implements CraftingAlgorithmNameMenu
         }
     }
 
-    @Inject(method = "removed", at = @At("HEAD"))
+    @Inject(method = "removed", at = @At("HEAD"), remap = true)
     private void thunderbolt$forgetCalculation(Player player, CallbackInfo ci) {
         CraftingAlgorithmCalculationStatus.forget(job);
     }

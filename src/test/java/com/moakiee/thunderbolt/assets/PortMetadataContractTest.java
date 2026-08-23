@@ -47,4 +47,17 @@ class PortMetadataContractTest {
                         + "(Lnet/minecraft/core/BlockPos;)"
                         + "Lnet/minecraft/world/level/block/entity/BlockEntity;\""));
     }
+
+    @Test
+    void productionRefmapIncludesCraftConfirmVanillaOverrides() throws IOException {
+        String refmap = Files.readString(GENERATED_REFMAP);
+
+        assertTrue(refmap.contains(
+                "\"broadcastChanges\": "
+                        + "\"Lappeng/menu/me/crafting/CraftConfirmMenu;m_38946_()V\""));
+        assertTrue(refmap.contains(
+                "\"removed\": "
+                        + "\"Lappeng/menu/me/crafting/CraftConfirmMenu;m_6877_"
+                        + "(Lnet/minecraft/world/entity/player/Player;)V\""));
+    }
 }
