@@ -1,6 +1,8 @@
 {
   "gui.thunderbolt.algorithm_provider.title": "Crafting Algorithm",
   "gui.thunderbolt.algorithm_provider.algorithm": "Selected algorithm",
+  "gui.thunderbolt.algorithm_provider.previous": "Switch to previous algorithm",
+  "gui.thunderbolt.algorithm_provider.next": "Switch to next algorithm",
   "gui.thunderbolt.algorithm_provider.public": "Public: available without a provider",
   "gui.thunderbolt.algorithm_provider.provider_required": "Available while this provider is online",
   "gui.thunderbolt.algorithm_provider.priority": "Player priority: %s",
