@@ -50,10 +50,10 @@ server.
 .\gradlew.bat publishToMavenLocal
 ```
 
-Maven coordinate: `com.moakiee.thunderbolt:thunderbolt:1.0.6-beta.1`.
+Maven coordinate: `com.moakiee.thunderbolt:thunderbolt:2.0.0-beta.1`.
 
 The distributable local build is
-`build/libs/thunderbolt-forge-1.20.1-1.0.6-beta.1.jar`.
+`build/libs/thunderbolt-forge-1.20.1-2.0.0-beta.1.jar`.
 The `-slim.jar` artifact does not contain the required MixinExtras jar-in-jar
 dependency and is intended only as an intermediate development artifact.
 
