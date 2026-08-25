@@ -1,6 +1,8 @@
 {
   "gui.thunderbolt.algorithm_provider.title": "合成算法",
   "gui.thunderbolt.algorithm_provider.algorithm": "当前选择的算法",
+  "gui.thunderbolt.algorithm_provider.previous": "切换到上一个算法",
+  "gui.thunderbolt.algorithm_provider.next": "切换到下一个算法",
   "gui.thunderbolt.algorithm_provider.public": "公开算法：没有提供器时仍可使用",
   "gui.thunderbolt.algorithm_provider.provider_required": "仅在此提供器在线时可使用",
   "gui.thunderbolt.algorithm_provider.priority": "玩家优先级：%s",
