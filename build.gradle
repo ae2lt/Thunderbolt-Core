@@ -4,11 +4,31 @@ plugins {
     id 'net.neoforged.moddev' version '2.0.140'
 }
 
-version = mod_version
+def releaseTag = System.getenv('TAG')?.trim()
+if (releaseTag) {
+    if (!releaseTag.startsWith('v')) {
+        throw new GradleException("Release tags must start with v: ${releaseTag}")
+    }
+    version = releaseTag.substring(1)
+} else {
+    version = mod_version
+}
+def resolvedProjectVersion = project.version.toString()
 group = mod_group_id
+
+def githubPackagesUser = System.getenv('GITHUB_ACTOR') ?: project.findProperty('gpr.user')
+def githubPackagesToken = System.getenv('GITHUB_PACKAGES_TOKEN') ?: System.getenv('GITHUB_TOKEN') ?: project.findProperty('gpr.key')
 
 base {
     archivesName = project.findProperty("artifact_name") ?: mod_id
+}
+
+tasks.register('printProjectVersion') {
+    group = 'help'
+    description = 'Prints the version used for this build.'
+    doLast {
+        println resolvedProjectVersion
+    }
 }
 
 java.toolchain.languageVersion = JavaLanguageVersion.of(21)
@@ -144,7 +164,7 @@ var generateModMetadata = tasks.register("generateModMetadata", ProcessResources
         mod_id                 : mod_id,
         mod_name               : mod_name,
         mod_license            : mod_license,
-        mod_version            : mod_version,
+        mod_version            : project.version,
         mod_authors            : mod_authors,
         mod_description        : mod_description]
     inputs.properties replaceProperties
@@ -166,6 +186,16 @@ publishing {
     repositories {
         maven {
             url = project.projectDir.toPath().resolve("repo").toUri()
+        }
+        if (githubPackagesUser && githubPackagesToken) {
+            maven {
+                name = 'GitHubPackages'
+                url = uri('https://maven.pkg.github.com/ae2lt/Thunderbolt-Core')
+                credentials {
+                    username = githubPackagesUser
+                    password = githubPackagesToken
+                }
+            }
         }
     }
 }
