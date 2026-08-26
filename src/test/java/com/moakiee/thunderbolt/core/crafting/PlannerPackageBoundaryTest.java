@@ -47,12 +47,19 @@ class PlannerPackageBoundaryTest {
     }
 
     @Test
-    void craftingCalculationUsesOneIsolationAndSessionCleanupPath() throws Exception {
+    void craftingCalculationKeepsVanillaNativeAndIsolatesEngines() throws Exception {
         var source = Files.readString(Path.of(
                 "src/main/java/com/moakiee/thunderbolt/mixin/ae2/crafting/"
                         + "CraftingCalculationMixin.java"));
 
-        assertTrue(source.contains("? thunderbolt$runVanillaCandidate"));
+        int vanillaBranch = source.indexOf(
+                "if (choice.kind() == PlanningChoice.Kind.VANILLA)");
+        int isolatedExecution = source.indexOf("PlanningCandidateExecutor.execute(");
+        assertTrue(vanillaBranch >= 0);
+        assertTrue(source.contains("ICraftingPlan result = original.call(instance);"));
+        assertTrue(isolatedExecution > vanillaBranch,
+                "vanilla must return through AE2 before engine isolation begins");
+        assertFalse(source.contains("thunderbolt$runVanillaCandidate"));
         assertTrue(source.contains("try (session)"));
         assertFalse(source.contains("PlanningAttemptMonitor.start("));
     }

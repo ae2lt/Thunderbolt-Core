@@ -95,7 +95,7 @@ public abstract class CraftingCalculationMixin implements CraftingPlanningContro
     private PlanningRequest thunderbolt$request;
 
     @Unique
-    private volatile boolean thunderbolt$activeVanilla;
+    private boolean thunderbolt$activeVanilla;
 
     @Unique
     @Nullable
@@ -178,26 +178,41 @@ public abstract class CraftingCalculationMixin implements CraftingPlanningContro
             CraftingCalculation instance, Operation<ICraftingPlan> original) {
         for (var candidate : thunderbolt$candidates) {
             var choice = candidate.choice();
-            var engineId = choice.kind() == PlanningChoice.Kind.VANILLA
-                    ? CraftingPlanningEngines.VANILLA_ID
-                    : choice.engineId();
+            if (choice.kind() == PlanningChoice.Kind.VANILLA) {
+                // AE2's native planner already owns this worker and its per-tick scheduler. Running
+                // it as an isolated candidate would hand the current slice back while a second
+                // thread computes, commonly adding a whole tick before the result is observed.
+                thunderbolt$activeVanilla = true;
+                try {
+                    ICraftingPlan result = original.call(instance);
+                    if (result == null) {
+                        throw new PlanningCandidateDeclinedException();
+                    }
+                    this.simulate = result.simulation();
+                    thunderbolt$selectedVanilla = true;
+                    thunderbolt$selectedEngine = CraftingPlanningEngines.VANILLA_ID;
+                    CraftingAlgorithmCalculationStatus.select(
+                            simRequester, CraftingPlanningEngines.VANILLA_ID);
+                    return result;
+                } finally {
+                    thunderbolt$activeVanilla = false;
+                }
+            }
+
+            var engineId = choice.engineId();
             boolean timedOut = false;
             try {
                 var engine = candidate.engine();
                 var candidateRequest = thunderbolt$request;
-                if (choice.kind() == PlanningChoice.Kind.ENGINE
-                        && (engine == null || candidateRequest == null)) {
+                if (engine == null || candidateRequest == null) {
                     thunderbolt$declinedEngines.incrementAndGet();
                     continue;
                 }
-                thunderbolt$activeVanilla = choice.kind() == PlanningChoice.Kind.VANILLA;
                 var execution = PlanningCandidateExecutor.execute(
                         engineId,
                         "output=" + output + " requested=" + requestedAmount,
-                        context -> choice.kind() == PlanningChoice.Kind.VANILLA
-                                ? thunderbolt$runVanillaCandidate(instance, original, context)
-                                : thunderbolt$runEngineCandidate(
-                                        engine, candidateRequest, candidate.capturedInput(), context),
+                        context -> thunderbolt$runEngineCandidate(
+                                engine, candidateRequest, candidate.capturedInput(), context),
                         this::thunderbolt$pauseUntilNextTick,
                         CraftingCalculationMixin::thunderbolt$discardCandidatePlan);
                 if (execution.status() == PlanningCandidateExecutor.Status.QUARANTINED) {
@@ -227,7 +242,7 @@ public abstract class CraftingCalculationMixin implements CraftingPlanningContro
                 }
 
                 this.simulate = result.simulation();
-                thunderbolt$selectedVanilla = choice.kind() == PlanningChoice.Kind.VANILLA;
+                thunderbolt$selectedVanilla = false;
                 thunderbolt$selectedEngine = engineId;
                 CraftingAlgorithmCalculationStatus.select(simRequester, engineId);
                 return result;
@@ -244,8 +259,6 @@ public abstract class CraftingCalculationMixin implements CraftingPlanningContro
                                     + "engine={} output={} timeout={}",
                             engineId, output, timedOut, failure);
                 }
-            } finally {
-                thunderbolt$activeVanilla = false;
             }
         }
 
@@ -292,22 +305,15 @@ public abstract class CraftingCalculationMixin implements CraftingPlanningContro
 
     @Inject(method = "handlePausing", at = @At("HEAD"), cancellable = true, remap = false)
     private void thunderbolt$keepCandidateOffAe2Scheduler(CallbackInfo ci) {
+        if (thunderbolt$activeVanilla) {
+            return;
+        }
         // AE2's monitor protocol has exactly one calculation-thread waiter. Candidate work runs
         // on a separate thread, so it must use Thunderbolt's cancellation context instead of
         // becoming a second waiter on monitor and competing with the owning AE2 worker.
         if (PlanningCandidateExecutor.checkpointCandidateThread()) {
             ci.cancel();
         }
-    }
-
-    @Unique
-    private ICraftingPlan thunderbolt$runVanillaCandidate(
-            CraftingCalculation instance,
-            Operation<ICraftingPlan> original,
-            PlanningAttemptContext context) {
-        context.report(PlanningDiagnosticSnapshot.phase("vanilla"));
-        context.checkpoint();
-        return original.call(instance);
     }
 
     @Unique
