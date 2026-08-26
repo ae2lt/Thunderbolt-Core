@@ -6,14 +6,13 @@ on:
 
 jobs:
   build:
-    name: Build and publish Maven package
+    name: Build release
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      packages: write
+      packages: read
     env:
       TAG: ${{ github.event.release.tag_name }}
-      GITHUB_PACKAGES_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
@@ -42,13 +41,6 @@ jobs:
       # timing-sensitive verification suite. Run the full suite in PR/branch CI.
       - name: Build release
         run: ./gradlew --no-daemon clean build -x check --max-workers 1
-
-      - name: Publish Maven package to GitHub Packages
-        run: ./gradlew --no-daemon publishMavenJavaPublicationToGitHubPackagesRepository
-        env:
-          GITHUB_ACTOR: ${{ github.actor }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GITHUB_PACKAGES_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Prepare distributable JAR
         shell: bash
