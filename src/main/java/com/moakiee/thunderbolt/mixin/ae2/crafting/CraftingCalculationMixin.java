@@ -194,6 +194,11 @@ public abstract class CraftingCalculationMixin implements CraftingPlanningContro
                     CraftingAlgorithmCalculationStatus.select(
                             simRequester, CraftingPlanningEngines.VANILLA_ID);
                     return result;
+                } catch (PlanningCandidateDeclinedException declined) {
+                    // Vanilla is always the last candidate (enforced in configurePlanning), so this
+                    // decline always lands on the ALL_FAILED plan below.
+                    thunderbolt$declinedEngines.incrementAndGet();
+                    continue;
                 } finally {
                     thunderbolt$activeVanilla = false;
                 }
