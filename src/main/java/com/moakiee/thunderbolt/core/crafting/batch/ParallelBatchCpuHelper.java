@@ -241,7 +241,7 @@ public final class ParallelBatchCpuHelper {
     public static void registerExpectedOutputs(BatchJobView job, IPatternDetails details,
                                                BulkResult result, long dispatched) {
         if (dispatched <= 0) return;
-        registerPatternOutputs(job, details, dispatched);
+        registerPatternOutputs(job, details, dispatched, result.hasSharedInputs());
         if (result.remainders != null) {
             for (var remainder : result.remainders) {
                 long copies = remainder.shared ? 1L : dispatched;
@@ -258,12 +258,22 @@ public final class ParallelBatchCpuHelper {
     public static void registerExpectedOutputs(BatchJobView job, IPatternDetails details,
                                                AEKey[] chosenKeys, long dispatched) {
         if (dispatched <= 0) return;
-        registerPatternOutputs(job, details, dispatched);
+        boolean sharedBatch = false;
+        if (chosenKeys != null) {
+            for (int slot = 0; slot < chosenKeys.length; slot++) {
+                if (SharedBatchInputs.isSharedInput(details, slot, chosenKeys[slot])) {
+                    sharedBatch = true;
+                    break;
+                }
+            }
+        }
+        registerPatternOutputs(job, details, dispatched, sharedBatch);
         registerLegacyRemainders(job, details, chosenKeys, null, dispatched);
     }
 
-    private static void registerPatternOutputs(BatchJobView job, IPatternDetails details, long dispatched) {
-        var sharedPattern = details instanceof SharedBatchInputPattern pattern
+    private static void registerPatternOutputs(
+            BatchJobView job, IPatternDetails details, long dispatched, boolean sharedBatch) {
+        var sharedPattern = sharedBatch && details instanceof SharedBatchInputPattern pattern
                 ? pattern : null;
         var sharedOutputsLeft = new HashMap<AEKey, Long>();
         for (var output : details.getOutputs()) {
