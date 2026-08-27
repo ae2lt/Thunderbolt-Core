@@ -254,4 +254,6 @@ jobs:
           version: ${{ needs.build.outputs.platform_version }}
           loaders: ${{ needs.build.outputs.loader }}
           game-versions: ${{ needs.build.outputs.game_version }}
+          dependencies: |
+            ae2(required){modrinth:XxWD5pD3}{curseforge:223794}
           changelog: ${{ github.event.release.body }}
