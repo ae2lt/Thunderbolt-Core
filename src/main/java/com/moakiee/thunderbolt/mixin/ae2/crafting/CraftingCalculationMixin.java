@@ -186,7 +186,8 @@ public abstract class CraftingCalculationMixin implements CraftingPlanningContro
                 try {
                     ICraftingPlan result = original.call(instance);
                     if (result == null) {
-                        throw new PlanningCandidateDeclinedException();
+                        thunderbolt$declinedEngines.incrementAndGet();
+                        break;
                     }
                     this.simulate = result.simulation();
                     thunderbolt$selectedVanilla = true;
