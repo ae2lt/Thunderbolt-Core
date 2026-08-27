@@ -19,15 +19,70 @@ jobs:
       TAG: ${{ github.event.release.tag_name }}
     outputs:
       version: ${{ steps.version.outputs.version }}
+      artifact_id: ${{ steps.target.outputs.artifact_id }}
+      game_version: ${{ steps.target.outputs.game_version }}
+      loader: ${{ steps.target.outputs.loader }}
+      platform_version: ${{ steps.target.outputs.platform_version }}
     steps:
       - name: Check out source
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.event.release.tag_name }}
 
-      - name: Set up Java 21
+      - name: Resolve release target
+        id: target
+        shell: bash
+        run: |
+          set -euo pipefail
+          game_version="$(sed -n 's/^minecraft_version=//p' gradle.properties)"
+          case "$game_version" in
+            1.21.1)
+              if [[ ! "$TAG" =~ ^v([0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?)$ ]]; then
+                echo "Minecraft 1.21.1 releases require tag v<version>; received: $TAG" >&2
+                exit 1
+              fi
+              release_version="${BASH_REMATCH[1]}"
+              java_version=21
+              artifact_id=thunderbolt
+              jar_file="thunderbolt-$release_version.jar"
+              loader=neoforge
+              platform_version="$release_version"
+              metadata_file=META-INF/neoforge.mods.toml
+              ;;
+            1.20.1)
+              if [[ ! "$TAG" =~ ^forge-1\.20\.1-v([0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?)$ ]]; then
+                echo "Minecraft 1.20.1 releases require tag forge-1.20.1-v<version>; received: $TAG" >&2
+                exit 1
+              fi
+              release_version="${BASH_REMATCH[1]}"
+              java_version=17
+              artifact_id=thunderbolt-forge-1.20.1
+              jar_file="thunderbolt-forge-1.20.1-$release_version.jar"
+              loader=forge
+              platform_version="$release_version-forge.1.20.1"
+              metadata_file=META-INF/mods.toml
+              ;;
+            *)
+              echo "Unsupported Minecraft release target: $game_version" >&2
+              exit 1
+              ;;
+          esac
+          {
+            echo "game_version=$game_version"
+            echo "release_version=$release_version"
+            echo "java_version=$java_version"
+            echo "artifact_id=$artifact_id"
+            echo "jar_file=$jar_file"
+            echo "loader=$loader"
+            echo "platform_version=$platform_version"
+            echo "metadata_file=$metadata_file"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Set up Java ${{ steps.target.outputs.java_version }}
         uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
         with:
           distribution: temurin
-          java-version: '21'
+          java-version: ${{ steps.target.outputs.java_version }}
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@48b5f213c81028ace310571dc5ec0fbbca0b2947 # v4
@@ -36,9 +91,13 @@ jobs:
         id: version
         shell: bash
         run: |
+          set -euo pipefail
           VERSION="$(./gradlew --no-daemon -q printProjectVersion)"
-          EXPECTED="${TAG#v}"
-          test "$VERSION" = "$EXPECTED"
+          EXPECTED="${{ steps.target.outputs.release_version }}"
+          if [ "$VERSION" != "$EXPECTED" ]; then
+            echo "Tag version $EXPECTED does not match Gradle version $VERSION" >&2
+            exit 1
+          fi
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
       # Timing-sensitive checks are intentionally excluded from release packaging.
@@ -50,48 +109,81 @@ jobs:
         shell: bash
         env:
           VERSION: ${{ steps.version.outputs.version }}
+          ARTIFACT_ID: ${{ steps.target.outputs.artifact_id }}
+          JAR_FILE: ${{ steps.target.outputs.jar_file }}
           GITHUB_ACTOR: ${{ github.actor }}
           GITHUB_PACKAGES_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          jar_path="build/libs/thunderbolt-$VERSION.jar"
+          set -euo pipefail
+          jar_path="build/libs/$JAR_FILE"
           test -f "$jar_path"
-          package_url="https://maven.pkg.github.com/ae2lt/Thunderbolt-Core/com/moakiee/thunderbolt/thunderbolt/$VERSION/thunderbolt-$VERSION.jar"
+          package_base="https://maven.pkg.github.com/ae2lt/Thunderbolt-Core/com/moakiee/thunderbolt/$ARTIFACT_ID/$VERSION/$ARTIFACT_ID-$VERSION"
           downloaded_jar="$(mktemp)"
-          trap 'rm -f "$downloaded_jar"' EXIT
+          downloaded_pom="$(mktemp)"
+          trap 'rm -f "$downloaded_jar" "$downloaded_pom"' EXIT
 
-          if curl --silent --show-error --fail --location \
-            --user "$GITHUB_ACTOR:$GITHUB_PACKAGES_TOKEN" \
-            --output "$downloaded_jar" "$package_url"; then
+          download_status() {
+            local url="$1" output="$2" status
+            if ! status="$(curl --silent --show-error --location \
+              --user "$GITHUB_ACTOR:$GITHUB_PACKAGES_TOKEN" \
+              --output "$output" --write-out '%{http_code}' "$url")"; then
+              echo "Failed to contact GitHub Packages: $url" >&2
+              exit 1
+            fi
+            printf '%s' "$status"
+          }
+
+          jar_status="$(download_status "$package_base.jar" "$downloaded_jar")"
+          pom_status="$(download_status "$package_base.pom" "$downloaded_pom")"
+          if [ "$jar_status" = 200 ] && [ "$pom_status" = 200 ]; then
+            jar tf "$downloaded_jar" >/dev/null
+            python3 - "$downloaded_pom" "$ARTIFACT_ID" "$VERSION" <<'PY'
+          import sys
+          import xml.etree.ElementTree as ET
+
+          root = ET.parse(sys.argv[1]).getroot()
+          ns = root.tag.partition('}')[0] + '}' if root.tag.startswith('{') else ''
+          expected = {
+              'groupId': 'com.moakiee.thunderbolt',
+              'artifactId': sys.argv[2],
+              'version': sys.argv[3],
+          }
+          for name, value in expected.items():
+              actual = root.findtext(f'{ns}{name}')
+              if actual != value:
+                  raise SystemExit(f'Unexpected Maven POM {name}: {actual!r} != {value!r}')
+          PY
             mv "$downloaded_jar" "$jar_path"
-            echo "Using the immutable Maven artifact already published for $VERSION."
-          else
+            echo "Using the complete immutable Maven publication already available for $ARTIFACT_ID:$VERSION."
+          elif [ "$jar_status" = 404 ] && [ "$pom_status" = 404 ]; then
             ./gradlew --no-daemon publishMavenJavaPublicationToGitHubPackagesRepository
+          else
+            echo "GitHub Packages returned inconsistent or non-retryable responses (JAR=$jar_status, POM=$pom_status)." >&2
+            exit 1
           fi
 
       - name: Prepare distributable JAR
         shell: bash
         env:
           VERSION: ${{ steps.version.outputs.version }}
+          JAR_FILE: ${{ steps.target.outputs.jar_file }}
+          METADATA_FILE: ${{ steps.target.outputs.metadata_file }}
         run: |
+          set -euo pipefail
           rm -rf release-artifacts
           mkdir -p release-artifacts
-          mapfile -t jars < <(find build/libs -maxdepth 1 -type f -name '*.jar' \
-            ! -name '*-sources.jar' ! -name '*-javadoc.jar' ! -name '*-slim.jar' | sort)
-          if [ "${#jars[@]}" -ne 1 ]; then
-            printf 'Expected exactly one distributable JAR, found %s:\n' "${#jars[@]}"
-            printf '  %s\n' "${jars[@]}"
-            exit 1
-          fi
+          jar_path="build/libs/$JAR_FILE"
+          test -f "$jar_path"
 
-          jar_entries="$(jar tf "${jars[0]}")"
+          jar_entries="$(jar tf "$jar_path")"
           grep -Fxq 'com/moakiee/thunderbolt/ThunderboltCore.class' <<< "$jar_entries"
-          metadata="$(unzip -p "${jars[0]}" META-INF/neoforge.mods.toml)"
+          metadata="$(unzip -p "$jar_path" "$METADATA_FILE")"
           compact_metadata="$(tr -d '[:space:]' <<< "$metadata")"
           grep -Fq 'modId="thunderbolt"' <<< "$compact_metadata"
           grep -Fq "version=\"$VERSION\"" <<< "$compact_metadata"
 
-          cp "${jars[0]}" release-artifacts/
-          (cd release-artifacts && sha256sum "$(basename "${jars[0]}")" > SHA256SUMS)
+          cp "$jar_path" release-artifacts/
+          (cd release-artifacts && sha256sum "$JAR_FILE" > SHA256SUMS)
 
       - name: Upload build artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -158,6 +250,8 @@ jobs:
           curseforge-id: 1631756
           curseforge-token: ${{ secrets.CURSEFORGE_TOKEN || secrets.CURSEFORGE }}
           files: release-artifacts/*.jar
-          name: Thunderbolt Core ${{ needs.build.outputs.version }}
-          version: ${{ needs.build.outputs.version }}
+          name: Thunderbolt Core ${{ needs.build.outputs.version }} (${{ needs.build.outputs.loader }} ${{ needs.build.outputs.game_version }})
+          version: ${{ needs.build.outputs.platform_version }}
+          loaders: ${{ needs.build.outputs.loader }}
+          game-versions: ${{ needs.build.outputs.game_version }}
           changelog: ${{ github.event.release.body }}
