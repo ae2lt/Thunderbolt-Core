@@ -31,10 +31,3 @@ ${mod_description}
     versionRange="${ae2_version_range}"
     ordering="AFTER"
     side="BOTH"
-
-[[dependencies.${mod_id}]]
-    modId="guideme"
-    mandatory=true
-    versionRange="${guideme_version_range}"
-    ordering="AFTER"
-    side="BOTH"

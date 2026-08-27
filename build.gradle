@@ -273,7 +273,6 @@ processResources {
         forge_version_range    : forge_version_range,
         loader_version_range   : loader_version_range,
         ae2_version_range      : ae2_version_range,
-        guideme_version_range  : guideme_version_range,
         mod_id                 : mod_id,
         mod_name               : mod_name,
         mod_license            : mod_license,
