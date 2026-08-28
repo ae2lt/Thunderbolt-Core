@@ -89,17 +89,14 @@ import com.moakiee.thunderbolt.core.crafting.support.CraftingPatternDelegates;
  * CPU logic), which sees the real extraction. The planner intentionally does not try to predict AE2's
  * runtime fuzzy resolution here — see the batch CPU logic for the execution-side fix.
  *
- * <p><b>Planning-side ID_ONLY (ignore-NBT) aggregation.</b> Overload patterns may mark an input slot
- * {@code ID_ONLY}: at execution any stack sharing the item id is accepted regardless of NBT. For such a
- * slot the planner expands the candidate set with every same-item stack already in the network (via
- * {@code findFuzzyTemplates}/{@code IGNORE_ALL}) <em>and</em> every same-item key some pattern can
- * craft ({@code ICraftingService#getCraftables}), so the slot can be supplied by stock under any NBT
- * and by any producer pattern — strict plain, strict overload, or ID_ONLY overload (whose declared
- * outputs are component-wiped, see {@code Ae2OverloadPatternDetails}) — regardless of which NBT
- * variant that producer declares. Without this the planner would only see the exact declared template
- * and report a false shortfall whenever the item is held or crafted under a different NBT variant.
- * STRICT slots are intentionally not expanded: a producer whose output NBT differs must not satisfy
- * them.
+ * <p><b>Planning-side input discovery.</b> Every input follows AE2's native contract: each
+ * {@link IPatternDetails.IInput#getPossibleInputs()} entry anchors one primary-identity candidate
+ * group, and concrete stocked/craftable keys from those groups are retained only when
+ * {@link IPatternDetails.IInput#isValid(AEKey, Level)} accepts them. This works for ordinary AE2
+ * substitutions, tags and custom matchers without requiring a Thunderbolt interface. Optional
+ * {@link FuzzyPatternInputs#acceptsSameIdVariants(int)} metadata is only a closure proof: it permits a
+ * late-bound same-id output to feed that slot, while an unmarked arbitrary accepted-key set may still
+ * consume any concrete output that {@code isValid} accepts.
  *
  * <p>Byte accounting reproduces AE2's formulas (see {@code CraftingTreeNode#request},
  * {@code CraftingTreeProcess#request} and {@code ICraftingSimulationState#addStackBytes}) over the
@@ -350,7 +347,7 @@ public final class FastCraftingPlanner {
         Set<Item> conservativeDurabilityItems = new HashSet<>();
         Map<AEKey, RequirementMode> forcedRequirementModes = new HashMap<>();
         GraphExportBudget exportBudget = new GraphExportBudget(MAX_GRAPH_EXPORT_WORK);
-        PrimaryIdentityCraftables idOnlyCraftables = new PrimaryIdentityCraftables(
+        PrimaryIdentityCraftables primaryIdentityCraftables = new PrimaryIdentityCraftables(
                 () -> craftingService.getCraftables(ignored -> true), exportBudget);
         GraphBuild graphBuild;
         try {
@@ -361,7 +358,7 @@ public final class FastCraftingPlanner {
                         craftingService, snapshot, reusableSeedSnapshot, level, output,
                         graphBuild.builder, graphBuild.multiplePaths, graphBuild.durability,
                         graphBuild.patternSources, graphBuild.emittable, conservativeDurabilityItems,
-                        forcedRequirementModes, idOnlyCraftables, exportBudget, reservedStock);
+                        forcedRequirementModes, primaryIdentityCraftables, exportBudget, reservedStock);
                 boolean durabilityChanged = conservativeDurabilityItems.addAll(
                         discovery.durabilityConflicts());
                 boolean requirementChanged = mergeForcedRequirementModes(
@@ -483,7 +480,7 @@ public final class FastCraftingPlanner {
                                       Set<AEKey> emittable,
                                       Set<Item> conservativeDurabilityItems,
                                       Map<AEKey, RequirementMode> forcedRequirementModes,
-                                      PrimaryIdentityCraftables idOnlyCraftables,
+                                      PrimaryIdentityCraftables primaryIdentityCraftables,
                                       GraphExportBudget exportBudget,
                                       @Nullable CraftingStockPolicy reservedStock) {
         Set<AEKey> seen = new HashSet<>();
@@ -629,9 +626,9 @@ public final class FastCraftingPlanner {
 
                 // Per-slot acceptable concrete options for the hard-fuzzy (OR) expansion.
                 IPatternDetails.IInput[] inputs = details.getInputs();
-                // Overload patterns expose per-slot match modes; an ID_ONLY (ignore-NBT) slot accepts
-                // every stocked or craftable key with the same primary identity. Resolve the provider
-                // view through wrappers so matching does not depend on the adapter nesting order.
+                // Resolve optional same-id closure metadata through wrappers. Concrete candidates do
+                // not depend on this interface: all slots use getPossibleInputs as discovery anchors
+                // and isValid as the authoritative membership test, matching AE2.
                 var providerDetails = CraftingPatternDelegates.forProviderLookup(details);
                 FuzzyPatternInputs overloadView =
                         providerDetails instanceof FuzzyPatternInputs op
@@ -674,9 +671,10 @@ public final class FastCraftingPlanner {
                         slotRequirementModes.add(RequirementMode.STRICT);
                         continue; // single deterministic option, never enqueued for crafting
                     }
-                    boolean idOnly = overloadView != null && overloadView.acceptsSameIdVariants(slot);
-                    List<GenericStack> templates = idOnlyTemplates(
-                            in, idOnly, snapshot, idOnlyCraftables, exportBudget);
+                    boolean sameIdClosure = overloadView != null
+                            && overloadView.acceptsSameIdVariants(slot);
+                    List<GenericStack> templates = inputTemplates(
+                            in, snapshot, primaryIdentityCraftables, level, exportBudget);
                     templates = addConservativeDurabilityTemplates(
                             in, templates, craftingService, snapshot, level,
                             conservativeDurabilityItems, exportBudget);
@@ -752,7 +750,7 @@ public final class FastCraftingPlanner {
                     List<SlotChoice> choices = expandSlotChoices(opts, in.getMultiplier(), availability);
                     slotOptions.add(choices);
                     slotRequirementModes.add(
-                            idOnly ? RequirementMode.ID_ONLY : RequirementMode.STRICT);
+                            sameIdClosure ? RequirementMode.ID_ONLY : RequirementMode.STRICT);
                     // Saturating product: a raw `combos *= opts.size()` can overflow Long for patterns
                     // with many fuzzy slots over large tags, wrapping to a small value that slips past
                     // the budget check below. Sat.mul clamps so the budget comparison stays correct.
@@ -782,68 +780,69 @@ public final class FastCraftingPlanner {
     }
 
     /**
-     * Concrete templates to consider for one input slot. A normal slot uses the pattern's declared
-     * possible inputs verbatim. An ID_ONLY (ignore-NBT) overload slot additionally pulls every same-item
-     * stack already in the network ({@code findFuzzyTemplates} uses {@code FuzzyMode.IGNORE_ALL} = same
-     * item id regardless of NBT/damage) <em>and</em> every same-item key any pattern can craft
-     * ({@code ICraftingService#getCraftables} filtered to the template's key type + id), each carrying
-     * the slot's per-craft amount. The v2 planner then treats them as competing inputs and splits
-     * firings across them, so the slot can draw from cross-NBT stock <em>and</em> from producer
-     * patterns declaring a different NBT variant (strict plain, strict overload, or wiped ID_ONLY
-     * overload outputs alike) — eliminating false "missing" when the item is only held or crafted
-     * under an NBT variant the pattern never enumerated. Crafting still works because the declared
-     * template stays first (so its own pattern is discovered) and both the executing CPU's extraction
-     * ({@code CraftingCpuHelper.getValidItemTemplates} filters fuzzy inventory keys through
-     * {@code IInput#isValid}, which an ID_ONLY slot answers by item id) and the provider push
-     * ({@code Ae2OverloadPatternDetails#pushIdOnlyInput}) resolve same-id variants at runtime.
+     * Concrete templates to consider for one input slot. Every declared possible input is a discovery
+     * anchor, exactly as in AE2. For each anchor we inspect same-primary stocked and craftable variants,
+     * then retain only keys accepted by {@link IPatternDetails.IInput#isValid}. The declared templates
+     * remain first so their own producer routes retain precedence. This deliberately does not consult
+     * {@link FuzzyPatternInputs}: arbitrary accepted-key sets work through the native {@code IInput}
+     * contract, while the optional fuzzy declaration is reserved for late-bound output compatibility.
      */
-    private static List<GenericStack> idOnlyTemplates(
+    private static List<GenericStack> inputTemplates(
             IPatternDetails.IInput in,
-            boolean idOnly,
             ChildCraftingSimulationState snapshot,
             PrimaryIdentityCraftables craftableIndex,
+            Level level,
             GraphExportBudget exportBudget) {
-        return expandIdOnlyTemplates(
+        return expandInputTemplates(
                 in,
-                idOnly,
                 snapshot::findFuzzyTemplates,
                 craftableIndex::get,
+                level,
                 exportBudget);
     }
 
-    static List<GenericStack> expandIdOnlyTemplates(
+    static List<GenericStack> expandInputTemplates(
             IPatternDetails.IInput in,
-            boolean idOnly,
-            Function<AEKey, ? extends Iterable<AEKey>> stockedVariants,
-            Function<AEKey, ? extends Iterable<AEKey>> craftableVariants) {
-        return expandIdOnlyTemplates(
-                in, idOnly, stockedVariants, craftableVariants, null);
-    }
-
-    private static List<GenericStack> expandIdOnlyTemplates(
-            IPatternDetails.IInput in,
-            boolean idOnly,
             Function<AEKey, ? extends Iterable<AEKey>> stockedVariants,
             Function<AEKey, ? extends Iterable<AEKey>> craftableVariants,
+            Level level) {
+        return expandInputTemplates(
+                in, stockedVariants, craftableVariants, level, null);
+    }
+
+    private static List<GenericStack> expandInputTemplates(
+            IPatternDetails.IInput in,
+            Function<AEKey, ? extends Iterable<AEKey>> stockedVariants,
+            Function<AEKey, ? extends Iterable<AEKey>> craftableVariants,
+            Level level,
             @Nullable GraphExportBudget exportBudget) {
         GenericStack[] possible = in.getPossibleInputs();
-        if (!idOnly) {
-            return Arrays.asList(possible);
-        }
         LinkedHashMap<AEKey, GenericStack> byKey = new LinkedHashMap<>();
         for (GenericStack template : possible) {
             consumeExportWork(exportBudget);
+            if (template == null || template.what() == null) {
+                continue;
+            }
             byKey.putIfAbsent(template.what(), template);
-            for (AEKey fuzzy : stockedVariants.apply(template.what())) {
-                consumeExportWork(exportBudget);
-                byKey.putIfAbsent(fuzzy, new GenericStack(fuzzy, template.amount()));
+            var stocked = stockedVariants.apply(template.what());
+            if (stocked != null) {
+                for (AEKey candidate : stocked) {
+                    consumeExportWork(exportBudget);
+                    if (candidate != null && in.isValid(candidate, level)) {
+                        byKey.putIfAbsent(
+                                candidate, new GenericStack(candidate, template.amount()));
+                    }
+                }
             }
             AEKey identity = template.what().dropSecondary();
-            for (AEKey craftable : craftableVariants.apply(identity)) {
-                consumeExportWork(exportBudget);
-                if (PatternInputMatchPolicy.accepts(
-                        possible, true, craftable, false)) {
-                    byKey.putIfAbsent(craftable, new GenericStack(craftable, template.amount()));
+            var craftables = craftableVariants.apply(identity);
+            if (craftables != null) {
+                for (AEKey candidate : craftables) {
+                    consumeExportWork(exportBudget);
+                    if (candidate != null && in.isValid(candidate, level)) {
+                        byKey.putIfAbsent(
+                                candidate, new GenericStack(candidate, template.amount()));
+                    }
                 }
             }
         }

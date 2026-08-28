@@ -45,13 +45,12 @@ import com.moakiee.thunderbolt.core.crafting.pattern.FuzzyPatternInputs;
 import org.junit.jupiter.api.Test;
 
 /**
- * Locks the planner-side supply matrix of overload ID_ONLY slots ("误报缺失" regression):
+ * Locks the planner-side accepted-key and late-bound output matrix ("误报缺失" regression):
  * <ul>
- *   <li>an ID_ONLY input can be supplied by any producer pattern sharing the item id — strict
- *       plain, strict overload, or (wiped) ID_ONLY overload outputs all appear to the planner as
- *       "a craftable same-id variant" and must be discovered even with zero stock of any variant;</li>
- *   <li>a STRICT slot must NOT borrow a same-id variant whose components differ;</li>
- *   <li>stocked same-id variants keep satisfying ID_ONLY slots (pre-existing behavior).</li>
+ *   <li>every input discovers concrete candidates through AE2's native
+ *       {@code getPossibleInputs + isValid} contract, without requiring a Thunderbolt interface;</li>
+ *   <li>a declared same-id input closure additionally permits a late-bound same-id output;</li>
+ *   <li>a late-bound output must not satisfy strict or merely partially-overlapping input demand.</li>
  * </ul>
  * Uses a key type whose {@code getId()} is shared across "component variants" while equality is
  * per-variant, mirroring how {@code AEItemKey} exposes one item id across NBT variants.
@@ -136,8 +135,8 @@ class FastCraftingPlannerIdOnlyCraftableVariantTest {
         });
         // Same shape, but the overload slot is STRICT: components differ -> must stay missing.
         IPatternDetails consumer = new FakeOverloadPattern(TARGET, new IPatternDetails.IInput[] {
-                new FakeInput(MAT_DECLARED, 1)
-        }, Set.of());
+                new StrictInput(MAT_DECLARED, 1)
+        }, Set.of(), Set.of());
 
         var service = new FakeCraftingService()
                 .pattern(TARGET, consumer)
@@ -159,7 +158,7 @@ class FastCraftingPlannerIdOnlyCraftableVariantTest {
     void idOnlySlotStillUsesStockedSameIdVariant() {
         IPatternDetails consumer = new FakeOverloadPattern(TARGET, new IPatternDetails.IInput[] {
                 new FakeInput(MAT_DECLARED, 1)
-        }, Set.of(0));
+        }, Set.of(0), Set.of());
 
         var service = new FakeCraftingService().pattern(TARGET, consumer).craftable(TARGET);
         var networkInv = new ChildCraftingSimulationState(new StockInventory(Map.of(MAT_STOCKED, 2L)));
@@ -170,6 +169,85 @@ class FastCraftingPlannerIdOnlyCraftableVariantTest {
         assertNotNull(attempt.plan());
         assertTrue(attempt.plan().missingItems().isEmpty());
         assertEquals(1L, attempt.plan().usedItems().get(MAT_STOCKED));
+    }
+
+    @Test
+    void ordinaryInputUsesNativeIsValidWithoutFuzzyInterface() {
+        IPatternDetails producesVariant = new FakePattern(MAT_CRAFTABLE, new IPatternDetails.IInput[] {
+                new StrictInput(BASE, 1)
+        });
+        IPatternDetails consumer = new FakePattern(TARGET, new IPatternDetails.IInput[] {
+                new FakeInput(MAT_DECLARED, 1)
+        });
+
+        var service = new FakeCraftingService()
+                .pattern(TARGET, consumer)
+                .pattern(MAT_CRAFTABLE, producesVariant)
+                .craftable(TARGET).craftable(MAT_CRAFTABLE);
+        var networkInv = new ChildCraftingSimulationState(new StockInventory(Map.of(BASE, 1L)));
+
+        var attempt = FastCraftingPlanner.tryAttempt(service, networkInv, null, TARGET, 1, false);
+
+        assertTrue(attempt.handled());
+        assertNotNull(attempt.plan());
+        assertTrue(attempt.plan().missingItems().isEmpty());
+        assertEquals(1L, attempt.plan().patternTimes().get(producesVariant));
+        assertEquals(1L, attempt.plan().patternTimes().get(consumer));
+    }
+
+    @Test
+    void lateBoundOutputFeedsDeclaredSameIdInput() {
+        IPatternDetails fuzzyProducer = new FakeOverloadPattern(
+                MAT_CRAFTABLE,
+                new IPatternDetails.IInput[] {new StrictInput(BASE, 1)},
+                Set.of(),
+                Set.of(0));
+        IPatternDetails fuzzyConsumer = new FakeOverloadPattern(
+                TARGET,
+                new IPatternDetails.IInput[] {new FakeInput(MAT_DECLARED, 1)},
+                Set.of(0),
+                Set.of());
+
+        var service = new FakeCraftingService()
+                .pattern(TARGET, fuzzyConsumer)
+                .pattern(MAT_CRAFTABLE, fuzzyProducer)
+                .craftable(TARGET).craftable(MAT_CRAFTABLE);
+        var networkInv = new ChildCraftingSimulationState(new StockInventory(Map.of(BASE, 1L)));
+
+        var attempt = FastCraftingPlanner.tryAttempt(service, networkInv, null, TARGET, 1, false);
+
+        assertTrue(attempt.handled());
+        assertNotNull(attempt.plan());
+        assertTrue(attempt.plan().missingItems().isEmpty());
+        assertEquals(1L, attempt.plan().patternTimes().get(fuzzyProducer));
+        assertEquals(1L, attempt.plan().patternTimes().get(fuzzyConsumer));
+    }
+
+    @Test
+    void lateBoundOutputDoesNotFeedUnmarkedAcceptedKeySet() {
+        IPatternDetails fuzzyProducer = new FakeOverloadPattern(
+                MAT_CRAFTABLE,
+                new IPatternDetails.IInput[] {new StrictInput(BASE, 1)},
+                Set.of(),
+                Set.of(0));
+        // isValid accepts MAT_CRAFTABLE, but without the closure declaration the output's unknown
+        // runtime component state cannot be proven safe for this input.
+        IPatternDetails consumer = new FakePattern(TARGET, new IPatternDetails.IInput[] {
+                new FakeInput(MAT_DECLARED, 1)
+        });
+
+        var service = new FakeCraftingService()
+                .pattern(TARGET, consumer)
+                .pattern(MAT_CRAFTABLE, fuzzyProducer)
+                .craftable(TARGET).craftable(MAT_CRAFTABLE);
+        var networkInv = new ChildCraftingSimulationState(new StockInventory(Map.of(BASE, 1L)));
+
+        var attempt = FastCraftingPlanner.tryAttempt(service, networkInv, null, TARGET, 1, false);
+
+        assertTrue(attempt.handled());
+        assertNull(attempt.plan());
+        assertNotNull(attempt.simulationFallback());
+        assertNull(attempt.simulationFallback().patternTimes().get(fuzzyProducer));
     }
 
     @Test
@@ -244,8 +322,16 @@ class FastCraftingPlannerIdOnlyCraftableVariantTest {
      * {@link FuzzyPatternInputs#acceptsSameIdVariants(int)} accessor the planner consults,
      * without depending on a product-specific pattern implementation.
      */
-    private record FakeOverloadPattern(AEKey output, IInput[] inputs, Set<Integer> idOnlySlots)
+    private record FakeOverloadPattern(
+            AEKey output,
+            IInput[] inputs,
+            Set<Integer> idOnlySlots,
+            Set<Integer> idOnlyOutputSlots)
             implements IPatternDetails, FuzzyPatternInputs {
+        private FakeOverloadPattern(AEKey output, IInput[] inputs, Set<Integer> idOnlySlots) {
+            this(output, inputs, idOnlySlots, Set.of());
+        }
+
         @Override public AEItemKey getDefinition() { return null; }
         @Override public IInput[] getInputs() { return inputs; }
         @Override public appeng.api.stacks.GenericStack[] getOutputs() {
@@ -253,6 +339,9 @@ class FastCraftingPlannerIdOnlyCraftableVariantTest {
                     new appeng.api.stacks.GenericStack(output, 1) };
         }
         @Override public boolean acceptsSameIdVariants(int slot) { return idOnlySlots.contains(slot); }
+        @Override public boolean producesSameIdVariants(int slot) {
+            return idOnlyOutputSlots.contains(slot);
+        }
     }
 
     private record FakeInput(AEKey key, long amount) implements IPatternDetails.IInput {
@@ -263,6 +352,18 @@ class FastCraftingPlannerIdOnlyCraftableVariantTest {
         @Override public long getMultiplier() { return 1; }
         @Override public boolean isValid(AEKey candidate, Level level) {
             return candidate.getId().equals(key.getId());
+        }
+        @Override public AEKey getRemainingKey(AEKey template) { return null; }
+    }
+
+    private record StrictInput(AEKey key, long amount) implements IPatternDetails.IInput {
+        @Override public appeng.api.stacks.GenericStack[] getPossibleInputs() {
+            return new appeng.api.stacks.GenericStack[] {
+                    new appeng.api.stacks.GenericStack(key, amount) };
+        }
+        @Override public long getMultiplier() { return 1; }
+        @Override public boolean isValid(AEKey candidate, Level level) {
+            return key.equals(candidate);
         }
         @Override public AEKey getRemainingKey(AEKey template) { return null; }
     }

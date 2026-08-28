@@ -29,7 +29,7 @@ class FastCraftingPlannerOverloadMatchingTest {
     private static final AEKey OTHER_ITEM = new TestKey("iron", "damaged");
 
     @Test
-    void idOnlyExpansionIncludesCraftableVariantsThatAreNotInStock() {
+    void nativeInputExpansionIncludesValidCraftableVariantsThatAreNotInStock() {
         IPatternDetails.IInput input = new IPatternDetails.IInput() {
             @Override public GenericStack[] getPossibleInputs() {
                 return new GenericStack[] {new GenericStack(TEMPLATE, 3)};
@@ -41,17 +41,42 @@ class FastCraftingPlannerOverloadMatchingTest {
             @Override public AEKey getRemainingKey(AEKey template) { return null; }
         };
 
-        var expanded = FastCraftingPlanner.expandIdOnlyTemplates(
+        var expanded = FastCraftingPlanner.expandInputTemplates(
                 input,
-                true,
                 ignored -> List.of(),
-                ignored -> List.of(CRAFTABLE_VARIANT));
+                ignored -> List.of(CRAFTABLE_VARIANT),
+                null);
 
         assertEquals(2, expanded.size());
         assertTrue(expanded.stream().anyMatch(stack -> stack.what().equals(CRAFTABLE_VARIANT)));
         assertEquals(3L, expanded.stream()
                 .filter(stack -> stack.what().equals(CRAFTABLE_VARIANT))
                 .findFirst().orElseThrow().amount());
+    }
+
+    @Test
+    void nativeInputExpansionFiltersEveryDiscoveredCandidateThroughIsValid() {
+        IPatternDetails.IInput input = new IPatternDetails.IInput() {
+            @Override public GenericStack[] getPossibleInputs() {
+                return new GenericStack[] {new GenericStack(TEMPLATE, 2)};
+            }
+            @Override public long getMultiplier() { return 1; }
+            @Override public boolean isValid(AEKey key, Level level) {
+                return TEMPLATE.equals(key) || CRAFTABLE_VARIANT.equals(key);
+            }
+            @Override public AEKey getRemainingKey(AEKey template) { return null; }
+        };
+
+        var rejectedStock = new TestKey("paper", "rejected-stock");
+        var rejectedCraftable = new TestKey("paper", "rejected-craftable");
+        var expanded = FastCraftingPlanner.expandInputTemplates(
+                input,
+                ignored -> List.of(CRAFTABLE_VARIANT, rejectedStock),
+                ignored -> List.of(CRAFTABLE_VARIANT, rejectedCraftable),
+                null);
+
+        assertEquals(List.of(TEMPLATE, CRAFTABLE_VARIANT),
+                expanded.stream().map(GenericStack::what).toList());
     }
 
     @Test
