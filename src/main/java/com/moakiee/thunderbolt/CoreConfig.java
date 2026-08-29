@@ -12,6 +12,7 @@ public final class CoreConfig {
      * setup via {@link #setChannelsPerController(int)} so the value stays user-configurable.
      */
     private static volatile int channelsPerController = 128;
+    private static volatile boolean channelMaxFlowRequired;
     private static volatile BatchCopyLimitRules batchCopyLimitRules =
             new BatchCopyLimitRules(0L, FastWildcardMatcher.empty());
 
@@ -21,6 +22,15 @@ public final class CoreConfig {
 
     public static void setChannelsPerController(int value) {
         channelsPerController = value;
+    }
+
+    public static boolean channelMaxFlowRequired() {
+        return channelMaxFlowRequired;
+    }
+
+    /** Declares that a loaded consumer mod requires Thunderbolt channel routing. */
+    public static void requireChannelMaxFlow() {
+        channelMaxFlowRequired = true;
     }
 
     /**
