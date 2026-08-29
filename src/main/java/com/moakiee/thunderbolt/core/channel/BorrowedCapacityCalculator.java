@@ -23,6 +23,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import com.moakiee.thunderbolt.api.channel.ChannelSourceRegistry;
+import com.moakiee.thunderbolt.api.channel.ChannelRequestProvider;
 import com.moakiee.thunderbolt.api.channel.ConnectionChannelCapacityProvider;
 
 /**
@@ -269,12 +270,14 @@ public final class BorrowedCapacityCalculator {
             if (!gn.hasFlag(GridFlags.REQUIRE_CHANNEL)) continue;
             if (multiblockSkip.contains(n)) continue;
             int ci = idx.getInt(n);
+            int requested = gn.getOwner() instanceof ChannelRequestProvider p
+                    ? Math.max(1, p.thunderbolt$getRequestedChannels()) : 1;
             sinkEdgeIndices.add(dinic.edgeCount());
-            dinic.addEdge(2 * ci + 1, T, 1);
+            dinic.addEdge(2 * ci + 1, T, requested);
             sinkNodes.add(n);
         }
 
-        int maxFlow = dinic.maxFlow(S, T, sinkNodes.size());
+        int maxFlow = dinic.maxFlow(S, T, Integer.MAX_VALUE / 2);
 
         LOG.debug("maxFlow={}, network={}, sinks={}, capacitySources={}, supply/ctrl={}",
                 maxFlow, network.size(), sinkNodes.size(), capacitySources.size(), supply);
@@ -283,8 +286,14 @@ public final class BorrowedCapacityCalculator {
         Set<GridNode> winners = new ReferenceOpenHashSet<>();
         for (int j = 0; j < sinkNodes.size(); j++) {
             int edgeIdx = sinkEdgeIndices.getInt(j);
-            if (dinic.residual(edgeIdx) == 0) {
+            int requested = sinkNodes.get(j).getOwner() instanceof ChannelRequestProvider p
+                    ? Math.max(1, p.thunderbolt$getRequestedChannels()) : 1;
+            int assigned = requested - dinic.residual(edgeIdx);
+            if (assigned >= requested) {
                 winners.add((GridNode) sinkNodes.get(j));
+            }
+            if (sinkNodes.get(j).getOwner() instanceof ChannelRequestProvider p) {
+                p.thunderbolt$setUsedChannels(assigned);
             }
         }
 
