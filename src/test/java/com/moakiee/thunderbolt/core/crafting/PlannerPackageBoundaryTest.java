@@ -59,6 +59,12 @@ class PlannerPackageBoundaryTest {
         assertTrue(source.contains("ICraftingPlan result = original.call(instance);"));
         assertTrue(isolatedExecution > vanillaBranch,
                 "vanilla must return through AE2 before engine isolation begins");
+        var vanillaSource = source.substring(vanillaBranch, isolatedExecution);
+        assertTrue(vanillaSource.contains("if (result == null)"));
+        assertTrue(vanillaSource.contains("thunderbolt$declinedEngines.incrementAndGet();"));
+        assertTrue(vanillaSource.contains("break;"),
+                "a declined terminal vanilla candidate must reach ALL_FAILED");
+        assertFalse(vanillaSource.contains("throw new PlanningCandidateDeclinedException()"));
         assertFalse(source.contains("thunderbolt$runVanillaCandidate"));
         assertTrue(source.contains("try (session)"));
         assertFalse(source.contains("PlanningAttemptMonitor.start("));

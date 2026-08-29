@@ -1,8 +1,11 @@
 package com.moakiee.thunderbolt.core.crafting.batch;
 
+import java.util.HashMap;
 import java.util.IdentityHashMap;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Predicate;
 
 import appeng.api.config.Actionable;
@@ -10,6 +13,7 @@ import appeng.api.config.PowerMultiplier;
 import appeng.api.crafting.IPatternDetails;
 import appeng.api.networking.crafting.ICraftingProvider;
 import appeng.api.networking.energy.IEnergyService;
+import appeng.api.stacks.AEKey;
 import appeng.api.stacks.KeyCounter;
 import appeng.crafting.execution.CraftingCpuHelper;
 import appeng.crafting.inv.ListCraftingInventory;
@@ -22,6 +26,9 @@ import com.moakiee.thunderbolt.core.crafting.batch.BatchCopyLimitPattern;
 import com.moakiee.thunderbolt.core.crafting.support.CraftingPatternDelegates;
 
 public final class BatchExecutor {
+    private static final Set<String> REPORTED_SHARED_SEMANTIC_MISMATCHES =
+            ConcurrentHashMap.newKeySet();
+
     private BatchExecutor() {
     }
 
@@ -186,7 +193,7 @@ public final class BatchExecutor {
             }
 
             var details = task.details();
-            var executionDetails = CraftingPatternDelegates.forProviderLookup(details);
+            var executionDetails = CraftingPatternDelegates.forBatchExecution(details);
             if (shouldSkip(executionDetails)) {
                 continue;
             }
@@ -296,6 +303,11 @@ public final class BatchExecutor {
                             .thenComparing(EligibleProvider::capacity, java.util.Comparator.reverseOrder()));
                     eligible.subList(1, eligible.size()).clear();
                 }
+            }
+            if (!sharedBatchSemanticsMatch(details, executionDetails, result)) {
+                ParallelBatchCpuHelper.reinject(result, result.actualCopies, inv);
+                reportSharedSemanticMismatch(details, executionDetails, eligible);
+                continue;
             }
 
             long realCraft = result.actualCopies;
@@ -427,6 +439,70 @@ public final class BatchExecutor {
     private static long saturatingAdd(long left, long right) {
         if (right <= 0) return left;
         return left > Long.MAX_VALUE - right ? Long.MAX_VALUE : left + right;
+    }
+
+    static boolean sharedBatchSemanticsMatch(
+            IPatternDetails taskDetails,
+            IPatternDetails executionDetails,
+            ParallelBatchCpuHelper.BulkResult result) {
+        if (!result.hasSharedInputs()) return true;
+
+        for (int slot = 0; slot < result.sharedPerBatch.length; slot++) {
+            for (var entry : result.sharedPerBatch[slot]) {
+                if (!SharedBatchInputs.isSharedInput(
+                        executionDetails, slot, entry.getKey())) {
+                    return false;
+                }
+            }
+        }
+
+        var taskOutputs = outputAmounts(taskDetails);
+        var executionOutputs = outputAmounts(executionDetails);
+        if (!taskOutputs.equals(executionOutputs)) return false;
+
+        for (var output : taskOutputs.entrySet()) {
+            long taskShared = sharedOutputAmount(
+                    taskDetails, output.getKey(), output.getValue());
+            long executionShared = sharedOutputAmount(
+                    executionDetails, output.getKey(), output.getValue());
+            if (taskShared != executionShared) return false;
+        }
+        return true;
+    }
+
+    private static Map<AEKey, Long> outputAmounts(IPatternDetails details) {
+        var result = new HashMap<AEKey, Long>();
+        for (var output : details.getOutputs()) {
+            if (output.what() != null && output.amount() > 0) {
+                result.merge(output.what(), output.amount(), BatchExecutor::saturatingAdd);
+            }
+        }
+        return result;
+    }
+
+    private static long sharedOutputAmount(
+            IPatternDetails details, AEKey outputKey, long totalOutput) {
+        if (!(details instanceof SharedBatchInputPattern shared)) return 0L;
+        return Math.min(totalOutput, Math.max(0L, shared.sharedBatchOutputAmount(outputKey)));
+    }
+
+    private static void reportSharedSemanticMismatch(
+            IPatternDetails taskDetails,
+            IPatternDetails executionDetails,
+            Iterable<EligibleProvider> providers) {
+        var providerTypes = new java.util.TreeSet<String>();
+        for (var provider : providers) {
+            providerTypes.add(provider.identity().getClass().getName());
+        }
+        var key = taskDetails.getClass().getName() + " -> "
+                + executionDetails.getClass().getName() + " -> " + providerTypes;
+        if (REPORTED_SHARED_SEMANTIC_MISMATCHES.add(key)) {
+            appeng.core.AELog.warn(
+                    "[thunderbolt] Blocking shared-input batch because task, execution and provider semantics disagree. task=%s execution=%s providers=%s",
+                    taskDetails.getClass().getName(),
+                    executionDetails.getClass().getName(),
+                    providerTypes);
+        }
     }
 
     private static long floorToLong(double value) {
