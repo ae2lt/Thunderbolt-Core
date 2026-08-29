@@ -1,9 +1,10 @@
 package com.moakiee.thunderbolt.config;
 
 import net.neoforged.neoforge.common.ModConfigSpec;
-import net.neoforged.fml.loading.LoadingModList;
 import appeng.api.networking.IGrid;
+import appeng.api.networking.IGridNode;
 import com.moakiee.thunderbolt.api.channel.ChannelSourceRegistry;
+import com.moakiee.thunderbolt.api.channel.ChannelRequestProvider;
 import com.moakiee.thunderbolt.core.channel.HighCapacityChannelSupport;
 
 /** Common configuration for optional Thunderbolt runtime components. */
@@ -40,10 +41,22 @@ public final class ThunderboltCommonConfig {
         if (!hasControllers) return false;
         return switch (CHANNEL_MODE.get()) {
             case ON -> true;
-            case MOD -> LoadingModList.get().getModFileById("ae2lt") != null;
+            case MOD -> hasOptInOwner(grid) || hasChannelSource(grid);
             case DEVICE -> HighCapacityChannelSupport.getAllControllerNodes(grid).stream()
                     .anyMatch(node -> ChannelSourceRegistry.isChannelSource(node.getOwner()));
         };
+    }
+
+    private static boolean hasOptInOwner(IGrid grid) {
+        for (IGridNode node : grid.getNodes()) {
+            if (node.getOwner() instanceof ChannelRequestProvider) return true;
+        }
+        return false;
+    }
+
+    private static boolean hasChannelSource(IGrid grid) {
+        return HighCapacityChannelSupport.getAllControllerNodes(grid).stream()
+                .anyMatch(node -> ChannelSourceRegistry.isChannelSource(node.getOwner()));
     }
 
     public enum ChannelMode { MOD, DEVICE, ON }
