@@ -16,6 +16,7 @@ public final class CoreConfig {
      * setup via {@link #setChannelsPerController(int)} so the value stays user-configurable.
      */
     private static volatile int channelsPerController = 128;
+    private static volatile boolean channelMaxFlowRequired;
     private static volatile BatchCopyLimitRules batchCopyLimitRules =
             new BatchCopyLimitRules(0L, FastWildcardMatcher.empty());
 
@@ -31,6 +32,15 @@ public final class CoreConfig {
             LOGGER.warn("非法的 channelsPerController 配置值: {}，已钳制为 {}", value, clamped);
         }
         channelsPerController = clamped;
+    }
+
+    public static boolean channelMaxFlowRequired() {
+        return channelMaxFlowRequired;
+    }
+
+    /** Declares that a loaded consumer mod requires Thunderbolt channel routing. */
+    public static void requireChannelMaxFlow() {
+        channelMaxFlowRequired = true;
     }
 
     /**
