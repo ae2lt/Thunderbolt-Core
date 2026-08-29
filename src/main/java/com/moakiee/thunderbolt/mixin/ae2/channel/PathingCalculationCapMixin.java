@@ -12,6 +12,7 @@ import com.moakiee.thunderbolt.core.channel.BorrowedCapacityCalculator;
 import com.moakiee.thunderbolt.api.channel.ChannelSourceRegistry;
 import com.moakiee.thunderbolt.core.channel.HighCapacityChannelSupport;
 import com.moakiee.thunderbolt.core.channel.HighCapacitySubtreeNode;
+import com.moakiee.thunderbolt.config.ThunderboltCommonConfig;
 import it.unimi.dsi.fastutil.objects.ReferenceOpenHashSet;
 import org.spongepowered.asm.mixin.Final;
 import org.spongepowered.asm.mixin.Mixin;
@@ -84,7 +85,8 @@ public abstract class PathingCalculationCapMixin {
         thunderbolt$capacitySources = capacitySources;
         boolean hasControllers = !allControllers.isEmpty();
         var channelMode = grid.getPathingService().getChannelMode();
-        thunderbolt$useMaxFlow = hasControllers && channelMode != ChannelMode.INFINITE;
+        thunderbolt$useMaxFlow = channelMode != ChannelMode.INFINITE
+                && ThunderboltCommonConfig.useMaxFlow(grid, hasControllers);
 
         // Controller-root unification is part of our max-flow path. In infinite
         // mode AE2's own allocator already has unbounded capacity, so it must
