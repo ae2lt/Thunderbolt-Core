@@ -5,6 +5,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.time.Duration;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.LockSupport;
 
@@ -16,9 +17,10 @@ import com.moakiee.thunderbolt.api.crafting.PlanningExitException;
 
 class PlanningAttemptMonitorTest {
     @Test
-    void budgetExpiryIsCooperativeAndHardDeadlineInterruptsCandidate() throws Exception {
+    void budgetExpiryInterruptAndIsolationAreDistinctStages() throws Exception {
         var engineId = new ResourceLocation("thunderbolt_test", "slow");
         var monitorReady = new CompletableFuture<PlanningAttemptMonitor>();
+        var interruptObserved = new CountDownLatch(1);
         var outcome = new CompletableFuture<Outcome>();
         var worker = new Thread(() -> {
             var monitor = PlanningAttemptMonitor.startForTest(
@@ -26,11 +28,15 @@ class PlanningAttemptMonitorTest {
                     "monitor test",
                     0,
                     30,
-                    200);
+                    250,
+                    550);
             monitorReady.complete(monitor);
             boolean timeoutThrown = false;
             try {
-                while (!Thread.currentThread().isInterrupted()) {
+                while (!monitor.isolated()) {
+                    if (Thread.interrupted()) {
+                        interruptObserved.countDown();
+                    }
                     LockSupport.parkNanos(TimeUnit.MILLISECONDS.toNanos(1));
                 }
                 try {
@@ -39,7 +45,8 @@ class PlanningAttemptMonitorTest {
                     timeoutThrown = true;
                 }
                 outcome.complete(new Outcome(
-                        monitor.timedOut(), timeoutThrown, Thread.currentThread().isInterrupted()));
+                        monitor.timedOut(), timeoutThrown, monitor.interruptSent(),
+                        monitor.isolated()));
             } catch (Throwable failure) {
                 outcome.completeExceptionally(failure);
             } finally {
@@ -51,13 +58,18 @@ class PlanningAttemptMonitorTest {
         var monitor = monitorReady.get(1, TimeUnit.SECONDS);
         waitUntil(monitor::timedOut);
         assertFalse(worker.isInterrupted(), "budget expiry must not interrupt the candidate");
-        waitUntil(monitor::hardTimedOut);
+        assertTrue(interruptObserved.await(1, TimeUnit.SECONDS));
+        assertTrue(monitor.interruptSent());
+        assertFalse(monitor.isolated(),
+                "sending interrupt must not quarantine at the same boundary");
+        waitUntil(monitor::isolated);
         var beforeClose = outcome.get(2, TimeUnit.SECONDS);
         worker.join(2_000);
 
         assertTrue(beforeClose.timedOut());
         assertTrue(beforeClose.timeoutThrown());
-        assertTrue(beforeClose.interruptedBeforeClose());
+        assertTrue(beforeClose.interruptSent());
+        assertTrue(beforeClose.isolated());
         assertFalse(worker.isAlive());
         assertFalse(worker.isInterrupted());
     }
@@ -73,6 +85,7 @@ class PlanningAttemptMonitorTest {
     private record Outcome(
             boolean timedOut,
             boolean timeoutThrown,
-            boolean interruptedBeforeClose) {
+            boolean interruptSent,
+            boolean isolated) {
     }
 }

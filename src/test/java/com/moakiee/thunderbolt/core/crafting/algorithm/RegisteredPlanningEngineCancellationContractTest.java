@@ -52,13 +52,34 @@ class RegisteredPlanningEngineCancellationContractTest {
 
         var result = org.junit.jupiter.api.Assertions.assertTimeoutPreemptively(
                 Duration.ofSeconds(2),
-                () -> executeRegistered(engine, 20L, 1_000L));
+                () -> executeRegistered(engine, 20L, 100L, 1_000L));
 
         assertEquals(PlanningCandidateExecutor.Status.SUCCESS, result.status());
         assertSame(PlanningAttempt.DECLINE, result.value());
         assertTrue(ranOnIsolatedThread.get());
         assertTrue(timeoutObserved.get());
         assertFalse(interrupted.get());
+        assertFalse(PlanningCandidateExecutor.isQuarantined(engine.id()));
+    }
+
+    @Test
+    void ae2StyleInterruptResponsiveEngineIsNotQuarantined() {
+        var interrupted = new AtomicBoolean();
+        var engine = register("interrupt_responsive", context -> {
+            while (!Thread.interrupted()) {
+                Thread.onSpinWait();
+            }
+            interrupted.set(true);
+            return PlanningAttempt.DECLINE;
+        });
+
+        var result = org.junit.jupiter.api.Assertions.assertTimeoutPreemptively(
+                Duration.ofSeconds(2),
+                () -> executeRegistered(engine, 20L, 30L, 120L));
+
+        assertEquals(PlanningCandidateExecutor.Status.SUCCESS, result.status());
+        assertSame(PlanningAttempt.DECLINE, result.value());
+        assertTrue(interrupted.get());
         assertFalse(PlanningCandidateExecutor.isQuarantined(engine.id()));
     }
 
@@ -83,7 +104,7 @@ class RegisteredPlanningEngineCancellationContractTest {
 
         var result = org.junit.jupiter.api.Assertions.assertTimeoutPreemptively(
                 Duration.ofSeconds(2),
-                () -> executeRegistered(engine, 20L, 30L));
+                () -> executeRegistered(engine, 20L, 30L, 60L));
 
         assertTrue(started.await(1, TimeUnit.SECONDS));
         assertEquals(PlanningCandidateExecutor.Status.HARD_TIMEOUT, result.status());
@@ -111,7 +132,10 @@ class RegisteredPlanningEngineCancellationContractTest {
     }
 
     private static PlanningCandidateExecutor.Result<PlanningAttempt> executeRegistered(
-            ProbeEngine engine, long timeoutMs, long stopGraceMs) throws InterruptedException {
+            ProbeEngine engine,
+            long timeoutMs,
+            long interruptGraceMs,
+            long isolationGraceMs) throws InterruptedException {
         return PlanningCandidateExecutor.executeForTest(
                 engine.id(),
                 "registered planning engine cancellation contract",
@@ -123,7 +147,8 @@ class RegisteredPlanningEngineCancellationContractTest {
                 },
                 Thread::yield,
                 timeoutMs,
-                stopGraceMs);
+                interruptGraceMs,
+                isolationGraceMs);
     }
 
     private static ResourceLocation id(String path) {

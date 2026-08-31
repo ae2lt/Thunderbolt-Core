@@ -17,7 +17,7 @@ import com.moakiee.thunderbolt.api.crafting.PlanningAttemptContext;
 import com.moakiee.thunderbolt.api.crafting.PlanningDiagnosticSnapshot;
 import com.moakiee.thunderbolt.api.crafting.PlanningExitException;
 
-/** Generic per-candidate computation budget, cooperative exit grace and diagnostics. */
+/** Generic per-candidate computation budget, staged cancellation and diagnostics. */
 final class PlanningAttemptMonitor implements PlanningAttemptContext, AutoCloseable {
     private static final Logger LOG = LoggerFactory.getLogger("thunderbolt-crafting-planning");
 
@@ -26,13 +26,16 @@ final class PlanningAttemptMonitor implements PlanningAttemptContext, AutoClosea
             Long.getLong("thunderbolt.watchdogMs", 2_000L)));
     private static final long DEFAULT_TIMEOUT_MS = Math.max(1L, Long.getLong(
             "thunderbolt.planningTimeoutMs", 3_000L));
-    private static final long DEFAULT_STOP_GRACE_MS = Math.max(0L, Long.getLong(
-            "thunderbolt.planningStopGraceMs", 1_000L));
+    private static final long DEFAULT_INTERRUPT_GRACE_MS = Math.max(0L, Long.getLong(
+            "thunderbolt.planningInterruptGraceMs", 2_000L));
+    private static final long DEFAULT_STOP_GRACE_MS = Math.max(
+            DEFAULT_INTERRUPT_GRACE_MS,
+            Long.getLong("thunderbolt.planningStopGraceMs", 5_000L));
 
     private static final int ACTIVE = 0;
-    private static final int BUDGET_EXPIRED = 1;
-    private static final int EXTERNAL_EXIT_REQUESTED = 2;
-    private static final int HARD_TIMED_OUT = 3;
+    private static final int EXIT_REQUESTED = 1;
+    private static final int INTERRUPT_SENT = 2;
+    private static final int ISOLATED = 3;
     private static final int CLOSED = 4;
 
     private static final ScheduledExecutorService EXECUTOR =
@@ -46,48 +49,63 @@ final class PlanningAttemptMonitor implements PlanningAttemptContext, AutoClosea
     private final Thread calculationThread;
     private final long startedNanos;
     private final long deadlineNanos;
-    private final long hardDeadlineNanos;
-    private final long stopGraceMs;
+    private final long interruptDeadlineNanos;
+    private final long isolationDeadlineNanos;
+    private final long postInterruptGraceMs;
     private final Runnable hardTimeoutAction;
     private final AtomicInteger state = new AtomicInteger(ACTIVE);
     private final ScheduledFuture<?> warningTask;
     private final ScheduledFuture<?> budgetExpiryTask;
-    private final ScheduledFuture<?> hardTimeoutTask;
-    private volatile ScheduledFuture<?> externalCancellationHardTimeoutTask;
+    private final ScheduledFuture<?> interruptTask;
+    private final ScheduledFuture<?> isolationTask;
+    private volatile ScheduledFuture<?> externalCancellationIsolationTask;
 
     private volatile PlanningDiagnosticSnapshot latest = PlanningDiagnosticSnapshot.phase("starting");
+    private volatile boolean externalExitRequested;
     private volatile boolean timeoutObserved;
-    private volatile boolean hardTimeoutObserved;
+    private volatile boolean interruptObserved;
+    private volatile boolean isolationObserved;
 
     private PlanningAttemptMonitor(
             ResourceLocation engineId,
             String label,
             long warnMs,
             long timeoutMs,
-            long stopGraceMs,
+            long interruptGraceMs,
+            long isolationGraceMs,
             Runnable hardTimeoutAction) {
+        long boundedInterruptGraceMs = Math.max(0L, interruptGraceMs);
+        long boundedIsolationGraceMs = Math.max(
+                boundedInterruptGraceMs, isolationGraceMs);
         this.engineId = engineId;
         this.label = label;
         this.calculationThread = Thread.currentThread();
         this.startedNanos = System.nanoTime();
         this.deadlineNanos = saturatedDeadline(startedNanos, timeoutMs);
-        this.hardDeadlineNanos = saturatedDeadline(deadlineNanos, stopGraceMs);
-        this.stopGraceMs = stopGraceMs;
+        this.interruptDeadlineNanos = saturatedDeadline(
+                deadlineNanos, boundedInterruptGraceMs);
+        this.isolationDeadlineNanos = saturatedDeadline(
+                deadlineNanos, boundedIsolationGraceMs);
+        this.postInterruptGraceMs = boundedIsolationGraceMs - boundedInterruptGraceMs;
         this.hardTimeoutAction = hardTimeoutAction;
         this.warningTask = warnMs <= 0L || warnMs >= timeoutMs
                 ? null
                 : EXECUTOR.schedule(this::warnSlow, warnMs, TimeUnit.MILLISECONDS);
         this.budgetExpiryTask = EXECUTOR.schedule(
                 this::expireBudget, timeoutMs, TimeUnit.MILLISECONDS);
-        this.hardTimeoutTask = EXECUTOR.schedule(
-                this::hardTimeout, saturatedAdd(timeoutMs, stopGraceMs), TimeUnit.MILLISECONDS);
+        this.interruptTask = EXECUTOR.schedule(
+                this::interruptAfterGrace,
+                saturatedAdd(timeoutMs, boundedInterruptGraceMs), TimeUnit.MILLISECONDS);
+        this.isolationTask = EXECUTOR.schedule(
+                this::isolateAfterGrace,
+                saturatedAdd(timeoutMs, boundedIsolationGraceMs), TimeUnit.MILLISECONDS);
     }
 
     static PlanningAttemptMonitor start(
             ResourceLocation engineId, String label, Runnable hardTimeoutAction) {
         return new PlanningAttemptMonitor(
-                engineId, label, DEFAULT_WARN_MS, DEFAULT_TIMEOUT_MS, DEFAULT_STOP_GRACE_MS,
-                hardTimeoutAction);
+                engineId, label, DEFAULT_WARN_MS, DEFAULT_TIMEOUT_MS,
+                DEFAULT_INTERRUPT_GRACE_MS, DEFAULT_STOP_GRACE_MS, hardTimeoutAction);
     }
 
     static PlanningAttemptMonitor startForTest(
@@ -95,9 +113,11 @@ final class PlanningAttemptMonitor implements PlanningAttemptContext, AutoClosea
             String label,
             long warnMs,
             long timeoutMs,
-            long stopGraceMs) {
+            long interruptGraceMs,
+            long isolationGraceMs) {
         return new PlanningAttemptMonitor(
-                engineId, label, warnMs, timeoutMs, stopGraceMs, () -> { });
+                engineId, label, warnMs, timeoutMs,
+                interruptGraceMs, isolationGraceMs, () -> { });
     }
 
     static PlanningAttemptMonitor startForTest(
@@ -105,10 +125,12 @@ final class PlanningAttemptMonitor implements PlanningAttemptContext, AutoClosea
             String label,
             long warnMs,
             long timeoutMs,
-            long stopGraceMs,
+            long interruptGraceMs,
+            long isolationGraceMs,
             Runnable hardTimeoutAction) {
         return new PlanningAttemptMonitor(
-                engineId, label, warnMs, timeoutMs, stopGraceMs, hardTimeoutAction);
+                engineId, label, warnMs, timeoutMs,
+                interruptGraceMs, isolationGraceMs, hardTimeoutAction);
     }
 
     @Override
@@ -120,15 +142,25 @@ final class PlanningAttemptMonitor implements PlanningAttemptContext, AutoClosea
     public void checkpoint() {
         int current = state.get();
         long now = System.nanoTime();
-        if (current == HARD_TIMED_OUT || now - hardDeadlineNanos >= 0L) {
-            markHardTimeout();
+        if (current == ISOLATED) {
+            isolateCandidate();
             throw new PlanningExitException("planning candidate exceeded its stop grace: " + engineId);
         }
-        if (current == BUDGET_EXPIRED || current == EXTERNAL_EXIT_REQUESTED
-                || now - deadlineNanos >= 0L) {
-            if (state.compareAndSet(ACTIVE, BUDGET_EXPIRED)) {
-                timeoutObserved = true;
-            }
+        if (externalExitRequested) {
+            publishInterrupt();
+            throw new PlanningExitException("planning candidate was cancelled: " + engineId);
+        }
+        if (now - isolationDeadlineNanos >= 0L) {
+            isolateCandidate();
+            throw new PlanningExitException("planning candidate exceeded its stop grace: " + engineId);
+        }
+        if (current == INTERRUPT_SENT || now - interruptDeadlineNanos >= 0L) {
+            interruptCandidate();
+            throw new PlanningExitException("planning candidate was interrupted after its grace: "
+                    + engineId);
+        }
+        if (current == EXIT_REQUESTED || now - deadlineNanos >= 0L) {
+            expireBudget();
             throw new PlanningExitException("planning candidate must exit: " + engineId);
         }
         if (Thread.currentThread().isInterrupted()) {
@@ -140,13 +172,23 @@ final class PlanningAttemptMonitor implements PlanningAttemptContext, AutoClosea
     void acceptReturnedResult() {
         while (true) {
             int current = state.get();
-            if (current == HARD_TIMED_OUT || System.nanoTime() - hardDeadlineNanos >= 0L) {
-                markHardTimeout();
+            long now = System.nanoTime();
+            if (current == ISOLATED) {
+                isolateCandidate();
                 throw new PlanningExitException(
                         "planning candidate exceeded its stop grace: " + engineId);
             }
-            if (current == EXTERNAL_EXIT_REQUESTED) {
+            if (externalExitRequested) {
+                publishInterrupt();
                 throw new PlanningExitException("planning candidate was cancelled: " + engineId);
+            }
+            if (now - isolationDeadlineNanos >= 0L) {
+                isolateCandidate();
+                throw new PlanningExitException(
+                        "planning candidate exceeded its stop grace: " + engineId);
+            }
+            if (current != INTERRUPT_SENT && now - interruptDeadlineNanos >= 0L) {
+                interruptCandidate();
             }
             if (Thread.currentThread().isInterrupted()) {
                 throw new CancellationException("crafting calculation interrupted");
@@ -169,28 +211,33 @@ final class PlanningAttemptMonitor implements PlanningAttemptContext, AutoClosea
         return timeoutObserved;
     }
 
-    boolean hardTimedOut() {
-        return hardTimeoutObserved;
+    boolean interruptSent() {
+        return interruptObserved;
+    }
+
+    boolean isolated() {
+        return isolationObserved;
     }
 
     /**
-     * Forwards an outer cancellation as a cooperative exit request. The caller detaches
-     * immediately, but the candidate gets its own grace period before hard interruption.
+     * Forwards an outer AE2 cancellation as both the cooperative exit state and the native AE2
+     * interrupt signal. The caller detaches immediately; quarantine is delayed so an
+     * interrupt-responsive candidate can finish its exception unwinding and cleanup normally.
      */
     void requestExitForExternalCancellation() {
+        externalExitRequested = true;
         while (true) {
             int current = state.get();
-            if (current == CLOSED || current == HARD_TIMED_OUT) {
+            if (current == CLOSED || current == ISOLATED) {
                 return;
             }
-            if (current == EXTERNAL_EXIT_REQUESTED) {
-                return;
-            }
-            if (state.compareAndSet(current, EXTERNAL_EXIT_REQUESTED)) {
+            if (current == INTERRUPT_SENT || state.compareAndSet(current, INTERRUPT_SENT)) {
                 break;
             }
         }
-        scheduleExternalCancellationHardTimeout();
+        cancelNormalDeadlineTasks();
+        publishInterrupt();
+        scheduleExternalCancellationIsolation();
     }
 
     private void warnSlow() {
@@ -203,7 +250,7 @@ final class PlanningAttemptMonitor implements PlanningAttemptContext, AutoClosea
     }
 
     private void expireBudget() {
-        if (!state.compareAndSet(ACTIVE, BUDGET_EXPIRED)) {
+        if (!state.compareAndSet(ACTIVE, EXIT_REQUESTED)) {
             return;
         }
         timeoutObserved = true;
@@ -213,31 +260,60 @@ final class PlanningAttemptMonitor implements PlanningAttemptContext, AutoClosea
                 engineId, elapsedMillis(), label, diagnosticDump(true)));
     }
 
-    private void hardTimeout() {
-        if (!markHardTimeout()) {
+    private void interruptAfterGrace() {
+        if (!interruptCandidate()) {
             return;
         }
-        runDiagnostic(() -> LOG.error(
-                "[Thunderbolt Core] planning candidate did not exit within its grace period; "
-                        + "interrupting it now: engine={} elapsedMs={} {}\n{}",
+        runDiagnostic(() -> LOG.warn(
+                "[Thunderbolt Core] planning candidate did not exit after cooperative grace; "
+                        + "interrupting without quarantine: engine={} elapsedMs={} {}\n{}",
                 engineId, elapsedMillis(), label, diagnosticDump(true)));
     }
 
-    private boolean markHardTimeout() {
+    private boolean interruptCandidate() {
         while (true) {
             int current = state.get();
-            if (current == CLOSED || current == HARD_TIMED_OUT) {
+            if (current == CLOSED || current == ISOLATED || current == INTERRUPT_SENT) {
                 return false;
             }
-            if (state.compareAndSet(current, HARD_TIMED_OUT)) {
+            if (state.compareAndSet(current, INTERRUPT_SENT)) {
+                timeoutObserved = true;
+                publishInterrupt();
+                return true;
+            }
+        }
+    }
+
+    private void publishInterrupt() {
+        calculationThread.interrupt();
+        interruptObserved = true;
+    }
+
+    private void isolateAfterGrace() {
+        if (!isolateCandidate()) {
+            return;
+        }
+        runDiagnostic(() -> LOG.error(
+                "[Thunderbolt Core] planning candidate did not exit after interrupt grace; "
+                        + "quarantining it now: engine={} elapsedMs={} {}\n{}",
+                engineId, elapsedMillis(), label, diagnosticDump(true)));
+    }
+
+    private boolean isolateCandidate() {
+        interruptCandidate();
+        while (true) {
+            int current = state.get();
+            if (current == CLOSED || current == ISOLATED) {
+                return false;
+            }
+            if (state.compareAndSet(current, ISOLATED)) {
                 timeoutObserved = true;
                 try {
                     hardTimeoutAction.run();
                 } finally {
-                    calculationThread.interrupt();
-                    // Publish completion only after quarantine and interruption are in effect.
-                    // The owning calculation thread can then detach without repeating either.
-                    hardTimeoutObserved = true;
+                    // Publish completion only after quarantine is in effect. The owning
+                    // calculation thread can then detach without racing a new invocation.
+                    isolationObserved = true;
                 }
                 return true;
             }
@@ -267,9 +343,9 @@ final class PlanningAttemptMonitor implements PlanningAttemptContext, AutoClosea
 
     @Override
     public void close() {
-        int previous = state.getAndSet(CLOSED);
+        state.getAndSet(CLOSED);
         cancelScheduledTasks();
-        if (previous == HARD_TIMED_OUT && Thread.currentThread() == calculationThread) {
+        if (interruptObserved && Thread.currentThread() == calculationThread) {
             Thread.interrupted();
         }
     }
@@ -279,24 +355,35 @@ final class PlanningAttemptMonitor implements PlanningAttemptContext, AutoClosea
             warningTask.cancel(false);
         }
         budgetExpiryTask.cancel(false);
-        hardTimeoutTask.cancel(false);
-        var externalHardTimeout = externalCancellationHardTimeoutTask;
-        if (externalHardTimeout != null) {
-            externalHardTimeout.cancel(false);
+        interruptTask.cancel(false);
+        isolationTask.cancel(false);
+        var externalIsolation = externalCancellationIsolationTask;
+        if (externalIsolation != null) {
+            externalIsolation.cancel(false);
         }
     }
 
-    private void scheduleExternalCancellationHardTimeout() {
+    private void cancelNormalDeadlineTasks() {
+        if (warningTask != null) {
+            warningTask.cancel(false);
+        }
+        budgetExpiryTask.cancel(false);
+        interruptTask.cancel(false);
+        isolationTask.cancel(false);
+    }
+
+    private void scheduleExternalCancellationIsolation() {
         final ScheduledFuture<?> task;
         try {
-            task = EXECUTOR.schedule(this::hardTimeout, stopGraceMs, TimeUnit.MILLISECONDS);
+            task = EXECUTOR.schedule(
+                    this::isolateAfterGrace, postInterruptGraceMs, TimeUnit.MILLISECONDS);
         } catch (RuntimeException schedulingFailure) {
             // Losing the cancellation timer must not leave an abandoned candidate running
             // without a hard boundary.
-            markHardTimeout();
+            isolateCandidate();
             return;
         }
-        externalCancellationHardTimeoutTask = task;
+        externalCancellationIsolationTask = task;
         if (state.get() == CLOSED) {
             task.cancel(false);
         }
