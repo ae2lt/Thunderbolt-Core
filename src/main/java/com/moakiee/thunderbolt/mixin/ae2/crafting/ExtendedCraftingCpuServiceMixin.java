@@ -246,6 +246,12 @@ public abstract class ExtendedCraftingCpuServiceMixin implements ExtendedCraftin
             CallbackInfoReturnable<ICraftingSubmitResult> cir,
             @Local CraftingCPUCluster cpuCluster,
             @Local MutableObject<UnsuitableCpus> unsuitableCpusResult) {
+        // A non-null target may belong to another crafting CPU add-on. Leave explicit requests
+        // to that add-on's submit hook instead of turning them back into automatic selection.
+        if (target != null) {
+            return;
+        }
+
         if (!(job instanceof CraftingPlan)) {
             return;
         }
