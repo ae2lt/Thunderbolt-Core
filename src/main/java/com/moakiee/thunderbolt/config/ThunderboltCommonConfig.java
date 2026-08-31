@@ -3,6 +3,7 @@ package com.moakiee.thunderbolt.config;
 import net.neoforged.neoforge.common.ModConfigSpec;
 import appeng.api.networking.IGrid;
 import appeng.api.networking.IGridNode;
+import com.moakiee.thunderbolt.CoreConfig;
 import com.moakiee.thunderbolt.api.channel.ChannelSourceRegistry;
 import com.moakiee.thunderbolt.api.channel.ChannelRequestProvider;
 import com.moakiee.thunderbolt.api.channel.HighCapacityChannelOwner;
