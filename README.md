@@ -3,62 +3,83 @@
 [简体中文](README_zh_CN.md)
 
 Thunderbolt Core is the shared AE2 optimization and infrastructure layer for
-AE2 Lightning Tech. It can also be installed as a standalone AE2 crafting
+AE2 Lightning Tech. It can also be installed as a standalone AE2 autocrafting
 accelerator.
 
-This repository tracks the **Minecraft Forge 1.20.1** port (branch `1.20.1`) of
-the upstream project. It is kept in sync with
-[ae2lt/Thunderbolt-Core](https://github.com/ae2lt/Thunderbolt-Core) `main` on a
-best-effort basis.
+This is the **Minecraft Forge 1.20.1** branch. For Minecraft 1.21.1 and
+NeoForge, see the [`main`](https://github.com/ae2lt/Thunderbolt-Core/tree/main)
+branch.
 
 ## Requirements
 
 - Minecraft `1.20.1`
-- Forge `47.1.3`+ (not NeoForge)
+- Forge `47.1.3` or newer (not NeoForge)
 - Java `17`
-- Applied Energistics 2 `15.4.10` (or any 1.20.1 release that keeps the
-  patched crafting classes stable)
+- Applied Energistics 2 `15.4.10`–`15.x`
 
-Place Thunderbolt Core and AE2 in the `mods` directory on both the client and
+Install Thunderbolt Core and AE2 in the `mods` directory on both the client and
 server.
 
 ## Features
 
-- fast AE2 autocrafting planning and batch dispatch (linear-time planner
-  installed on AE2's `CraftingCalculation` via mixin)
-- crafting extension APIs for compatible addons
-- overloaded-channel and matrix-crafting infrastructure for AE2LT
-- infinite indexed-cell storage backend
-- time-wheel crafting CPU scheduling and closed-loop crafting support
+- faster AE2 autocrafting planning with ordered planner selection and native
+  AE2 fallback
+- batch dispatch, closed-loop crafting, time-wheel scheduling, and overloaded
+  pattern support
+- extension APIs for crafting providers, high-capacity channels, indexed
+  storage cells, and eject endpoints
+- max-flow channel allocation for compatible high-capacity networks
 - optional compatibility hooks for Advanced AE, NeoECO, AE2 Crafting Tree,
-  and ExtendedAE Plus (loaded only when the corresponding mod is present)
+  and ExtendedAE Plus; hooks load only when the corresponding mod is present
 
-## Runtime Options
+## Configuration
 
-- `-Dthunderbolt.watchdogMs=<ms>`: first slow-planning warning delay
-- `-Dthunderbolt.watchdogRepeatMs=<ms>`: repeated warning interval
-- `-Dthunderbolt.planningTimeoutMs=<ms>`: cooperative candidate deadline (default: 3000)
-- `-Dthunderbolt.planningInterruptGraceMs=<ms>`: grace before interrupt (default: 2000)
-- `-Dthunderbolt.planningStopGraceMs=<ms>`: total post-deadline grace before quarantine (default: 5000)
+Common options are written to `config/thunderbolt-common.toml`:
+
+- `planning.enableCpSatPlanner`: enables the experimental OR-Tools CP-SAT
+  planner (default: `false`). When enabled, Thunderbolt downloads and verifies
+  the matching native runtime at startup. If loading fails, the other planners
+  remain available.
+- `channel.mode`: controls max-flow channel allocation (default: `MOD`). `MOD`
+  enables it when a loaded integration requests it, `DEVICE` also enables it
+  for an opted-in device, and `ON` enables it whenever a controller is present.
+
+Advanced planner diagnostics and safety limits can be set as JVM system
+properties:
+
+- `-Dthunderbolt.planningWarnMs=<ms>`: slow-planning warning delay (default:
+  `2000`; legacy alias: `thunderbolt.watchdogMs`)
+- `-Dthunderbolt.planningTimeoutMs=<ms>`: cooperative exit deadline (default:
+  `3000`)
+- `-Dthunderbolt.planningInterruptGraceMs=<ms>`: grace period before interrupt
+  (default: `2000`)
+- `-Dthunderbolt.planningStopGraceMs=<ms>`: total post-deadline grace before
+  isolation (default: `5000`)
 - `-Dthunderbolt.maxCraftSearchWork=<count>`: planner search-work budget
 - `-Dthunderbolt.maxCraftDepth=<count>`: planner depth limit
 
 ## Development
 
+Build the distributable JAR:
+
 ```powershell
 .\gradlew.bat build
 ```
+
+Publish it to the local Maven repository:
 
 ```powershell
 .\gradlew.bat publishToMavenLocal
 ```
 
-Maven coordinate: `com.moakiee.thunderbolt:thunderbolt:2.0.0-beta.1`.
+- Version: `2.0.0-beta.2`
+- Maven coordinate:
+  `com.moakiee.thunderbolt:thunderbolt-forge-1.20.1:2.0.0-beta.2`
+- Distributable JAR:
+  `build/libs/thunderbolt-forge-1.20.1-2.0.0-beta.2.jar`
 
-The distributable local build is
-`build/libs/thunderbolt-forge-1.20.1-2.0.0-beta.1.jar`.
 The `-slim.jar` artifact does not contain the required MixinExtras jar-in-jar
-dependency and is intended only as an intermediate development artifact.
+dependency and is only an intermediate development artifact.
 
 Issues: [GitHub Issues](https://github.com/ae2lt/Thunderbolt-Core/issues) ·
 License: [GNU LGPL 3.0](LICENSE)
