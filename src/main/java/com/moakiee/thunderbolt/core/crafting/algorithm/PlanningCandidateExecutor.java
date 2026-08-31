@@ -13,8 +13,8 @@ import com.moakiee.thunderbolt.core.crafting.planner.PlanningCancellation;
 
 /**
  * Isolates an engine candidate so a non-cooperative implementation cannot block AE2's worker.
- * The monitor first publishes a cooperative deadline, interrupts after the exit grace, then the
- * caller detaches and quarantines an invocation that still does not return.
+ * The monitor first publishes a cooperative deadline, later interrupts without quarantine, then
+ * detaches and quarantines only an invocation that still does not return after interrupt grace.
  */
 public final class PlanningCandidateExecutor {
     private static final java.util.concurrent.ThreadFactory CANDIDATE_THREADS =
@@ -55,9 +55,11 @@ public final class PlanningCandidateExecutor {
             Work<T> work,
             SchedulerYield schedulerYield,
             long timeoutMs,
-            long stopGraceMs) throws InterruptedException {
+            long interruptGraceMs,
+            long isolationGraceMs) throws InterruptedException {
         return executeForTest(
-                engineId, label, work, schedulerYield, ignored -> { }, timeoutMs, stopGraceMs);
+                engineId, label, work, schedulerYield, ignored -> { },
+                timeoutMs, interruptGraceMs, isolationGraceMs);
     }
 
     static <T> Result<T> executeForTest(
@@ -67,7 +69,8 @@ public final class PlanningCandidateExecutor {
             SchedulerYield schedulerYield,
             Consumer<T> discard,
             long timeoutMs,
-            long stopGraceMs) throws InterruptedException {
+            long interruptGraceMs,
+            long isolationGraceMs) throws InterruptedException {
         return execute(
                 engineId,
                 label,
@@ -75,7 +78,8 @@ public final class PlanningCandidateExecutor {
                 schedulerYield,
                 discard,
                 (id, taskLabel, hardTimeoutAction) -> PlanningAttemptMonitor.startForTest(
-                        id, taskLabel, 0L, timeoutMs, stopGraceMs, hardTimeoutAction));
+                        id, taskLabel, 0L, timeoutMs,
+                        interruptGraceMs, isolationGraceMs, hardTimeoutAction));
     }
 
     static <T> Result<T> executeWithMonitorForTest(
@@ -145,7 +149,7 @@ public final class PlanningCandidateExecutor {
                     throw new InterruptedException("crafting calculation cancelled");
                 }
                 if (!result.isDone()) {
-                    if (monitor.hardTimedOut()) {
+                    if (monitor.isolated()) {
                         return new Result<>(Status.HARD_TIMEOUT, null, null);
                     }
                     schedulerYield.run();
@@ -164,7 +168,7 @@ public final class PlanningCandidateExecutor {
                     }
                     Throwable failure = failed.getCause();
                     return new Result<>(
-                            monitor.hardTimedOut()
+                            monitor.isolated()
                                     ? Status.HARD_TIMEOUT
                                     : monitor.timedOut() ? Status.SOFT_TIMEOUT : Status.FAILED,
                             null,

@@ -27,6 +27,9 @@ server.
 
 - `-Dthunderbolt.watchdogMs=<ms>`: first slow-planning warning delay
 - `-Dthunderbolt.watchdogRepeatMs=<ms>`: repeated warning interval
+- `-Dthunderbolt.planningTimeoutMs=<ms>`: cooperative candidate deadline (default: 3000)
+- `-Dthunderbolt.planningInterruptGraceMs=<ms>`: grace before interrupt (default: 2000)
+- `-Dthunderbolt.planningStopGraceMs=<ms>`: total post-deadline grace before quarantine (default: 5000)
 - `-Dthunderbolt.maxCraftSearchWork=<count>`: planner search-work budget
 - `-Dthunderbolt.maxCraftDepth=<count>`: planner depth limit
 

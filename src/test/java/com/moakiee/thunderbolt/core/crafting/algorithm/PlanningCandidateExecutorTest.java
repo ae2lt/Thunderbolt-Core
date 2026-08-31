@@ -66,6 +66,7 @@ class PlanningCandidateExecutorTest {
                     Thread.yield();
                 },
                 5_000,
+                1_000,
                 5_000);
 
         assertEquals(PlanningCandidateExecutor.Status.SUCCESS, result.status());
@@ -91,6 +92,7 @@ class PlanningCandidateExecutorTest {
                         },
                         Thread::yield,
                         20,
+                        1_000,
                         1_000));
 
         assertEquals(PlanningCandidateExecutor.Status.SOFT_TIMEOUT, result.status());
@@ -123,6 +125,7 @@ class PlanningCandidateExecutorTest {
                             assertTrue(nextTick.await(1, TimeUnit.SECONDS));
                         },
                         5_000,
+                        1_000,
                         5_000));
             } catch (Throwable failure) {
                 outcome.completeExceptionally(failure);
@@ -174,6 +177,7 @@ class PlanningCandidateExecutorTest {
                         () -> { },
                         discarded::complete,
                         5_000,
+                        1_000,
                         5_000);
                 outerCancellation.complete(false);
             } catch (InterruptedException expected) {
@@ -190,8 +194,8 @@ class PlanningCandidateExecutorTest {
         assertTrue(internalExit.get(2, TimeUnit.SECONDS));
         assertTrue(outerCancellation.get(2, TimeUnit.SECONDS));
         assertEquals(42, discarded.get(2, TimeUnit.SECONDS));
-        assertFalse(candidateInterrupted.get(),
-                "ordinary cancellation must reach the candidate without interrupting it");
+        assertTrue(candidateInterrupted.get(),
+                "AE2 cancellation must publish checkpoint exit and interrupt together");
         caller.join(2_000);
         assertFalse(caller.isAlive());
         assertFalse(
@@ -205,7 +209,56 @@ class PlanningCandidateExecutorTest {
     }
 
     @Test
-    void nonCooperativeExternalCancellationUsesItsOwnGraceBeforeHardInterrupt() throws Exception {
+    void interruptResponsiveExternalCancellationExitsWithoutQuarantine() throws Exception {
+        var engineId = id("external_cancel_interrupt_responsive");
+        var started = new CountDownLatch(1);
+        var interruptObserved = new CountDownLatch(1);
+        var outerCancellation = new CompletableFuture<Boolean>();
+        var discarded = new AtomicInteger();
+
+        var caller = Thread.ofPlatform().start(() -> {
+            try {
+                PlanningCandidateExecutor.executeForTest(
+                        engineId,
+                        "interrupt responsive external cancellation test",
+                        context -> {
+                            started.countDown();
+                            while (!Thread.interrupted()) {
+                                Thread.onSpinWait();
+                            }
+                            interruptObserved.countDown();
+                            return 1;
+                        },
+                        Thread::yield,
+                        ignored -> discarded.incrementAndGet(),
+                        5_000,
+                        20,
+                        70);
+                outerCancellation.complete(false);
+            } catch (InterruptedException expected) {
+                outerCancellation.complete(true);
+            } catch (Throwable failure) {
+                outerCancellation.completeExceptionally(failure);
+            }
+        });
+
+        assertTrue(started.await(1, TimeUnit.SECONDS));
+        caller.interrupt();
+        assertTrue(outerCancellation.get(1, TimeUnit.SECONDS));
+        assertTrue(interruptObserved.await(1, TimeUnit.SECONDS));
+        caller.join(1_000L);
+        assertFalse(caller.isAlive());
+        org.junit.jupiter.api.Assertions.assertTimeoutPreemptively(Duration.ofSeconds(1), () -> {
+            while (discarded.get() == 0) {
+                Thread.onSpinWait();
+            }
+        });
+        assertFalse(PlanningCandidateExecutor.isQuarantined(engineId));
+        assertEquals(1, discarded.get());
+    }
+
+    @Test
+    void nonCooperativeExternalCancellationWaitsAfterInterruptBeforeQuarantine() throws Exception {
         var engineId = id("external_cancel_hard_timeout");
         var started = new CountDownLatch(1);
         var interruptObserved = new CountDownLatch(1);
@@ -231,7 +284,8 @@ class PlanningCandidateExecutorTest {
                         Thread::yield,
                         ignored -> discarded.incrementAndGet(),
                         5_000,
-                        50);
+                        20,
+                        220);
                 outerCancellation.complete(false);
             } catch (InterruptedException expected) {
                 outerCancellation.complete(true);
@@ -248,8 +302,14 @@ class PlanningCandidateExecutorTest {
 
         try {
             assertTrue(interruptObserved.await(1, TimeUnit.SECONDS),
-                    "cancellation must use its own grace instead of the original 5 second budget");
-            assertTrue(PlanningCandidateExecutor.isQuarantined(engineId));
+                    "external cancellation must forward AE2 interrupt immediately");
+            assertFalse(PlanningCandidateExecutor.isQuarantined(engineId),
+                    "interrupt delivery must not quarantine at the same boundary");
+            org.junit.jupiter.api.Assertions.assertTimeoutPreemptively(Duration.ofSeconds(1), () -> {
+                while (!PlanningCandidateExecutor.isQuarantined(engineId)) {
+                    Thread.onSpinWait();
+                }
+            });
         } finally {
             mayReturn.countDown();
         }
@@ -280,6 +340,7 @@ class PlanningCandidateExecutorTest {
                         },
                         () -> { },
                         20,
+                        1_000,
                         1_000));
 
         assertEquals(PlanningCandidateExecutor.Status.SUCCESS, result.status());
@@ -288,7 +349,35 @@ class PlanningCandidateExecutorTest {
     }
 
     @Test
-    void hardTimeoutDetachesNonCooperativeCandidateAndAllowsNextCandidate() {
+    void interruptResponsiveCandidateReturnsBeforeIsolationWithoutQuarantine() {
+        var engineId = id("responds_to_interrupt");
+        var interruptObserved = new AtomicBoolean();
+
+        var result = org.junit.jupiter.api.Assertions.assertTimeoutPreemptively(
+                Duration.ofSeconds(2),
+                () -> PlanningCandidateExecutor.executeForTest(
+                        engineId,
+                        "interrupt responsive timeout test",
+                        context -> {
+                            while (!Thread.interrupted()) {
+                                Thread.onSpinWait();
+                            }
+                            interruptObserved.set(true);
+                            return 42;
+                        },
+                        Thread::yield,
+                        20,
+                        30,
+                        120));
+
+        assertEquals(PlanningCandidateExecutor.Status.SUCCESS, result.status());
+        assertEquals(42, result.value());
+        assertTrue(interruptObserved.get());
+        assertFalse(PlanningCandidateExecutor.isQuarantined(engineId));
+    }
+
+    @Test
+    void hardTimeoutDetachesNonCooperativeCandidateOnlyAtIsolationDeadline() {
         var stuckId = id("ignores_interrupt");
         var nextId = id("next");
         var stuckStillRunning = new AtomicBoolean();
@@ -310,7 +399,8 @@ class PlanningCandidateExecutorTest {
                         },
                         schedulerYields::incrementAndGet,
                         20,
-                        30));
+                        30,
+                        60));
 
         assertEquals(PlanningCandidateExecutor.Status.HARD_TIMEOUT, hardTimedOut.status());
         assertTrue(stuckStillRunning.get(), "the ignored interrupt must not hold up the caller");
@@ -320,7 +410,7 @@ class PlanningCandidateExecutorTest {
         var next = org.junit.jupiter.api.Assertions.assertTimeoutPreemptively(
                 Duration.ofSeconds(1),
                 () -> PlanningCandidateExecutor.executeForTest(
-                        nextId, "next test", context -> 42, () -> { }, 100, 100));
+                        nextId, "next test", context -> 42, () -> { }, 100, 100, 200));
         assertEquals(PlanningCandidateExecutor.Status.SUCCESS, next.status());
         assertEquals(42, next.value());
 

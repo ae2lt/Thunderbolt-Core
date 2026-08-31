@@ -1,6 +1,6 @@
 package com.moakiee.thunderbolt.api.crafting;
 
-/** Computation budget, exit grace and diagnostics supplied to one planning-engine candidate. */
+/** Computation budget, staged cancellation and diagnostics for one planning-engine candidate. */
 public interface PlanningAttemptContext {
     /** Absolute {@link System#nanoTime()} computation deadline. */
     long deadlineNanos();

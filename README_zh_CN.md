@@ -21,6 +21,9 @@ Thunderbolt Core 是 AE2 Lightning Tech 使用的 AE2 优化与底层基础设�
 
 - `-Dthunderbolt.watchdogMs=<毫秒>`：首次慢规划警告延迟
 - `-Dthunderbolt.watchdogRepeatMs=<毫秒>`：后续警告间隔
+- `-Dthunderbolt.planningTimeoutMs=<毫秒>`：候选协作退出期限（默认 3000）
+- `-Dthunderbolt.planningInterruptGraceMs=<毫秒>`：发送 interrupt 前的宽限（默认 2000）
+- `-Dthunderbolt.planningStopGraceMs=<毫秒>`：软期限后到隔离的总宽限（默认 5000）
 - `-Dthunderbolt.maxCraftSearchWork=<数量>`：规划器搜索工作量上限
 - `-Dthunderbolt.maxCraftDepth=<数量>`：规划深度上限
 
