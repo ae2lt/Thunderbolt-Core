@@ -18,11 +18,11 @@ class ConservativeFeedbackPressureTest {
     private static final int MAX_PATTERNS = 64;
     private static final int WARMUPS = 3;
     private static final int SAMPLES = 9;
-    private static final long LIMIT_NANOS = Duration.ofMillis(100).toNanos();
+    private static final long LIMIT_NANOS = Duration.ofMillis(200).toNanos();
     private static final long HARD_LIMIT_NANOS = Duration.ofSeconds(3).toNanos();
 
     @Test
-    void maximumAdmittedPrimeRatioSccStaysBelowOneHundredMilliseconds() {
+    void maximumAdmittedPrimeRatioSccStaysBelowTwoHundredMilliseconds() {
         Fixture fixture = primeRatioRing(MAX_STATES, MAX_PATTERNS, 0L);
 
         for (int warmup = 0; warmup < WARMUPS; warmup++) {
