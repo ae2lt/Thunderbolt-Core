@@ -220,6 +220,7 @@ dependencies {
     optionalModShapeArtifacts "maven.modrinth:advancedae:${advancedae_version}"
     optionalModShapeArtifacts "maven.modrinth:neoecoae:${neoecoae_version}"
     optionalModShapeArtifacts "maven.modrinth:ae2-crafting-tree-refreshed:${ae2_crafting_tree_version}"
+    optionalModShapeArtifacts "curse.maven:ae2-crafting-tree-1086241:${ae2_crafting_tree_file_id}"
     optionalModShapeArtifacts "maven.modrinth:extendedae-plus:${extendedae_plus_version}"
 }
 

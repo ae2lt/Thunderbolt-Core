@@ -126,24 +126,14 @@ class OptionalIntegrationBinaryShapeTest {
 
     @Test
     void ae2CraftingTree101StillCastsSummaryPlansToConcreteAe2Plans() throws IOException {
-        try (var jar = preparedJar("ae2-crafting-tree-refreshed-1.0.1.jar")) {
-            var mixin = shape(jar,
-                    "com/vcwdfca/ae2ct/mixin/AE2CraftingPlanSummary.class");
-            String handler = "buildEX(Lappeng/api/networking/IGrid;"
-                    + "Lappeng/api/networking/security/IActionSource;"
-                    + "Lappeng/api/networking/crafting/ICraftingPlan;"
-                    + "Lorg/spongepowered/asm/mixin/injection/callback/CallbackInfoReturnable;)V";
-            assertTrue(mixin.methods.contains(handler));
-            assertCallCount(
-                    mixin,
-                    handler,
-                    Opcodes.INVOKESTATIC,
-                    "com/vcwdfca/ae2ct/api/RecipeHelper",
-                    "fromCraftingPlan",
-                    "(Lappeng/crafting/CraftingPlan;)Lcom/vcwdfca/ae2ct/api/RecipeHelper;",
-                    false,
-                    1);
-        }
+        assertAe2CraftingTreeSummaryShape(
+                "ae2-crafting-tree-refreshed-1.0.1.jar", "com/vcwdfca/ae2ct");
+    }
+
+    @Test
+    void ae2CraftingTree111StillUsesTheSummaryJobContract() throws IOException {
+        assertAe2CraftingTreeSummaryShape(
+                "ae2-crafting-tree-1086241-7182165.jar", "com/neuvillette/ae2ct");
     }
 
     @Test
@@ -189,6 +179,40 @@ class OptionalIntegrationBinaryShapeTest {
                 "()Z",
                 true,
                 1);
+    }
+
+    private static void assertAe2CraftingTreeSummaryShape(
+            String jarName, String rootPackage) throws IOException {
+        try (var jar = preparedJar(jarName)) {
+            var mixin = shape(jar, rootPackage + "/mixin/AE2CraftingPlanSummary.class");
+            String helper = rootPackage + "/api/RecipeHelper";
+            String handler = "buildEX(Lappeng/api/networking/IGrid;"
+                    + "Lappeng/api/networking/security/IActionSource;"
+                    + "Lappeng/api/networking/crafting/ICraftingPlan;"
+                    + "Lorg/spongepowered/asm/mixin/injection/callback/CallbackInfoReturnable;)V";
+            assertTrue(mixin.methods.contains(handler));
+            assertTrue(mixin.fields.contains("jobs:L" + helper + ";"));
+            assertTrue(mixin.methods.contains("setJob(L" + helper + ";)V"));
+            assertCallCount(
+                    mixin,
+                    handler,
+                    Opcodes.INVOKESTATIC,
+                    helper,
+                    "fromCraftingPlan",
+                    "(Lappeng/crafting/CraftingPlan;)L" + helper + ";",
+                    false,
+                    1);
+            assertCallCount(
+                    mixin,
+                    "write(Lnet/minecraft/network/FriendlyByteBuf;"
+                            + "Lorg/spongepowered/asm/mixin/injection/callback/CallbackInfo;)V",
+                    Opcodes.INVOKEVIRTUAL,
+                    helper,
+                    "write",
+                    "(Lnet/minecraft/network/FriendlyByteBuf;)V",
+                    false,
+                    1);
+        }
     }
 
     private static JarFile preparedJar(String fileName) throws IOException {
