@@ -72,11 +72,11 @@ Publish it to the local Maven repository:
 .\gradlew.bat publishToMavenLocal
 ```
 
-- Version: `2.0.0-beta.2`
+- Version: `2.0.0-beta.3`
 - Maven coordinate:
-  `com.moakiee.thunderbolt:thunderbolt-forge-1.20.1:2.0.0-beta.2`
+  `com.moakiee.thunderbolt:thunderbolt-forge-1.20.1:2.0.0-beta.3`
 - Distributable JAR:
-  `build/libs/thunderbolt-forge-1.20.1-2.0.0-beta.2.jar`
+  `build/libs/thunderbolt-forge-1.20.1-2.0.0-beta.3.jar`
 
 The `-slim.jar` artifact does not contain the required MixinExtras jar-in-jar
 dependency and is only an intermediate development artifact.
