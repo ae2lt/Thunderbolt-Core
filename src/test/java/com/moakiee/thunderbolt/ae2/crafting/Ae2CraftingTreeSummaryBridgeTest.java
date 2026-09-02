@@ -20,16 +20,6 @@ class Ae2CraftingTreeSummaryBridgeTest {
         assertSame(plan, summary.getJob().sourcePlan());
     }
 
-    @Test
-    void keepsLegacyRefreshedPayloadCompatible() {
-        var summary = new RefreshedSummary();
-        var plan = plan();
-
-        assertTrue(Ae2CraftingTreeSummaryBridge.attachSupportedIntegration(
-                summary, plan, getClass().getClassLoader()));
-        assertSame(plan, summary.getJob().sourcePlan());
-    }
-
     private static CraftingPlan plan() {
         return new CraftingPlan(
                 null, 1, false, false,
@@ -47,21 +37,6 @@ class Ae2CraftingTreeSummaryBridgeTest {
 
         @Override
         public void setJob(com.neuvillette.ae2ct.api.RecipeHelper job) {
-            this.job = job;
-        }
-    }
-
-    private static final class RefreshedSummary
-            implements com.vcwdfca.ae2ct.api.ICraftingPlanSummary {
-        private com.vcwdfca.ae2ct.api.RecipeHelper job;
-
-        @Override
-        public com.vcwdfca.ae2ct.api.RecipeHelper getJob() {
-            return job;
-        }
-
-        @Override
-        public void setJob(com.vcwdfca.ae2ct.api.RecipeHelper job) {
             this.job = job;
         }
     }

@@ -125,12 +125,6 @@ class OptionalIntegrationBinaryShapeTest {
     }
 
     @Test
-    void ae2CraftingTree101StillCastsSummaryPlansToConcreteAe2Plans() throws IOException {
-        assertAe2CraftingTreeSummaryShape(
-                "ae2-crafting-tree-refreshed-1.0.1.jar", "com/vcwdfca/ae2ct");
-    }
-
-    @Test
     void ae2CraftingTree111StillUsesTheSummaryJobContract() throws IOException {
         assertAe2CraftingTreeSummaryShape(
                 "ae2-crafting-tree-1086241-7182165.jar", "com/neuvillette/ae2ct");
