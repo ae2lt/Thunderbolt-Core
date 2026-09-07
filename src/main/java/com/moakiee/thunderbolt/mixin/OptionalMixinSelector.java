@@ -11,7 +11,8 @@ public final class OptionalMixinSelector {
             Map.entry("AaeExecutingCraftingJobAccessor", "advanced_ae"),
             Map.entry("AaeElapsedTimeTrackerAccessor", "advanced_ae"),
             Map.entry("AaeTaskProgressAccessor", "advanced_ae"),
-            Map.entry("ExtendedAePlusSuperMatrixBatchMixin", "extendedae_plus"));
+            Map.entry("ExtendedAePlusSuperMatrixBatchMixin", "extendedae_plus"),
+            Map.entry("AppliedETransmutationModuleBatchMixin", "appliede"));
 
     private OptionalMixinSelector() {
     }

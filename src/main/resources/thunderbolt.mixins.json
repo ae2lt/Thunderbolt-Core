@@ -24,6 +24,7 @@
     "ae2.crafting.CraftingCpuLogicAccessor",
     "compat.advancedae.AdvCraftingCpuAccessor",
     "compat.extendedaeplus.ExtendedAePlusSuperMatrixBatchMixin",
+    "compat.appliede.AppliedETransmutationModuleBatchMixin",
     "ae2.crafting.ExecutingCraftingJobAccessor",
     "ae2.crafting.ElapsedTimeTrackerAccessor",
     "ae2.crafting.TaskProgressAccessor",
