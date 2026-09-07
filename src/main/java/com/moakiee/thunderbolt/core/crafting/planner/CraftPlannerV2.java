@@ -1855,6 +1855,10 @@ public final class CraftPlannerV2<K> {
         for (CraftPattern<K> pattern
                 : patternsByOutput.getOrDefault(output, List.of())) {
             if (craftableConservativeFeedbackPatterns.contains(pattern)) return true;
+            // A converter admitted to bootstrap a contracted loop is still a real dependency
+            // when another (ordinary) recipe consumes its output. Its upstream consumers must
+            // not enter an aggregate sweep that assumes the feedback edge was cut to a DAG.
+            if (feedbackSeedConverters.containsKey(pattern)) return true;
             for (CraftInput<K> input : pattern.inputs()) {
                 if (!input.returned() || input.uses() != CraftInput.INFINITE_USES) {
                     continue;
@@ -3875,15 +3879,16 @@ public final class CraftPlannerV2<K> {
             return 0;
         }
 
-        if (fixedFallbackItems.contains(x)) {
-            return obtainFixedComponent(x, d, commitFailure);
-        }
-
         // This is a branch-local safety guard. Report only the unstocked remainder as missing so the
         // parent may roll this branch back and try another route; never invalidate unrelated nodes.
+        // Exact firing quotas still require recursive input acquisition and must obey it as well.
         if (depth >= MAX_OBTAIN_DEPTH) {
             if (commitFailure) addMissing(x, d);
             return d;
+        }
+
+        if (fixedFallbackItems.contains(x)) {
+            return obtainFixedComponent(x, d, commitFailure);
         }
 
         List<CraftPattern<K>> ps = patternsByOutput.getOrDefault(x, List.of());
@@ -4539,6 +4544,11 @@ public final class CraftPlannerV2<K> {
             externalExact = reserved;
         }
         if (remaining > 0 && isFeedbackSeed(pattern, input)) {
+            // Cutting the converter's back-edge forbids recursive seed fabrication, not drawing
+            // an already physical seed from ordinary stock (or an earlier completed producer).
+            long stocked = drawPools(input.key(), remaining);
+            remaining -= stocked;
+            externalExact = Sat.add(externalExact, stocked);
             long bootstrapped = consumeFeedbackSeedBootstrap(pattern, input, remaining);
             remaining -= bootstrapped;
             externalExact = Sat.add(externalExact, bootstrapped);
