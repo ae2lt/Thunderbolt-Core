@@ -105,8 +105,8 @@ public final class CraftPlannerV2<K> {
             1_024L,
             Long.getLong("thunderbolt.maxByproductScheduleWork", 16_384L));
     /**
-     * Maximum number of alternate roots tried for a proven conservative conversion SCC. This is a
-     * fixed bound, so cycle orientation remains linear in graph size rather than enumerating cuts.
+     * Maximum number of alternate roots tried for conversion cycles and stock-backed cycle cuts.
+     * This is a fixed bound, so orientation remains linear in graph size rather than enumerating cuts.
      */
     static final int MAX_CONVERSION_ORIENTATION_RETRIES = 16;
 
@@ -481,8 +481,8 @@ public final class CraftPlannerV2<K> {
 
         Deque<List<K>> frontier = new ArrayDeque<>();
 
-        // A conversion SCC may still need a different cut orientation. This is bounded separately
-        // from ordinary recipe choice, which is now resolved inside one integer-flow plan run.
+        // A cycle may still need a different cut orientation. This is bounded separately from
+        // ordinary recipe choice, which is resolved inside one integer-flow plan run.
         if (!firstPlanner.cutOutputs.isEmpty()) {
             CycleAnalysis<K> cycleAnalysis = CycleAnalysis.analyze(graph, target);
             // The DFS cut position inside a cycle depends on sibling arrival order, so a bad cut can
@@ -490,27 +490,65 @@ public final class CraftPlannerV2<K> {
             // cut output. Attribute missing at member granularity and try the most-starved
             // orientation first, so the bounded retries go to the cuts that actually hurt.
             List<Map.Entry<K, Long>> reorientCandidates = new ArrayList<>();
+            Map<K, Long> missingByCycleMember = new HashMap<>();
             for (K cutOutput : firstPlanner.cutOutputs) {
-                if (!cycleAnalysis.mayReorient(cutOutput)) {
-                    continue;
-                }
-                long attributedMissing = first.missing().getOrDefault(cutOutput, 0L);
-                for (K member : cycleAnalysis.membersOf(cutOutput)) {
-                    if (!member.equals(cutOutput)) {
-                        attributedMissing = Sat.add(
-                                attributedMissing, first.missing().getOrDefault(member, 0L));
+                Long attributedMissing = missingByCycleMember.get(cutOutput);
+                if (attributedMissing == null) {
+                    Set<K> members = cycleAnalysis.membersOf(cutOutput);
+                    attributedMissing = first.missing().getOrDefault(cutOutput, 0L);
+                    for (K member : members) {
+                        if (!member.equals(cutOutput)) {
+                            attributedMissing = Sat.add(
+                                    attributedMissing, first.missing().getOrDefault(member, 0L));
+                        }
                     }
+                    // Many cut recipes can share one complex SCC. Attribute its deficit once,
+                    // instead of rescanning every member for each cut (quadratic in SCC size).
+                    for (K member : members) missingByCycleMember.put(member, attributedMissing);
+                    missingByCycleMember.put(cutOutput, attributedMissing);
                 }
                 if (attributedMissing > 0) {
                     reorientCandidates.add(Map.entry(cutOutput, attributedMissing));
                 }
             }
             reorientCandidates.sort((left, right) -> Long.compare(right.getValue(), left.getValue()));
-            int retries = 0;
+            Set<K> orientationRoots = new LinkedHashSet<>();
+            Set<K> affectedCycleMembers = new HashSet<>();
             for (Map.Entry<K, Long> candidate : reorientCandidates) {
-                if (retries >= MAX_CONVERSION_ORIENTATION_RETRIES) break;
-                retries++;
-                frontier.addLast(List.of(candidate.getKey()));
+                K cutOutput = candidate.getKey();
+                if (cycleAnalysis.mayReorient(cutOutput)) {
+                    orientationRoots.add(cutOutput);
+                }
+                if (!affectedCycleMembers.contains(cutOutput)) {
+                    affectedCycleMembers.addAll(cycleAnalysis.membersOf(cutOutput));
+                }
+            }
+
+            // Structural DFS expands even an already-stocked intermediate's unused producers. A
+            // back-edge found below it must not be the only view available to another branch that
+            // really needs the discarded recipe (#53). Starting at an input of that stocked item
+            // offers an orientation with the cut at the inventory boundary instead. This is safe
+            // even for a complex SCC: each attempt still keeps an acyclic subset of real recipes,
+            // validates the whole demand against shared stock, and retains the positive-feedback
+            // guard. Stock is only an orientation hint, never a claim that its quantity is enough.
+            // Scan the existing traversal once, preserving caller order and the shared retry cap.
+            for (K stocked : firstPlanner.preparedGraph.order) {
+                if (orientationRoots.size() >= MAX_CONVERSION_ORIENTATION_RETRIES) break;
+                if (!affectedCycleMembers.contains(stocked) || graph.stock(stocked) <= 0L) continue;
+                Set<K> members = cycleAnalysis.membersOf(stocked);
+                for (CraftPattern<K> pattern : graph.patternsFor(stocked)) {
+                    for (CraftInput<K> input : pattern.inputs()) {
+                        if (orientationRoots.size() >= MAX_CONVERSION_ORIENTATION_RETRIES) break;
+                        if (!input.returned() && input.remainder() == null
+                                && members.contains(input.key()) && !input.key().equals(target)) {
+                            orientationRoots.add(input.key());
+                        }
+                    }
+                }
+            }
+            for (K root : orientationRoots) {
+                if (frontier.size() >= MAX_CONVERSION_ORIENTATION_RETRIES) break;
+                frontier.addLast(List.of(root));
             }
         }
 
