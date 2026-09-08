@@ -14,8 +14,8 @@ import java.util.Set;
 
 /**
  * Linear-time reachable-SCC analysis used to distinguish simple material conversions from arbitrary
- * recipe cycles. It deliberately classifies narrowly: anything that cannot be proven conservative is
- * {@link Kind#COMPLEX} and stays on the planner's existing safe target-first cut.
+ * recipe cycles. It deliberately classifies narrowly: {@link Kind#COMPLEX} cannot use the conversion
+ * proof. The planner may still try stock-backed DAG cuts without admitting cyclic execution.
  */
 final class CycleAnalysis<K> {
 
@@ -103,6 +103,7 @@ final class CycleAnalysis<K> {
         return membersByMember.getOrDefault(key, Set.of());
     }
 
+    /** Conversion-specific retry eligibility; stock-backed DAG cuts do not require this proof. */
     boolean mayReorient(K key) {
         return kindOf(key).mayReorient() || directlyReorientable.contains(key);
     }
